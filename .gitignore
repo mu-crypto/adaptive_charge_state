@@ -1,3 +1,10 @@
 out_master/
 __pycache__/
 *.pyc
+
+# Simulation state. Each pickle carries the per-shot correctness and stop-time
+# matrices so the speedup analysis and the bootstrap can be redone without
+# re-simulating, which makes them 8-11 MB each -- ~600 MB for the full
+# experiment x detector matrix. Regenerate with `run`; the committed figures,
+# CSVs and summaries under results/ are derived from them.
+*.pkl

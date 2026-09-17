@@ -105,6 +105,7 @@ Experiments: demo, power, ratio, contrast, efficiency.
 from __future__ import annotations
 
 import argparse
+import csv
 import heapq
 import pickle
 import sys
@@ -4009,6 +4010,123 @@ def cmd_plot(args: argparse.Namespace) -> int:
     return 0
 
 
+_SPEEDUP_CSV_COLUMNS = [
+    "experiment",
+    "detector",
+    "point_index",
+    "point",
+    "sweep_value",
+    "power_uw",
+    "detection_efficiency",
+    "photons_per_bright_dwell",
+    "contrast",
+    "switching_ratio",
+    "p_bright_stationary",
+    "gamma_tot_khz",
+    "horizon_us",
+    "target_fidelity",
+    "t_threshold_us",
+    "t_adaptive_count_us",
+    "t_adaptive_mmpp_us",
+    "speedup_mmpp",
+    "speedup_mmpp_ci_low",
+    "speedup_mmpp_ci_high",
+    "speedup_count",
+    "speedup_count_ci_low",
+    "speedup_count_ci_high",
+]
+
+_CEILING_CSV_COLUMNS = [
+    "experiment",
+    "detector",
+    "point_index",
+    "point",
+    "sweep_value",
+    "method",
+    "max_balanced_fidelity",
+]
+
+
+def export_csv(
+    results: list[dict],
+    spec: SweepSpec,
+    directory: Path,
+) -> list[Path]:
+    """
+    Write the speedup table and the fidelity ceilings as CSV.
+
+    The pickles hold everything, but they are only readable from this module.
+    These two files are the results in a form a plotting script, a spreadsheet
+    or a paper table can consume directly.
+    """
+    written: list[Path] = []
+
+    fp = directory / "speedup_table.csv"
+    with open(fp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_SPEEDUP_CSV_COLUMNS)
+        w.writeheader()
+        for res in results:
+            reg = res["regime"]
+            base = {
+                "experiment": spec.key,
+                "detector": res["detector"].tag(),
+                "point_index": res.get("point_index"),
+                "point": res["name"],
+                "sweep_value": res["sweep_value"],
+                "power_uw": res["power_uw"],
+                "detection_efficiency": res["detection_efficiency"],
+                "photons_per_bright_dwell": reg["photons_per_bright_dwell"],
+                "contrast": reg["contrast"],
+                "switching_ratio": reg["switching_ratio"],
+                "p_bright_stationary": reg["p_bright_stationary"],
+                "gamma_tot_khz": reg["gamma_tot_khz"],
+                "horizon_us": res["horizon_us"],
+            }
+            for row in res["speedup_table"]:
+                out = dict(base)
+                for k in _SPEEDUP_CSV_COLUMNS:
+                    if k in row:
+                        out[k] = row[k]
+                w.writerow(out)
+    written.append(fp)
+
+    fp = directory / "fidelity_ceilings.csv"
+    with open(fp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_CEILING_CSV_COLUMNS)
+        w.writeheader()
+        for res in results:
+            for method, value in max_fidelity_summary(res).items():
+                w.writerow(
+                    {
+                        "experiment": spec.key,
+                        "detector": res["detector"].tag(),
+                        "point_index": res.get("point_index"),
+                        "point": res["name"],
+                        "sweep_value": res["sweep_value"],
+                        "method": method,
+                        "max_balanced_fidelity": value,
+                    }
+                )
+    written.append(fp)
+
+    return written
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    spec = _resolve_spec(args.experiment)
+    cfg = config_from_args(args, spec)
+    directory = run_directory(spec, Path(args.out), cfg.detector)
+    results = load_results(spec, Path(args.out), cfg.detector, cfg)
+
+    if not results:
+        print(f"no saved runs in {directory}; run the experiment first")
+        return 1
+
+    for fp in export_csv(results, spec, directory):
+        print(f"wrote {fp}")
+    return 0
+
+
 def cmd_summary(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
@@ -4132,6 +4250,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_summary)
+
+    sp = sub.add_parser("export", help="write saved runs out as CSV")
+    add_common(sp)
+    sp.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
+    sp.set_defaults(func=cmd_export)
 
     sp = sub.add_parser(
         "robustness", help="does the speedup survive parameter error?"
