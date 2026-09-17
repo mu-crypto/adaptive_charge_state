@@ -22,63 +22,158 @@ Not committed, both regenerable: the per-shot pickles (~870 MB — they carry th
 correctness and stop-time matrices so the bootstrap can be redone without
 re-simulating; `run`) and the per-operating-point figures (13 MB; `plot`).
 
-## Peak adaptive-MMPP speedup, ideal detector
+## How to read these numbers
 
-Largest run-time reduction at matched balanced fidelity anywhere on the target
-grid, with the fidelity it occurs at. These are peak values at the edge of what
-each configuration can reach, which is also where the bootstrap CIs are widest
-— see `speedup_table.csv` for the interval at every target.
+Two framing choices matter before any number below means anything.
 
-| experiment | point | peak speedup | at F* | adaptive-count only |
-|---|---|---|---|---|
-| power | 0.875 µW | 2.00× | 0.96 | 1.68× |
-| power | 2 µW | 2.08× | 0.95 | 1.40× |
-| power | 4 µW | **2.38×** | 0.92 | 1.37× |
-| power | 8 µW | 1.61× | 0.87 | 1.60× |
-| power | 15 µW | 1.38× | 0.80 | 1.38× |
-| contrast | C = 0.50 | 1.68× | 0.67 | 1.28× |
-| contrast | C = 0.85 | 1.79× | 0.84 | 1.33× |
-| contrast | C = 0.99 | 1.45× | 0.92 | 1.32× |
-| ratio | Γ₋₀/Γ₀₋ = 0.5 | 1.40× | 0.86 | 1.33× |
-| ratio | Γ₋₀/Γ₀₋ = 7.07 | 1.36× | 0.88 | 1.28× |
-| ratio | Γ₋₀/Γ₀₋ = 100 | 1.62× | 0.91 | 1.53× |
-| efficiency | η = 0.02 | 1.05× | 0.56 | 1.02× |
-| efficiency | η = 0.15 | 1.25× | 0.75 | 1.25× |
-| efficiency | η = 1.0 | 1.45× | 0.90 | 1.32× |
-| demo | high flux | 1.26× | 0.79 | 1.20× |
-| demo | moderate | 1.52× | 0.90 | 1.31× |
-| demo | sparse | 1.13× | 0.69 | 1.14× |
+**The speedup depends strongly on *where* on the fidelity axis you ask.** The
+fixed-time threshold curve is non-monotone: fidelity rises, peaks, then falls as
+the charge state scrambles. So `t_threshold` diverges as the target approaches
+the threshold's own ceiling, and the speedup diverges with it. Pooling all
+targets, the median reduction is only 1.09–1.14×; the per-point *maxima* of
+1.4–2.4× all sit within a hundredth or two of the ceiling. Both are true, and
+quoting only the max is selection bias — it is a maximum over ~45 correlated
+targets.
 
-## What the sweeps show
+| headroom `F_thr_max − F*` | n rows | median MMPP speedup | median count speedup |
+|---|---|---|---|
+| [0.00, 0.01) | 15 | 1.43× | 1.23× |
+| [0.01, 0.02) | 22 | 1.32× | 1.13× |
+| [0.02, 0.05) | 67 | 1.28× | 1.09× |
+| [0.05, 0.10) | 109 | 1.25× | 1.14× |
+| [0.10, 0.20) | 207 | 1.15× | 1.09× |
+| [0.20, 1.00) | 265 | 1.08× | 0.78× |
 
-**Power.** The speedup is largest at low power (2.0–2.4×) and decays to ~1.4× at
-15 µW. Low power means many photons per bright dwell, which is the regime where
-the arrival-time pattern carries information the total count does not. At 15 µW
-there are ~2.9 photons per dwell and the count is nearly sufficient. Note the
-fidelity column moves with it: high power cannot reach high fidelity at any
-readout time, so the peak migrates down the fidelity axis.
+Note the last row: far from the ceiling the adaptive *count* rule is actively
+**slower** than the optimized fixed window (0.78×). Stopping at the n-th photon
+is a worse time/accuracy trade there than simply using a short window. The MMPP
+rule never falls below 1 in any band.
 
-**Efficiency.** Monotone, and the cleanest statement of the mechanism: 1.05× at
-η = 0.02 (0.21 photons per bright dwell) rising to 1.45× at η = 1.0 (10.4 per
-dwell). Below about one photon per dwell the event-time statistic stops paying —
-the adaptive-count control captures essentially the whole gain there
-(1.02× vs 1.05×), so what little is left is adaptive stopping, not the MMPP
-filter.
+**Comparisons between operating points are therefore only meaningful at matched
+headroom.** The table below fixes headroom to [0.02, 0.08) and reports the
+median speedup over that band, with the typical bootstrap CI width so you can
+see what is resolved and what is not.
 
-**Switching ratio.** Weakest dependence of the four. The speedup is flat
-(1.36–1.40×) from Γ₋₀/Γ₀₋ = 0.5 to 7 and rises to ~1.6× at 100. The fidelity
-ceiling, though, climbs steadily with the ratio (0.885 → 0.931 for adaptive
-MMPP) and the MMPP advantage over the count threshold widens as the emitter
-spends most of its time dark.
+| experiment | point | ph/dwell | thr ceiling | MMPP ceiling | speedup | ±CI width | peak |
+|---|---|---|---|---|---|---|---|
+| power | 0.875 µW | 92.4 | 0.979 | 0.983 | 1.43× | 0.14 | 2.00× |
+| power | 2 µW | 35.7 | 0.958 | 0.962 | 1.38× | 0.07 | 2.08× |
+| power | 4 µW | 15.3 | 0.927 | 0.937 | 1.34× | 0.05 | 2.38× |
+| power | 8 µW | 6.4 | 0.873 | 0.879 | 1.27× | 0.05 | 1.61× |
+| power | 15 µW | 2.9 | 0.805 | 0.807 | 1.19× | 0.06 | 1.38× |
+| efficiency | η = 0.02 | 0.21 | 0.575 | 0.571 | 1.02× | 0.28 | 1.05× |
+| efficiency | η = 0.05 | 0.52 | 0.630 | 0.630 | 1.04× | 0.11 | 1.11× |
+| efficiency | η = 0.15 | 1.56 | 0.754 | 0.758 | 1.03× | 0.07 | 1.25× |
+| efficiency | η = 0.40 | 4.16 | 0.841 | 0.845 | 1.23× | 0.08 | 1.30× |
+| efficiency | η = 1.0 | 10.40 | 0.902 | 0.912 | 1.28× | 0.07 | 1.45× |
+| contrast | C = 0.50 | 10.40 | 0.771 | 0.785 | 1.18× | 0.57 | 1.68× |
+| contrast | C = 0.70 | 10.40 | 0.834 | 0.851 | 1.41× | 0.50 | 1.70× |
+| contrast | C = 0.85 | 10.40 | 0.872 | 0.883 | 1.40× | 0.25 | 1.79× |
+| contrast | C = 0.95 | 10.40 | 0.899 | 0.913 | 1.26× | 0.11 | 1.39× |
+| contrast | C = 0.99 | 10.40 | 0.931 | 0.932 | 1.32× | 0.06 | 1.45× |
+| ratio | Γ₋₀/Γ₀₋ = 0.5 | 27.5 | 0.877 | 0.885 | 1.25× | 0.11 | 1.40× |
+| ratio | Γ₋₀/Γ₀₋ = 1.88 | 14.1 | 0.878 | 0.892 | 1.27× | 0.07 | 1.36× |
+| ratio | Γ₋₀/Γ₀₋ = 7.07 | 10.5 | 0.896 | 0.906 | 1.26× | 0.05 | 1.36× |
+| ratio | Γ₋₀/Γ₀₋ = 26.6 | 9.5 | 0.914 | 0.924 | 1.33× | 0.07 | 1.60× |
+| ratio | Γ₋₀/Γ₀₋ = 100 | 9.3 | 0.912 | 0.931 | 1.29× | 0.05 | 1.62× |
+| demo | high flux | 2.9 | 0.815 | 0.820 | 1.16× | 0.06 | 1.26× |
+| demo | moderate | 10.40 | 0.902 | 0.914 | 1.29× | 0.06 | 1.52× |
+| demo | sparse | 1.04 | 0.712 | 0.711 | 1.10× | 0.05 | 1.13× |
 
-**Contrast.** Peaks near C = 0.85 at 1.79×, lower at both ends. At low contrast
-neither method reaches high fidelity; at C → 1 the dark state is genuinely dark,
-so a plain count threshold is already close to optimal and there is less left to
-win.
+## The speedup is real but modest
+
+Across the 693 defined (point, target) rows at the ideal detector, the 95%
+paired-bootstrap CI on the MMPP speedup lies entirely above 1 in **95%** of
+rows, and entirely below 1 in **none**. The effect is robust; it is also
+typically 10–30% rather than a factor of two.
+
+Decomposing at matched target, by median:
+
+| step | factor |
+|---|---|
+| adaptive stopping alone (count / threshold) | 1.046× |
+| event-time statistic on top (MMPP / count) | 1.091× |
+| total (MMPP / threshold) | 1.120× |
+
+So roughly two thirds of the gain comes from the event-time statistic and one
+third from adaptive stopping. The MMPP rule beats the count rule at the same
+target in 86% of rows. The count control's own CI excludes 1 in only 65% of
+rows, against 95% for MMPP — adaptivity alone is a much weaker effect than
+adaptivity plus the arrival-time likelihood.
+
+## One parameter controls the speedup: photons per bright dwell
+
+With headroom matched, the sparsity parameter λ₋/Γ₋₀ explains most of the
+between-point variation in speedup:
+
+```
+log(speedup) = 0.086 + 0.063 log(photons per bright dwell)     R² = 0.77, n = 23
+```
+
+A factor of 10 more photons per bright dwell buys about **1.16×** more speedup.
+Adding contrast as a second regressor changes nothing (coefficient +0.013,
+R² unchanged at 0.77).
+
+This is the mechanism working as predicted. The event-time filter can only beat
+a photon count when the arrival *pattern* within a dwell carries information the
+total does not, which requires several photons per dwell. Below ~1 photon per
+bright dwell the count is very nearly a sufficient statistic: at η = 0.02
+(0.21 photons per dwell) the speedup is 1.02× and the adaptive-count control
+captures essentially all of it, so what little remains there is stopping, not
+filtering.
+
+**Contrast and switching ratio move the ceiling, not the speedup.** This
+corrects an earlier reading of these runs. Both sweeps look like they have a
+speedup trend if you take the per-point maximum — contrast appearing to peak at
+C = 0.85, the ratio appearing to rise to 1.6× — but at matched headroom the
+contrast speedups (1.18–1.41×) sit inside CI widths of 0.25–0.57, and the ratio
+speedups (1.25–1.33×) inside widths of 0.05–0.11. Neither trend is resolved.
+What *is* clean and monotone in both sweeps is the achievable fidelity:
+
+- contrast 0.50 → 0.99 raises the MMPP ceiling 0.785 → 0.932
+- ratio 0.5 → 100 raises it 0.885 → 0.931
+
+Physically sensible: contrast and the bright/dark asymmetry determine how
+distinguishable the two initial states are at all, whereas the speedup is about
+how efficiently a given amount of distinguishability is extracted per unit time.
+
+## Nothing here beats the D'Anjou bound
+
+Only 3 of 693 ideal-detector rows exceed the 2× reduction that D'Anjou gives as
+the bound for decay readout, and in none of them does the CI lower bound clear 2:
+
+| point | F* | speedup | 95% CI | t_thr | t_mmpp |
+|---|---|---|---|---|---|
+| 4 µW | 0.92 | 2.38× | [1.42, 2.68] | 66.3 µs | 27.8 µs |
+| 2 µW | 0.95 | 2.08× | [1.67, 2.23] | 98.4 µs | 47.2 µs |
+| 0.875 µW | 0.96 | 2.00× | [1.40, 2.13] | 174.5 µs | 87.2 µs |
+
+All three are the near-ceiling maxima, where the estimator is noisiest. Read as
+consistent with the bound, not as clearing it.
+
+## What an experiment would actually gain
+
+Adaptive readout shortens the measurement window only. Per-shot initialization,
+spin manipulation and reset dilute it:
+
+| point | F* | t_thr | t_mmpp | 0 µs | 5 µs | 20 µs | 100 µs overhead |
+|---|---|---|---|---|---|---|---|
+| 0.875 µW | 0.96 | 174.5 µs | 87.2 µs | 2.00× | 1.95× | 1.81× | 1.47× |
+| 2 µW | 0.95 | 98.4 µs | 47.2 µs | 2.08× | 1.98× | 1.76× | 1.35× |
+| 4 µW | 0.92 | 66.3 µs | 27.8 µs | 2.38× | 2.17× | 1.80× | 1.30× |
+| 8 µW | 0.87 | 29.2 µs | 18.2 µs | 1.61× | 1.48× | 1.29× | 1.09× |
+| 15 µW | 0.80 | 16.5 µs | 12.0 µs | 1.38× | 1.27× | 1.14× | 1.04× |
+
+The low-power points survive overhead best, because their absolute run times are
+longest. The practical sweet spot is **low power with high collection
+efficiency**, run at a target close to the threshold's ceiling: that is
+simultaneously where sparsity is highest, where the threshold's turnover is
+sharpest, and where the saved microseconds are large enough to matter against
+overhead. High power is the worst case on every axis at once.
 
 ## Effect of the detector model
 
-Dead time and afterpulsing do **not** overturn the conclusion. Comparing peak
+Dead time and afterpulsing do **not** overturn any of this. Comparing peak
 speedups across detector settings, the differences are comparable to the
 bootstrap width rather than systematic:
 
@@ -111,6 +206,25 @@ Caveat carried in the code: with the detector on, the stream is no longer a
 Markov-modulated *Poisson* process, so the MMPP likelihood is approximate and
 the reported LLR is a score rather than an exact log-likelihood ratio. Run with
 `--no-filter-correction` to see what pure model mismatch costs instead.
+
+## Caveats
+
+- **Physics layer.** These runs use `builtin-reference`, not
+  `nv_charge_readout_master_v1_4`. The rate model is pinned to the same 5.437 µW
+  operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) but the power dependence
+  and the emission rates are a documented stand-in. Re-run with the real module
+  before quoting any number. Every CSV and summary records the layer used.
+- **Selection bias in the peaks.** Per-point maxima are maxima over ~45
+  correlated targets and are biased upward. The matched-headroom medians are the
+  defensible statistic.
+- **The ratio sweep is not a clean one-parameter sweep.** Holding Γ_tot fixed
+  means changing Γ₋₀/Γ₀₋ also changes Γ₋₀, so photons per bright dwell drifts
+  27.5 → 9.3 across it. Given the sparsity law above, that alone predicts a
+  ~1.07× *decrease*, against a roughly flat observation — so the ratio has a
+  mild compensating positive effect that this design cannot separate.
+- **Test-set frontier.** Both methods are optimized on the test set, which is
+  symmetric between them and matches published figures where t_R and the count
+  threshold are both tuned, but it is not an out-of-sample number.
 
 ## Reproducing
 
