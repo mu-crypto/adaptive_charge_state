@@ -8,3 +8,7 @@ __pycache__/
 # experiment x detector matrix. Regenerate with `run`; the committed figures,
 # CSVs and summaries under results/ are derived from them.
 *.pkl
+
+# Per-operating-point figures, 13 MB across the matrix. The sweep-level figures
+# under results/ are committed; regenerate these with `plot`.
+results/**/point_*.png

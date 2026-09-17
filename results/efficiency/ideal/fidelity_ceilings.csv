@@ -1,0 +1,16 @@
+experiment,detector,point_index,point,sweep_value,method,max_balanced_fidelity
+efficiency,ideal,0,eta0.02,0.02,threshold,0.5747222222222222
+efficiency,ideal,0,eta0.02,0.02,adaptive_count,0.5741666666666667
+efficiency,ideal,0,eta0.02,0.02,adaptive_mmpp,0.5705555555555556
+efficiency,ideal,1,eta0.05,0.05,threshold,0.63
+efficiency,ideal,1,eta0.05,0.05,adaptive_count,0.6297222222222222
+efficiency,ideal,1,eta0.05,0.05,adaptive_mmpp,0.6297222222222222
+efficiency,ideal,2,eta0.15,0.15,threshold,0.7541666666666667
+efficiency,ideal,2,eta0.15,0.15,adaptive_count,0.7502777777777778
+efficiency,ideal,2,eta0.15,0.15,adaptive_mmpp,0.7577777777777778
+efficiency,ideal,3,eta0.4,0.4,threshold,0.8413888888888889
+efficiency,ideal,3,eta0.4,0.4,adaptive_count,0.8388888888888888
+efficiency,ideal,3,eta0.4,0.4,adaptive_mmpp,0.845
+efficiency,ideal,4,eta1,1.0,threshold,0.9019444444444444
+efficiency,ideal,4,eta1,1.0,adaptive_count,0.9013888888888889
+efficiency,ideal,4,eta1,1.0,adaptive_mmpp,0.9116666666666666

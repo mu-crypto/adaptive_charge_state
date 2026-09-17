@@ -1,0 +1,16 @@
+experiment,detector,point_index,point,sweep_value,method,max_balanced_fidelity
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,0,ratio0.5,0.5,threshold,0.8738888888888889
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,0,ratio0.5,0.5,adaptive_count,0.8677777777777778
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,0,ratio0.5,0.5,adaptive_mmpp,0.8791666666666667
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,1,ratio1.88,1.88,threshold,0.8955555555555555
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,1,ratio1.88,1.88,adaptive_count,0.8933333333333333
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,1,ratio1.88,1.88,adaptive_mmpp,0.9016666666666666
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,2,ratio7.07,7.07,threshold,0.9013888888888889
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,2,ratio7.07,7.07,adaptive_count,0.9008333333333334
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,2,ratio7.07,7.07,adaptive_mmpp,0.9091666666666667
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,3,ratio26.6,26.6,threshold,0.905
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,3,ratio26.6,26.6,adaptive_count,0.9033333333333333
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,3,ratio26.6,26.6,adaptive_mmpp,0.9197222222222222
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,4,ratio100,100.0,threshold,0.9116666666666666
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,4,ratio100,100.0,adaptive_count,0.9130555555555555
+ratio,det_nonpar_dt50ns_ap0.01_tau100ns,4,ratio100,100.0,adaptive_mmpp,0.9297222222222222

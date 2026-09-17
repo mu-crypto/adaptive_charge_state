@@ -1,0 +1,13 @@
+experiment,detector,point_index,point,sweep_value,method,max_balanced_fidelity
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,0,high_flux,2.8995965459017876,threshold,0.8047222222222222
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,0,high_flux,2.8995965459017876,fixed_mmpp,0.8041666666666667
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,0,high_flux,2.8995965459017876,adaptive_count,0.8047222222222222
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,0,high_flux,2.8995965459017876,adaptive_mmpp,0.8066666666666666
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,1,moderate,10.401528157851567,threshold,0.9002777777777777
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,1,moderate,10.401528157851567,fixed_mmpp,0.9080555555555556
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,1,moderate,10.401528157851567,adaptive_count,0.8991666666666667
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,1,moderate,10.401528157851567,adaptive_mmpp,0.9080555555555556
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,2,sparse,1.0401528157851567,threshold,0.7116666666666667
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,2,sparse,1.0401528157851567,fixed_mmpp,0.7102777777777778
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,2,sparse,1.0401528157851567,adaptive_count,0.7083333333333334
+demo,det_nonpar_dt2000ns_ap0.05_tau5000ns,2,sparse,1.0401528157851567,adaptive_mmpp,0.7105555555555556
