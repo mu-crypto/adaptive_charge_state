@@ -3,6 +3,7 @@
 GAUSSIAN VS TELEGRAPH RATE NOISE AT MATCHED VARIANCE: run-time reduction at matched balanced fidelity
   Matched in variance and correlation time, differing only at third order -- what a bispectrum resolves and a power spectrum cannot.
   detector: ideal detector (no dead time, no afterpulsing)
+  rate noise: no rate noise
   physics layer: builtin-reference
 ====================================================================================================
          point  ph/dwell     F*  t_thr(us) t_count(us)  t_fcm(us)  T_mmpp(us)  sp_mmpp         95% CI  sp_fcm  sp_count

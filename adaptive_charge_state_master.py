@@ -3696,13 +3696,72 @@ def run_directory(
     return d
 
 
+# Results carry MMPPParams, DetectorModel and RateNoise instances. Pickling
+# them directly records the class by module path, and when this file runs as a
+# script that path is "__main__" -- so a saved result could only be reopened
+# from another __main__ defining the same names, not from an analysis script,
+# which is most of the point of saving it. Reassigning __module__ does not help
+# either: pickle then demands class IDENTITY with the imported module's class
+# and refuses, because importing creates a fresh class object.
+#
+# So the on-disk form carries no custom classes at all. The three object fields
+# are stored as plain dicts and rehydrated on load, which makes a saved result
+# readable by any script with plain `pickle.load`.
+_OBJECT_FIELDS = {
+    "params": "mmpp",
+    "filter_params": "mmpp",
+    "detector": "detector",
+    "noise": "noise",
+}
+
+
+def _params_to_dict(p) -> dict:
+    return {
+        "gamma_minus_to_zero_khz": float(p.gamma_minus_to_zero_khz),
+        "gamma_zero_to_minus_khz": float(p.gamma_zero_to_minus_khz),
+        "lambda_minus_khz": float(p.lambda_minus_khz),
+        "lambda_zero_khz": float(p.lambda_zero_khz),
+    }
+
+
+def _to_plain(result: dict) -> dict:
+    """Copy of `result` with every custom class replaced by a plain dict."""
+    out = dict(result)
+    for key, kind in _OBJECT_FIELDS.items():
+        obj = out.get(key)
+        if obj is None or isinstance(obj, dict):
+            continue
+        if kind == "mmpp":
+            out[key] = {"__kind__": "mmpp", **_params_to_dict(obj)}
+        else:
+            out[key] = {"__kind__": kind, **dict(vars(obj))}
+    return out
+
+
+def _from_plain(result: dict) -> dict:
+    """Inverse of `_to_plain`; tolerant of results saved before it existed."""
+    out = dict(result)
+    builders = {
+        "mmpp": lambda d: MMPPParams(**d),
+        "detector": lambda d: DetectorModel(**d),
+        "noise": lambda d: RateNoise(**d),
+    }
+    for key, kind in _OBJECT_FIELDS.items():
+        obj = out.get(key)
+        if not isinstance(obj, dict):
+            continue
+        d = {k: v for k, v in obj.items() if k != "__kind__"}
+        out[key] = builders[obj.get("__kind__", kind)](d)
+    return out
+
+
 def save_result(result: dict, index: int, directory: Path) -> Path:
     # Stored so later commands can address a point by its SWEEP position even
     # when only some points have been run.
     result["point_index"] = int(index)
     fp = directory / f"point_{index:02d}_{result['name']}.pkl"
     with open(fp, "wb") as f:
-        pickle.dump(result, f)
+        pickle.dump(_to_plain(result), f)
     return fp
 
 
@@ -3722,7 +3781,7 @@ def load_results(
         fp = directory / f"point_{i:02d}_{p.name}.pkl"
         if fp.exists():
             with open(fp, "rb") as f:
-                out.append(pickle.load(f))
+                out.append(_from_plain(pickle.load(f)))
     return out
 
 

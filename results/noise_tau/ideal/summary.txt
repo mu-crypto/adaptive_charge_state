@@ -3,6 +3,7 @@
 RATE-NOISE CORRELATION-TIME SWEEP (GAUSSIAN, SIGMA = 0.2): run-time reduction at matched balanced fidelity
   Noise much faster than the 120 us bright dwell averages out within a dwell; noise much slower is quasi-static and the calibrated cutoff absorbs it. The damage should peak in between.
   detector: ideal detector (no dead time, no afterpulsing)
+  rate noise: ou rate noise, sigma = 0.2, tau_c = 0.01 ms, photon order 3.98287, mean-renormalised
   physics layer: builtin-reference
 ====================================================================================================
          point  ph/dwell     F*  t_thr(us) t_count(us)  t_fcm(us)  T_mmpp(us)  sp_mmpp         95% CI  sp_fcm  sp_count

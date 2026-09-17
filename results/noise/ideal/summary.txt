@@ -3,6 +3,7 @@
 RATE-NOISE AMPLITUDE SWEEP (GAUSSIAN, TAU_C = 100 US): run-time reduction at matched balanced fidelity
   A single fractional intensity fluctuation drives emission linearly and switching quadratically, as the photon order requires. The filter is built from the NOMINAL rates, so this is the one error a calibrated boundary cannot absorb.
   detector: ideal detector (no dead time, no afterpulsing)
+  rate noise: no rate noise
   physics layer: builtin-reference
 ====================================================================================================
          point  ph/dwell     F*  t_thr(us) t_count(us)  t_fcm(us)  T_mmpp(us)  sp_mmpp         95% CI  sp_fcm  sp_count
