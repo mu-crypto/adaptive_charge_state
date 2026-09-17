@@ -1314,6 +1314,12 @@ def measure_q_excess(
 
     Bin widths default to a geometric spread inside the shot, since a bin
     wider than the shot measures shot-to-shot spread rather than Q.
+
+    Caveat: `mandel_q_mmpp` is the null for an IDEAL detector. Dead time
+    suppresses Q and afterpulsing inflates it, neither of which is a rate
+    effect, so a Q excess measured with the detector model on mixes detector
+    and rate contributions. The noise experiments all run at the ideal
+    detector for that reason.
     """
     params.validate()
 
@@ -2497,6 +2503,7 @@ class RunConfig:
             n_cal=120,
             n_test=240,
             n_boot=40,
+            n_q_shots=60,
             n_readout_times=18,
             n_deadlines=4,
             max_n_up=24,
@@ -2565,14 +2572,39 @@ def time_grid_floor_us(params: MMPPParams, horizon_us: float) -> float:
 def _filter_params_for(
     params: MMPPParams,
     detector: DetectorModel,
+    noise: RateNoise = NOISE_OFF,
 ) -> MMPPParams:
     """
     Parameters the MMPP filter is built from.
 
-    With the detector off this is the truth. With it on and
-    ``correct_filter_rates`` set, it is the rate the detector actually records,
-    which is what a calibration measurement returns.
+    With the detector and noise off this is the truth. Otherwise it is what a
+    calibration measurement would return, which is the honest thing to give
+    the filter:
+
+      * with the detector on and ``correct_filter_rates`` set, the rate the
+        detector actually records;
+      * with rate noise on, the rates the emitter actually AVERAGES. Under the
+        mean-preserving convention those are the nominal ones, so nothing
+        changes. Under the setpoint convention the mean switching rate is
+        inflated by E[(1+delta)^p] -- 1.57 at sigma = 0.3, p = 4 -- and
+        handing the filter the un-inflated value would confound a constant
+        rate error with the time dependence the sweep is trying to isolate.
+        A constant error is already known to be absorbed by the calibrated
+        boundary, so leaving it in would only dilute the measurement.
     """
+    if noise.renormalise == "none" and not noise.is_off:
+        params = _replace_params(
+            params,
+            lambda_minus_khz=params.lambda_minus_khz
+            * _modulation_gain_mean(noise, 1.0),
+            lambda_zero_khz=params.lambda_zero_khz
+            * _modulation_gain_mean(noise, 1.0),
+            gamma_minus_to_zero_khz=params.gamma_minus_to_zero_khz
+            * _modulation_gain_mean(noise, noise.photon_order),
+            gamma_zero_to_minus_khz=params.gamma_zero_to_minus_khz
+            * _modulation_gain_mean(noise, noise.photon_order),
+        )
+
     if not detector.correct_filter_rates:
         return params
 
@@ -2616,7 +2648,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     detector = cfg.detector
     noise = point.noise if point.noise is not None else cfg.noise
     noise.validate()
-    filter_params = _filter_params_for(params, detector)
+    filter_params = _filter_params_for(params, detector, noise)
     seed = int(cfg.seed) + int(point.seed_offset)
 
     if cfg.verbose:
@@ -4096,6 +4128,9 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
         print(f"  {spec.note}")
     if results:
         print(f"  detector: {results[0]['detector'].describe()}")
+        nz = results[0].get("noise")
+        if nz is not None:
+            print(f"  rate noise: {nz.describe()}")
         print(f"  physics layer: {results[0].get('physics_layer', '?')}")
     print("=" * 100)
     print(
@@ -4402,10 +4437,18 @@ def run_parameter_robustness(
 
     draws = sample_switching_posterior(params, C, n_draws, seed=seed)
 
-    # Regenerate the same test shots from the true parameters.
+    # Regenerate the same test shots from the true parameters. The rate noise
+    # has to come along: without it, running this on a noise result would
+    # silently report parameter-error robustness measured on NOISELESS shots.
+    noise = result.get("noise", NOISE_OFF)
     n_per_state = int(len(labels) // 2)
     shots, lab = simulate_balanced_dataset(
-        n_per_state, horizon_us / 1000.0, params, result["seed"] + 7717, detector
+        n_per_state,
+        horizon_us / 1000.0,
+        params,
+        result["seed"] + 7717,
+        detector,
+        noise,
     )
 
     t_thr = time_for_fidelity_interp(
@@ -4421,7 +4464,7 @@ def run_parameter_robustness(
     for p_used in draws:
         # The filter's own rates also get the detector correction, since a
         # mis-fit posterior draw is a separate error source from the detector.
-        p_filter = _filter_params_for(p_used, detector)
+        p_filter = _filter_params_for(p_used, detector, noise)
         spec = build_no_click_spectral(p_filter)
         packed = pack_records(
             build_records(shots, horizon_us, p_filter, spec), spec
@@ -4923,6 +4966,82 @@ def validate_all(verbose: bool = True) -> int:
         and abs(NOISE_PHOTON_ORDER - used[1]) < 1e-6,
         f"orders {[round(o, 2) for o in used]} at 0.875, "
         f"{BASE_POWER_UW}, 15 uW; sweeps use {NOISE_PHOTON_ORDER:.2f}",
+    )
+
+    # The clamped gain mean is computed by Gauss-Hermite quadrature, which is
+    # exact for polynomials but not for the kink the clamp introduces at
+    # delta = -1. Pin it against Monte Carlo out to sigma = 0.8, where a tenth
+    # of all segments are clamped.
+    worst_q = 0.0
+    rng_q = np.random.default_rng(808)
+    for sg in (0.1, 0.3, 0.5, 0.8):
+        for order in (1.0, NOISE_PHOTON_ORDER):
+            nz = RateNoise(sigma=sg, tau_c_ms=0.1, kind="ou")
+            quad = _modulation_gain_mean(nz, order)
+            draws = rng_q.normal(0.0, sg, 2_000_000)
+            mc = float(np.power(np.maximum(1.0 + draws, 0.0), order).mean())
+            worst_q = max(worst_q, abs(quad / mc - 1.0))
+    check(
+        "clamped gain mean by quadrature matches Monte Carlo",
+        worst_q < 5e-3,
+        f"worst relative error {worst_q:.1e} out to sigma = 0.8",
+    )
+
+    # Under the setpoint convention the emitter's MEAN switching rate is
+    # inflated, and the filter must be handed that inflated value. Otherwise a
+    # constant rate error rides along and dilutes the time-dependence
+    # measurement. Under the mean convention nothing may change.
+    nz_mean = RateNoise(
+        sigma=0.3, tau_c_ms=0.1, kind="ou", photon_order=NOISE_PHOTON_ORDER
+    )
+    nz_set = replace(nz_mean, renormalise="none")
+    f_mean = _filter_params_for(tp, DETECTOR_OFF, nz_mean)
+    f_set = _filter_params_for(tp, DETECTOR_OFF, nz_set)
+    check(
+        "mean-renormalised noise leaves the filter rates alone",
+        abs(f_mean.gamma_minus_to_zero_khz / tp.gamma_minus_to_zero_khz - 1.0)
+        < 1e-12,
+    )
+    # Realised mean of the switching rate the simulator produces, to compare.
+    dd = modulator_path(
+        nz_set, 300000, nz_set.tau_c_ms / nz_set.steps_per_tau, rng_q
+    )
+    _, _, g_real, _ = modulated_rates(tp, nz_set, dd)
+    check(
+        "setpoint noise hands the filter the inflated mean switching rate",
+        abs(f_set.gamma_minus_to_zero_khz / g_real.mean() - 1.0) < 0.02,
+        f"filter {f_set.gamma_minus_to_zero_khz:.3f} kHz vs realised mean "
+        f"{g_real.mean():.3f} kHz (nominal "
+        f"{tp.gamma_minus_to_zero_khz:.3f})",
+    )
+
+    # Parameter-error robustness must carry the rate noise into the shots it
+    # regenerates. Passing the noise through is checked by giving the helper a
+    # noisy result and confirming the shots it builds are not the noiseless
+    # ones -- the bug this replaces silently measured noiseless robustness.
+    fake = {
+        "params": tp,
+        "horizon_us": 637.0,
+        "test_labels": np.tile([0, 1], 40),
+        "detector": DETECTOR_OFF,
+        "noise": RateNoise(
+            sigma=0.6, tau_c_ms=0.1, kind="ou", photon_order=NOISE_PHOTON_ORDER
+        ),
+        "seed": 11,
+        "T_threshold": np.array([10.0, 100.0]),
+        "F_threshold": np.array([0.6, 0.9]),
+        "deadlines_us": np.array([100.0, 600.0]),
+    }
+    noisy, lab_n = simulate_balanced_dataset(
+        40, 0.637, tp, 11 + 7717, DETECTOR_OFF, fake["noise"]
+    )
+    clean, _ = simulate_balanced_dataset(40, 0.637, tp, 11 + 7717, DETECTOR_OFF)
+    n_noisy = np.array([x.size for x in noisy], dtype=float)
+    n_clean = np.array([x.size for x in clean], dtype=float)
+    check(
+        "rate noise changes the regenerated robustness shots",
+        not np.allclose(n_noisy, n_clean),
+        f"mean clicks {n_noisy.mean():.2f} noisy vs {n_clean.mean():.2f} clean",
     )
 
     # -- 10. the detector model ----------------------------------------------
