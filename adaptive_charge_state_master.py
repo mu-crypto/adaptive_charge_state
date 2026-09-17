@@ -818,15 +818,367 @@ def effective_emission_rates(
     )
 
 
+# =============================================================================
+# 1c. Rate noise: rates that vary WITHIN a shot
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class RateNoise:
+    """
+    Multiplicative rate modulation, off by default.
+
+    This is the one noise channel nothing else in this file can express.
+    Everything else holds the rates fixed for the duration of a shot:
+
+        parameter sweeps          a different constant per run
+        run_parameter_robustness  a different constant per draw, shared by
+                                  every shot in that draw
+        DetectorModel             acts on the photon stream, not on the rates
+
+    A time-dependent modulation is therefore a change to the GENERATOR, not a
+    new parameter value, and that distinction is the whole point. A constant
+    rate error only rescales the LLR, so the calibrated cutoff and SPRT
+    boundaries absorb it -- `run_parameter_robustness` measures exactly that
+    and finds the speedup survives a 30% rate CV. A time-dependent error has
+    nothing constant to recalibrate against.
+
+    Physical model
+    --------------
+    A single fractional intensity fluctuation delta(t) drives both rates, with
+    the coupling fixed by photon order rather than chosen:
+
+        emission  is one-photon,  lambda ~ P    ->  lambda(t) = lambda (1+delta)
+        switching is two-photon,  Gamma  ~ P^2  ->  Gamma(t)  = Gamma (1+delta)^2
+
+    To first order in a fractional POWER fluctuation eps, lambda picks up
+    a_lambda eps and Gamma picks up a_Gamma eps, where a_x = d ln x / d ln P.
+    Writing delta for the emission response (the measurable one, since it is
+    what photon counts report) makes the switching exponent
+
+        photon_order = a_Gamma / a_lambda,
+
+    because (1+delta)^p = 1 + p a_lambda eps = 1 + a_Gamma eps. So this is a
+    ONE-parameter-pair model (amplitude and correlation time), not an ad hoc
+    perturbation of four independent rates.
+
+    That exponent is 2 only where BOTH processes are unsaturated. Once
+    emission saturates, a_lambda falls and the ratio grows: on the
+    builtin-reference rate laws it is 2.02 at 0.05 uW but 3.98 at the 5.437 uW
+    reference point and 6.9 at 15 uW, because emission saturates at 4 uW while
+    ionization saturates at 12 uW. `local_photon_order` computes it from
+    whichever rate laws are active, and the noise experiments use that rather
+    than a hardcoded 2, so the model stays self-consistent with the physics
+    layer. With rate laws whose emission saturates more weakly the exponent is
+    nearer 2 and the noise correspondingly gentler.
+
+    sigma          RMS fractional amplitude of delta(t)
+    tau_c_ms       correlation time of delta(t)
+    kind           'ou' (Gaussian, zero third cumulant) or 'telegraph'
+                   (dichotomous, nonzero third cumulant). Matched in variance
+                   and correlation time, they differ only at third order --
+                   the distinction a bispectrum resolves and a power spectrum
+                   cannot, and the one that decides the remedy: a telegraph
+                   modulator is a genuine extra state and can be modelled as
+                   one, Gaussian modulation cannot.
+    photon_order   exponent coupling switching to emission; 2.0 for the
+                   two-photon ionization/recombination of 594 nm readout
+    steps_per_tau  segments per correlation time in the simulator
+    """
+
+    sigma: float = 0.0
+    tau_c_ms: float = 0.1
+    kind: str = "ou"
+    photon_order: float = 2.0
+    steps_per_tau: int = 12
+
+    @property
+    def is_off(self) -> bool:
+        return self.sigma <= 0.0
+
+    def validate(self) -> None:
+        if self.sigma < 0.0:
+            raise ValueError("sigma must be non-negative.")
+        if self.tau_c_ms <= 0.0:
+            raise ValueError("tau_c_ms must be positive.")
+        if self.kind not in ("ou", "telegraph"):
+            raise ValueError("kind must be 'ou' or 'telegraph'.")
+        if self.steps_per_tau < 1:
+            raise ValueError("steps_per_tau must be >= 1.")
+        # delta <= -1 drives a rate non-positive. For the telegraph process
+        # that is a hard failure because the low state is reached with
+        # probability 1/2; for the Gaussian it is a tail event, handled by
+        # clamping in `modulated_rates` and reported by `clamp_fraction`.
+        if self.kind == "telegraph" and self.sigma >= 1.0:
+            raise ValueError(
+                "telegraph modulation with sigma >= 1 gives a non-positive "
+                "rate in the low state."
+            )
+
+    def clamp_fraction(self) -> float:
+        """
+        Probability that the Gaussian modulator would drive a rate negative,
+        and is therefore clamped at zero. Zero for the telegraph process.
+        """
+        if self.is_off or self.kind != "ou":
+            return 0.0
+        from scipy.stats import norm
+
+        return float(norm.cdf(-1.0 / self.sigma))
+
+    def tag(self) -> str:
+        if self.is_off:
+            return "nonoise"
+        return (
+            f"noise_{self.kind}_s{self.sigma:g}_tau{self.tau_c_ms:g}ms"
+        )
+
+    def describe(self) -> str:
+        if self.is_off:
+            return "no rate noise"
+        return (
+            f"{self.kind} rate noise, sigma = {self.sigma:g}, "
+            f"tau_c = {self.tau_c_ms:g} ms, photon order {self.photon_order:g}"
+        )
+
+
+NOISE_OFF = RateNoise(sigma=0.0)
+
+
+def local_photon_order(power_uw: float, rel_step: float = 1e-5) -> float:
+    """
+    d ln(Gamma_-0) / d ln(lambda_-) at a given power, from the ACTIVE rate laws.
+
+    This is the exponent coupling switching to emission for a small power
+    fluctuation, evaluated where the experiment actually sits rather than
+    assumed. Equal to 2 in the doubly-unsaturated limit; larger once emission
+    saturates, since a saturated emission rate responds less to a power change
+    than an unsaturated two-photon switching rate does.
+    """
+    P = float(power_uw)
+    h = rel_step * P
+    a = shields_2015_params(P - h)
+    b = shields_2015_params(P + h)
+    d_gamma = np.log(b.gamma_minus_to_zero_khz) - np.log(
+        a.gamma_minus_to_zero_khz
+    )
+    d_lambda = np.log(b.lambda_minus_khz) - np.log(a.lambda_minus_khz)
+    if abs(d_lambda) < 1e-300:
+        return np.inf
+    return float(d_gamma / d_lambda)
+
+
+def _modulation_gain_mean(noise: RateNoise, order: float) -> float:
+    """
+    Ensemble mean of the clamped gain max(1+delta, 0)**order.
+
+    This is the renormalisation constant, and using the ENSEMBLE mean rather
+    than each shot's realised sample mean matters.
+
+    E[(1+delta)^2] = 1 + sigma^2, so multiplicative noise silently inflates
+    the mean switching rate by sigma^2 -- 9% at sigma = 0.3. Left uncorrected,
+    a sigma sweep would partly measure a mean-rate shift, which is the very
+    thing already known to be harmless. So a renormalisation is needed.
+
+    But dividing by the REALISED per-shot mean over-corrects. It forces every
+    shot to the nominal time-average, which deletes the shot-to-shot mean-rate
+    fluctuation -- exactly the quasi-static component that dominates when
+    tau_c exceeds the shot duration. The model would then be unable to
+    represent slow noise at all, and the within-shot amplitude would be
+    attenuated by a tau_c-dependent factor that has no physical meaning.
+    Measured on a 0.637 ms shot at sigma = 0.3, per-shot renormalisation left
+    a switching-gain spread of 0.57 at tau_c = 0.01 ms but only 0.15 at
+    tau_c = 1 ms, purely as an artifact of the normalisation.
+
+    Dividing by the ensemble mean removes the systematic inflation and nothing
+    else. Gauss-Hermite quadrature for the Gaussian marginal (exact for
+    integer order, and it accounts for the clamp); exact two-point average for
+    the telegraph process.
+    """
+    if noise.is_off:
+        return 1.0
+
+    p = float(order)
+
+    if noise.kind == "telegraph":
+        lo = max(1.0 - noise.sigma, 0.0)
+        hi = max(1.0 + noise.sigma, 0.0)
+        return 0.5 * (lo**p + hi**p)
+
+    nodes, weights = np.polynomial.hermite.hermgauss(64)
+    delta = np.sqrt(2.0) * noise.sigma * nodes
+    gain = np.power(np.maximum(1.0 + delta, 0.0), p)
+    return float(np.sum(weights * gain) / np.sqrt(np.pi))
+
+
+def modulator_path(
+    noise: RateNoise,
+    n_steps: int,
+    dt_ms: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Sample delta(t) on a uniform grid, exactly in both cases.
+
+    OU uses the exact AR(1) transition of the STATIONARY process, so the grid
+    spacing biases neither the variance nor the correlation time. Telegraph
+    uses exact exponential holding times, then bins to the grid. A symmetric
+    dichotomous process with mean holding time 2 tau_c has autocovariance
+    sigma^2 exp(-|t|/tau_c), matching the OU process it is compared against.
+    """
+    noise.validate()
+
+    if noise.is_off:
+        return np.zeros(n_steps)
+
+    if noise.kind == "ou":
+        a = float(np.exp(-dt_ms / noise.tau_c_ms))
+        s = noise.sigma * np.sqrt(max(1.0 - a * a, 0.0))
+        d = np.empty(n_steps)
+        d[0] = rng.normal(0.0, noise.sigma)
+        eps = rng.normal(0.0, s, n_steps)
+        for i in range(1, n_steps):
+            d[i] = a * d[i - 1] + eps[i]
+        return d
+
+    state = 1.0 if rng.random() < 0.5 else -1.0
+    t = 0.0
+    total = n_steps * dt_ms
+    edges = [0.0]
+    states = [state]
+    while t < total:
+        t += float(rng.exponential(2.0 * noise.tau_c_ms))
+        state = -state
+        edges.append(min(t, total))
+        states.append(state)
+
+    centres = (np.arange(n_steps) + 0.5) * dt_ms
+    idx = np.searchsorted(np.asarray(edges), centres, side="right") - 1
+    idx = np.clip(idx, 0, len(states) - 1)
+    return noise.sigma * np.asarray(states)[idx]
+
+
+def modulated_rates(
+    params: MMPPParams,
+    noise: RateNoise,
+    delta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Per-segment rates, renormalised by the ensemble mean gain.
+
+    Both gains are clamped at zero. A rate cannot be negative, and the
+    Gaussian modulator reaches 1 + delta < 0 with probability
+    Phi(-1/sigma) -- 4e-4 at sigma = 0.3, rare but not never. Leaving the
+    emission gain unclamped is silently wrong rather than loud: a negative
+    lambda makes the Gillespie total too small, so the sojourn is drawn from
+    the wrong distribution, and `rng.random() < lambda/total` can never fire,
+    so the segment quietly becomes switch-only.
+    """
+    if noise.is_off:
+        one = np.ones_like(delta)
+        return (
+            params.lambda_minus_khz * one,
+            params.lambda_zero_khz * one,
+            params.gamma_minus_to_zero_khz * one,
+            params.gamma_zero_to_minus_khz * one,
+        )
+
+    base = np.maximum(1.0 + delta, 0.0)
+
+    g_emis = base / _modulation_gain_mean(noise, 1.0)
+    g_swit = np.power(base, noise.photon_order) / _modulation_gain_mean(
+        noise, noise.photon_order
+    )
+
+    return (
+        params.lambda_minus_khz * g_emis,
+        params.lambda_zero_khz * g_emis,
+        params.gamma_minus_to_zero_khz * g_swit,
+        params.gamma_zero_to_minus_khz * g_swit,
+    )
+
+
+def simulate_modulated_shot(
+    t_max_ms: float,
+    initial_state: int,
+    params: MMPPParams,
+    noise: RateNoise,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Ideal photon arrivals from an MMPP whose rates vary within the shot.
+
+    The modulator is held constant on segments short compared with the
+    correlation time, and exact Gillespie sampling runs inside each segment
+    with the charge state carried across boundaries. Segment length is set by
+    the correlation time alone: Gillespie is exact for constant rates, so the
+    only discretisation error is in holding delta(t) constant, and tying dt to
+    the photon spacing as well would be needlessly fine.
+
+    Because the exponential is memoryless, truncating a sojourn at a segment
+    boundary and redrawing in the next segment is exact, not an approximation.
+    """
+    params.validate()
+    noise.validate()
+
+    dt = noise.tau_c_ms / noise.steps_per_tau
+    n_steps = max(int(np.ceil(float(t_max_ms) / dt)), 1)
+    dt = float(t_max_ms) / n_steps
+
+    delta = modulator_path(noise, n_steps, dt, rng)
+    lam_m, lam_0, g_m0, g_0m = modulated_rates(params, noise, delta)
+
+    state = int(initial_state)
+    if state not in (0, 1):
+        raise ValueError("initial_state must be 0 (NV-) or 1 (NV0).")
+
+    t = 0.0
+    out: list[float] = []
+
+    for i in range(n_steps):
+        t_end = (i + 1) * dt
+        lam = lam_m[i] if state == 0 else lam_0[i]
+        gam = g_m0[i] if state == 0 else g_0m[i]
+
+        while True:
+            total = lam + gam
+            if total <= 0.0:
+                t = t_end
+                break
+            t = t + float(rng.exponential(1.0 / total))
+            if t >= t_end:
+                t = t_end
+                break
+            if rng.random() < lam / total:
+                out.append(t)
+            else:
+                state = 1 - state
+                lam = lam_m[i] if state == 0 else lam_0[i]
+                gam = g_m0[i] if state == 0 else g_0m[i]
+
+    return np.asarray(out, dtype=float)
+
+
 def simulate_mmpp_shot(
     t_max_ms: float,
     initial_state: int,
     params: MMPPParams,
     rng: np.random.Generator,
     detector: DetectorModel = DETECTOR_OFF,
+    noise: RateNoise = NOISE_OFF,
 ) -> np.ndarray:
-    """One shot of recorded click times (ms), starting in `initial_state`."""
-    arrivals = _nv_simulate_mmpp_shot(t_max_ms, initial_state, params, rng)
+    """
+    One shot of recorded click times (ms), starting in `initial_state`.
+
+    With `noise` off this is the unmodified simulator, so sigma = 0 reproduces
+    every earlier result bit for bit.
+    """
+    if noise.is_off:
+        arrivals = _nv_simulate_mmpp_shot(t_max_ms, initial_state, params, rng)
+    else:
+        arrivals = simulate_modulated_shot(
+            t_max_ms, initial_state, params, noise, rng
+        )
     return apply_detector_response(arrivals, detector, rng, t_max_ms=t_max_ms)
 
 
@@ -836,6 +1188,7 @@ def simulate_balanced_dataset(
     params: MMPPParams,
     seed: int,
     detector: DetectorModel = DETECTOR_OFF,
+    noise: RateNoise = NOISE_OFF,
 ) -> tuple[list[np.ndarray], np.ndarray]:
     """
     Equal numbers of NV- and NV0 initial states, in interleaved order.
@@ -851,10 +1204,126 @@ def simulate_balanced_dataset(
     rng = np.random.default_rng(seed)
     labels = np.tile([0, 1], n)
     shots = [
-        simulate_mmpp_shot(t_max_ms, int(s), params, rng, detector)
+        simulate_mmpp_shot(t_max_ms, int(s), params, rng, detector, noise)
         for s in labels
     ]
     return shots, labels
+
+
+# -----------------------------------------------------------------------------
+# Observable-unit calibration: Mandel Q
+#
+# sigma is not measurable. The Mandel Q excess it produces is, so a noise
+# tolerance can be quoted as "survives a Q excess up to X" and checked against
+# a real photon record without knowing sigma.
+# -----------------------------------------------------------------------------
+
+
+def mandel_q_curve(
+    shots: Sequence[np.ndarray],
+    duration_ms: float,
+    bin_widths_ms: Sequence[float],
+) -> dict:
+    """
+    Q(T) = (Var N - <N>) / <N>, pooled over shots.
+
+    Zero for a pure Poisson process, so Q isolates rate modulation from shot
+    noise by construction. Bins are laid from t = 0 and any partial trailing
+    bin is dropped, so every bin has the same exposure.
+    """
+    out = {}
+    for T in bin_widths_ms:
+        T = float(T)
+        nb = max(int(float(duration_ms) / T), 1)
+        counts = []
+        for ts in shots:
+            c, _ = np.histogram(ts, bins=nb, range=(0.0, nb * T))
+            counts.append(c)
+        c = np.concatenate(counts).astype(float)
+        mu = c.mean()
+        out[T] = float((c.var() - mu) / mu) if mu > 0 else np.nan
+    return out
+
+
+def mandel_q_mmpp(params: MMPPParams, T_ms: float) -> float:
+    """
+    Closed form under the two-state MMPP null, with no free parameters.
+
+    With rate autocovariance C(s) = (dlambda)^2 p(1-p) exp(-Gamma |s|),
+
+        Var N_T - <N> = 2 (dlambda)^2 p(1-p) (T/Gamma) [1 - (1-e^-x)/x]
+
+    for x = Gamma T, so dividing by <N> = lambda_bar T gives the expression
+    below. Assumes the STATIONARY chain, which is why `measure_q_excess`
+    draws its initial state from the stationary distribution rather than
+    balancing it. Verified against simulation to 0.1% at short bins.
+    """
+    g_m0 = params.gamma_minus_to_zero_khz
+    g_0m = params.gamma_zero_to_minus_khz
+    G = g_m0 + g_0m
+    pb = g_0m / G
+    dl = params.lambda_minus_khz - params.lambda_zero_khz
+    lbar = pb * params.lambda_minus_khz + (1.0 - pb) * params.lambda_zero_khz
+    x = G * float(T_ms)
+    bracket = 1.0 - (1.0 - np.exp(-x)) / x if x > 0 else 0.0
+    return float(2.0 * dl * dl * pb * (1.0 - pb) / (lbar * G) * bracket)
+
+
+def measure_q_excess(
+    params: MMPPParams,
+    noise: RateNoise,
+    duration_ms: float,
+    n_shots: int = 300,
+    seed: int = 0,
+    bin_widths_ms: Sequence[float] | None = None,
+    detector: DetectorModel = DETECTOR_OFF,
+) -> dict:
+    """
+    Measured Q minus the MMPP prediction, per bin width.
+
+    The initial state is drawn from the STATIONARY distribution, matching the
+    assumption behind `mandel_q_mmpp`. Balancing the two initial states 50/50
+    instead -- as the readout datasets must -- over-weights NV- by a factor
+    1/(2 p_bright), about 4x at the reference point, and leaves a residual in
+    the Q excess that has nothing to do with rate noise.
+
+    Bin widths default to a geometric spread inside the shot, since a bin
+    wider than the shot measures shot-to-shot spread rather than Q.
+    """
+    params.validate()
+
+    if bin_widths_ms is None:
+        bin_widths_ms = np.geomspace(
+            duration_ms / 40.0, duration_ms / 4.0, 3
+        )
+
+    pb = regime_summary(params)["p_bright_stationary"]
+    rng = np.random.default_rng(seed)
+
+    shots = [
+        simulate_mmpp_shot(
+            duration_ms,
+            0 if rng.random() < pb else 1,
+            params,
+            rng,
+            detector,
+            noise,
+        )
+        for _ in range(int(n_shots))
+    ]
+
+    meas = mandel_q_curve(shots, duration_ms, bin_widths_ms)
+    return {
+        "bin_widths_ms": [float(T) for T in sorted(meas)],
+        "q_measured": [meas[T] for T in sorted(meas)],
+        "q_mmpp": [mandel_q_mmpp(params, T) for T in sorted(meas)],
+        "q_excess": [
+            meas[T] - mandel_q_mmpp(params, T) for T in sorted(meas)
+        ],
+        "mean_clicks_per_shot": float(
+            np.mean([s.size for s in shots])
+        ),
+    }
 
 
 # =============================================================================
@@ -1977,7 +2446,9 @@ class RunConfig:
     max_n_up: int = 120
     seed: int = 20260916
     detector: DetectorModel = DETECTOR_OFF
+    noise: RateNoise = NOISE_OFF
     include_fixed_mmpp: bool = False
+    n_q_shots: int = 300
     efficiency_model: str = "signal_only"
     verbose: bool = True
 
@@ -2022,6 +2493,8 @@ class OperatingPoint:
     power_uw: float | None = None
     detection_efficiency: float = 1.0
     seed_offset: int = 0
+    # Per-point override of cfg.noise, so a sweep can vary the noise itself.
+    noise: RateNoise | None = None
 
 
 def choose_horizon_us(
@@ -2116,6 +2589,8 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     )
 
     detector = cfg.detector
+    noise = point.noise if point.noise is not None else cfg.noise
+    noise.validate()
     filter_params = _filter_params_for(params, detector)
     seed = int(cfg.seed) + int(point.seed_offset)
 
@@ -2123,6 +2598,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         print(f"\n{'=' * 78}")
         print(f"{point.label}  |  horizon = {horizon_us:.1f} us")
         print(f"  detector: {detector.describe()}")
+        print(f"  rate noise: {noise.describe()}")
         print(
             f"  lambda_- = {params.lambda_minus_khz:8.2f} kHz   "
             f"Gamma_-0 = {params.gamma_minus_to_zero_khz:8.4f} kHz"
@@ -2146,10 +2622,22 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
 
     # ---- data --------------------------------------------------------------
     cal_shots, cal_labels = simulate_balanced_dataset(
-        cfg.n_cal, horizon_us / 1000.0, params, seed, detector
+        cfg.n_cal, horizon_us / 1000.0, params, seed, detector, noise
     )
     test_shots, test_labels = simulate_balanced_dataset(
-        cfg.n_test, horizon_us / 1000.0, params, seed + 7717, detector
+        cfg.n_test, horizon_us / 1000.0, params, seed + 7717, detector, noise
+    )
+
+    # Observable-unit calibration of the noise, on its own stationary dataset.
+    # The filter below is still built from the NOMINAL rates, which is the
+    # model mismatch this experiment measures.
+    q_cal = measure_q_excess(
+        params,
+        noise,
+        horizon_us / 1000.0,
+        n_shots=cfg.n_q_shots,
+        seed=seed + 4242,
+        detector=detector,
     )
 
     spec = build_no_click_spectral(filter_params)
@@ -2165,6 +2653,14 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
             f"  records built in {time.time() - t0:.1f} s "
             f"(max clicks/shot = {int(test_packed.n_clicks.max())})"
         )
+        if not noise.is_off:
+            print(
+                "  Q excess (measured - MMPP null) at bins "
+                + ", ".join(
+                    f"{T * 1000:.0f} us: {q:+.3f}"
+                    for T, q in zip(q_cal["bin_widths_ms"], q_cal["q_excess"])
+                )
+            )
 
     t_floor_us = time_grid_floor_us(params, horizon_us)
     readout_times_us = np.geomspace(t_floor_us, horizon_us, cfg.n_readout_times)
@@ -2504,6 +3000,8 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         "params": params,
         "filter_params": filter_params,
         "detector": detector,
+        "noise": noise,
+        "q_calibration": q_cal,
         "regime": reg,
         "horizon_us": horizon_us,
         "seed": seed,
@@ -2659,6 +3157,21 @@ CONTRASTS = [0.50, 0.70, 0.85, 0.95, 0.99]
 EFFICIENCIES = [0.02, 0.05, 0.15, 0.40, 1.00]
 
 SWEEP_COLORS = ["#08306b", "#2171b5", "#6baed6", "#fd8d3c", "#a50f15"]
+
+# Rate-noise grids. sigma is the RMS fractional intensity fluctuation; tau_c is
+# its correlation time. The interesting scale is the mean bright dwell,
+# 1/Gamma_-0 = 120 us at the reference point: noise much faster than that
+# averages out within a dwell, noise much slower is quasi-static and the
+# calibrated boundary absorbs it, so the damage should peak in between.
+NOISE_SIGMAS = [0.0, 0.05, 0.10, 0.20, 0.30]
+NOISE_TAUS_MS = [0.01, 0.03, 0.10, 0.30, 1.00]
+NOISE_REF_SIGMA = 0.20
+NOISE_REF_TAU_MS = 0.10
+
+# Switching/emission coupling at the reference power, taken from the active
+# rate laws rather than assumed to be 2. On the builtin-reference laws
+# emission is already 58% saturated at 5.437 uW, which pushes this to ~4.
+NOISE_PHOTON_ORDER = local_photon_order(BASE_POWER_UW)
 
 
 def check_power(power_uw: float) -> None:
@@ -2843,6 +3356,101 @@ def _efficiency_points(cfg: RunConfig) -> list[OperatingPoint]:
     return pts
 
 
+def _noise_sigma_points(cfg: RunConfig) -> list[OperatingPoint]:
+    base = _base_params()
+    pts = []
+    for sg in NOISE_SIGMAS:
+        noise = RateNoise(
+            sigma=float(sg),
+            tau_c_ms=NOISE_REF_TAU_MS,
+            kind="ou",
+            photon_order=NOISE_PHOTON_ORDER,
+        )
+        pts.append(
+            OperatingPoint(
+                name=f"sigma{sg:g}",
+                label=f"$\\sigma$ = {sg:g}" if sg else "no noise",
+                params=base,
+                sweep_value=float(sg),
+                power_uw=BASE_POWER_UW,
+                detection_efficiency=1.0,
+                noise=noise,
+            )
+        )
+    return pts
+
+
+def _noise_tau_points(cfg: RunConfig) -> list[OperatingPoint]:
+    base = _base_params()
+    pts = []
+    for tau in NOISE_TAUS_MS:
+        noise = RateNoise(
+            sigma=NOISE_REF_SIGMA,
+            tau_c_ms=float(tau),
+            kind="ou",
+            photon_order=NOISE_PHOTON_ORDER,
+        )
+        pts.append(
+            OperatingPoint(
+                name=f"tau{tau:g}ms",
+                label=f"$\\tau_c$ = {1000 * tau:g} us",
+                params=base,
+                sweep_value=float(tau),
+                power_uw=BASE_POWER_UW,
+                detection_efficiency=1.0,
+                noise=noise,
+            )
+        )
+    return pts
+
+
+def _noise_kind_points(cfg: RunConfig) -> list[OperatingPoint]:
+    """
+    OU against telegraph at matched variance and correlation time.
+
+    They differ only at third order, which is the distinction a bispectrum can
+    resolve and a power spectrum cannot -- and the one that decides the
+    remedy, since a telegraph modulator is a genuine extra state and could be
+    absorbed into a three-state filter whereas Gaussian modulation cannot.
+    """
+    base = _base_params()
+    specs = [
+        ("off", "no noise", NOISE_OFF),
+        (
+            "ou",
+            "Gaussian (OU)",
+            RateNoise(
+                sigma=NOISE_REF_SIGMA,
+                tau_c_ms=NOISE_REF_TAU_MS,
+                kind="ou",
+                photon_order=NOISE_PHOTON_ORDER,
+            ),
+        ),
+        (
+            "telegraph",
+            "telegraph",
+            RateNoise(
+                sigma=NOISE_REF_SIGMA,
+                tau_c_ms=NOISE_REF_TAU_MS,
+                kind="telegraph",
+                photon_order=NOISE_PHOTON_ORDER,
+            ),
+        ),
+    ]
+    return [
+        OperatingPoint(
+            name=nm,
+            label=lab,
+            params=base,
+            sweep_value=float(i),
+            power_uw=BASE_POWER_UW,
+            detection_efficiency=1.0,
+            noise=nz,
+        )
+        for i, (nm, lab, nz) in enumerate(specs)
+    ]
+
+
 @dataclass(frozen=True)
 class SweepSpec:
     key: str
@@ -2905,6 +3513,45 @@ EXPERIMENTS: dict[str, SweepSpec] = {
             "to tell apart."
         ),
     ),
+    "noise": SweepSpec(
+        key="noise",
+        title="Rate-noise amplitude sweep (Gaussian, tau_c = 100 us)",
+        xlabel=r"rate-noise amplitude $\sigma$",
+        legend_title="noise amplitude",
+        build_points=_noise_sigma_points,
+        xscale="linear",
+        note=(
+            "A single fractional intensity fluctuation drives emission "
+            "linearly and switching quadratically, as the photon order "
+            "requires. The filter is built from the NOMINAL rates, so this is "
+            "the one error a calibrated boundary cannot absorb."
+        ),
+    ),
+    "noise_tau": SweepSpec(
+        key="noise_tau",
+        title="Rate-noise correlation-time sweep (Gaussian, sigma = 0.2)",
+        xlabel=r"noise correlation time $\tau_c$ (ms)",
+        legend_title="correlation time",
+        build_points=_noise_tau_points,
+        note=(
+            "Noise much faster than the 120 us bright dwell averages out "
+            "within a dwell; noise much slower is quasi-static and the "
+            "calibrated cutoff absorbs it. The damage should peak in between."
+        ),
+    ),
+    "noise_kind": SweepSpec(
+        key="noise_kind",
+        title="Gaussian vs telegraph rate noise at matched variance",
+        xlabel="modulator type",
+        legend_title="modulator",
+        build_points=_noise_kind_points,
+        xscale="linear",
+        note=(
+            "Matched in variance and correlation time, differing only at "
+            "third order -- what a bispectrum resolves and a power spectrum "
+            "cannot."
+        ),
+    ),
     "efficiency": SweepSpec(
         key="efficiency",
         title="Detection-efficiency sweep",
@@ -2931,9 +3578,19 @@ def run_directory(
     spec: SweepSpec,
     out_root: Path,
     detector: DetectorModel,
+    noise: RateNoise = NOISE_OFF,
 ) -> Path:
-    """One directory per (experiment, detector setting) so runs never collide."""
+    """
+    One directory per (experiment, detector, noise) so runs never collide.
+
+    The noise tag is omitted when the noise is off, so existing output paths
+    are unchanged. The noise sweeps vary the noise PER POINT, so their own
+    directory tag stays "nonoise" and the per-point setting lives in the
+    filename and the result.
+    """
     d = Path(out_root) / spec.key / detector.tag()
+    if not noise.is_off:
+        d = d / noise.tag()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -2955,8 +3612,9 @@ def load_results(
     cfg: RunConfig | None = None,
 ) -> list[dict]:
     """Load whatever points have been run, in sweep order."""
-    directory = run_directory(spec, out_root, detector)
-    points = spec.build_points(cfg if cfg is not None else RunConfig(verbose=False))
+    cfg = cfg if cfg is not None else RunConfig(verbose=False)
+    directory = run_directory(spec, out_root, detector, cfg.noise)
+    points = spec.build_points(cfg)
 
     out = []
     for i, p in enumerate(points):
@@ -4005,6 +4663,199 @@ def validate_all(verbose: bool = True) -> int:
         f"max diff {np.abs(a_stop - a_grid).max():.2e}",
     )
 
+    # -- 9c. rate noise ------------------------------------------------------
+    rng = np.random.default_rng(20250917)
+
+    # The modulator must have the variance and correlation time it claims, on
+    # the simulation grid, for both kinds.
+    for kind in ("ou", "telegraph"):
+        nz = RateNoise(sigma=0.25, tau_c_ms=0.1, kind=kind, steps_per_tau=12)
+        dt = nz.tau_c_ms / nz.steps_per_tau
+        n = 60000
+        d = modulator_path(nz, n, dt, rng)
+        var_ok = abs(d.std() / nz.sigma - 1.0) < 0.05
+        # Correlation time from the lag-1 autocorrelation of the grid.
+        r1 = float(np.corrcoef(d[:-1], d[1:])[0, 1])
+        tau_est = -dt / np.log(max(r1, 1e-12))
+        tau_ok = abs(tau_est / nz.tau_c_ms - 1.0) < 0.15
+        check(
+            f"{kind} modulator has the stated variance",
+            var_ok,
+            f"std {d.std():.4f} vs sigma {nz.sigma}",
+        )
+        check(
+            f"{kind} modulator has the stated correlation time",
+            tau_ok,
+            f"tau_est {tau_est:.4f} ms vs {nz.tau_c_ms} ms",
+        )
+
+    # Third cumulant separates the two kinds: zero for Gaussian, nonzero for
+    # the dichotomous process ONLY if it is asymmetric -- the symmetric
+    # telegraph used here also has zero skew, so the distinction shows up in
+    # the fourth cumulant (kurtosis) instead. Assert what is actually true
+    # rather than what the label suggests.
+    d_ou = modulator_path(
+        RateNoise(sigma=0.25, tau_c_ms=0.1, kind="ou"), 60000, 0.1 / 12, rng
+    )
+    d_tel = modulator_path(
+        RateNoise(sigma=0.25, tau_c_ms=0.1, kind="telegraph"),
+        60000,
+        0.1 / 12,
+        rng,
+    )
+    k_ou = float(((d_ou / d_ou.std()) ** 4).mean() - 3.0)
+    k_tel = float(((d_tel / d_tel.std()) ** 4).mean() - 3.0)
+    check(
+        "OU and telegraph differ beyond second order (excess kurtosis)",
+        abs(k_ou) < 0.15 and k_tel < -1.5,
+        f"OU {k_ou:+.3f} (Gaussian 0), telegraph {k_tel:+.3f} (two-level -2)",
+    )
+
+    # Mean renormalisation: the ENSEMBLE mean gain must be 1 for both rates,
+    # so multiplicative noise does not smuggle in a mean-rate shift. This is
+    # the check that would have caught renormalising by the realised per-shot
+    # mean, which instead forces every shot to the nominal average and
+    # deletes the quasi-static component.
+    for kind in ("ou", "telegraph"):
+        nz = RateNoise(sigma=0.3, tau_c_ms=0.05, kind=kind, steps_per_tau=12)
+        dt = nz.tau_c_ms / nz.steps_per_tau
+        big = modulator_path(nz, 400000, dt, rng)
+        lam_m, lam_0, g_m0, g_0m = modulated_rates(tp, nz, big)
+        e_lam = lam_m.mean() / tp.lambda_minus_khz
+        e_gam = g_m0.mean() / tp.gamma_minus_to_zero_khz
+        check(
+            f"{kind} rate noise preserves the mean emission rate",
+            abs(e_lam - 1.0) < 0.02,
+            f"ratio {e_lam:.4f}",
+        )
+        check(
+            f"{kind} rate noise preserves the mean switching rate",
+            abs(e_gam - 1.0) < 0.02,
+            f"ratio {e_gam:.4f} (uncorrected would be 1 + sigma^2 = "
+            f"{1 + nz.sigma**2:.3f})",
+        )
+
+    # The pooled spread of the gain is the marginal spread whatever tau_c is,
+    # so it cannot test the renormalisation. What tau_c controls is how that
+    # spread SPLITS between shots and within a shot, and renormalising per
+    # shot instead of per ensemble sets the between-shot part to exactly zero
+    # -- deleting the quasi-static limit the tau_c sweep is meant to probe.
+    # So assert that the between-shot part grows with tau_c and survives.
+    between, within = [], []
+    for tau in (0.01, 0.1, 1.0):
+        nz = RateNoise(sigma=0.3, tau_c_ms=tau, kind="ou")
+        dt = nz.tau_c_ms / nz.steps_per_tau
+        n = max(int(0.637 / dt), 2)
+        means, stds = [], []
+        for _ in range(200):
+            dd = modulator_path(nz, n, dt, rng)
+            _, _, gg, _ = modulated_rates(tp, nz, dd)
+            gg = gg / tp.gamma_minus_to_zero_khz
+            means.append(gg.mean())
+            stds.append(gg.std())
+        between.append(float(np.std(means)))
+        within.append(float(np.mean(stds)))
+    check(
+        "ensemble renormalisation keeps the quasi-static component",
+        between[0] < between[1] < between[2] and between[2] > 0.05,
+        f"between-shot std {[round(x, 3) for x in between]} at tau_c = "
+        f"0.01, 0.1, 1 ms (per-shot renormalisation gives 0, 0, 0)",
+    )
+    check(
+        "within-shot component falls as the noise slows",
+        within[0] > within[1] > within[2],
+        f"within-shot std {[round(x, 3) for x in within]}",
+    )
+
+    # No rate may be negative: the Gaussian modulator reaches 1 + delta < 0.
+    nz = RateNoise(sigma=0.5, tau_c_ms=0.05, kind="ou")
+    dt = nz.tau_c_ms / nz.steps_per_tau
+    dd = modulator_path(nz, 200000, dt, rng)
+    lam_m, lam_0, g_m0, g_0m = modulated_rates(tp, nz, dd)
+    n_would = int((1.0 + dd < 0).sum())
+    check(
+        "all modulated rates stay non-negative",
+        min(lam_m.min(), lam_0.min(), g_m0.min(), g_0m.min()) >= 0.0,
+        f"{n_would} of {dd.size} segments would have gone negative unclamped",
+    )
+    check(
+        "clamp_fraction predicts the clamped tail",
+        abs(n_would / dd.size - nz.clamp_fraction()) < 0.01,
+        f"measured {n_would / dd.size:.4f} vs predicted "
+        f"{nz.clamp_fraction():.4f}",
+    )
+
+    # sigma = 0 must reproduce the unmodulated simulator bit for bit, so every
+    # earlier result stands unchanged.
+    r_off = simulate_mmpp_shot(
+        1.0, 0, tp, np.random.default_rng(31415), DETECTOR_OFF, NOISE_OFF
+    )
+    r_base = _nv_simulate_mmpp_shot(1.0, 0, tp, np.random.default_rng(31415))
+    check(
+        "sigma = 0 reproduces the unmodulated simulator exactly",
+        r_off.size == r_base.size and np.allclose(r_off, r_base),
+    )
+
+    # Rate noise must raise the Mandel Q excess above the MMPP null, which is
+    # what makes it reportable in observable units.
+    # The closed form is the null: with no rate noise the excess must vanish
+    # relative to Q_MMPP itself, which is O(1-7) at these bin widths.
+    q0 = measure_q_excess(tp, NOISE_OFF, 0.637, n_shots=800, seed=5)
+    rel = [
+        abs(e) / max(abs(v), 1e-9)
+        for e, v in zip(q0["q_excess"], q0["q_mmpp"])
+    ]
+    check(
+        "Mandel Q closed form matches the unmodulated simulation",
+        max(rel) < 0.08,
+        f"relative excess {[round(r, 3) for r in rel]} of Q_MMPP "
+        f"{[round(v, 2) for v in q0['q_mmpp']]}",
+    )
+
+    # Rate noise must raise Q at the FINEST bin, where the MMPP contribution
+    # is smallest and the added rate variance is therefore most visible. It is
+    # deliberately NOT asserted to rise at every bin or monotonically in
+    # sigma: modulating the switching rate also decorrelates the charge state
+    # faster, which LOWERS the MMPP part of Q, and the two effects partly
+    # cancel at intermediate sigma. Measured excess at the finest bin runs
+    # +0.01, +0.05, +0.02, +0.15 for sigma = 0, 0.1, 0.2, 0.3.
+    q1 = measure_q_excess(
+        tp,
+        RateNoise(
+            sigma=0.3, tau_c_ms=0.1, kind="ou", photon_order=NOISE_PHOTON_ORDER
+        ),
+        0.637,
+        n_shots=800,
+        seed=5,
+    )
+    check(
+        "strong rate noise raises Q at the finest bin",
+        q1["q_measured"][0] > q0["q_measured"][0],
+        f"Q {q0['q_measured'][0]:.3f} -> {q1['q_measured'][0]:.3f} at "
+        f"T = {1000 * q0['bin_widths_ms'][0]:.0f} us",
+    )
+
+    # The photon-order coupling is not a free choice: it must match the rate
+    # laws this file implements.
+    # The photon-order coupling is not a free choice, but it equals 2 only
+    # where BOTH processes are unsaturated. Assert the unsaturated limit, and
+    # report the value at the powers actually used so the saturation-driven
+    # rise is on the record rather than assumed away.
+    low = [local_photon_order(P) for P in (0.05, 0.1, 0.2)]
+    used = [local_photon_order(P) for P in (0.875, BASE_POWER_UW, 15.0)]
+    check(
+        "photon order -> 2 in the unsaturated limit",
+        all(1.95 <= o <= 2.15 for o in low),
+        f"orders {[round(o, 2) for o in low]} at 0.05-0.2 uW",
+    )
+    check(
+        "photon order rises with emission saturation, and is used as measured",
+        used[0] < used[1] < used[2]
+        and abs(NOISE_PHOTON_ORDER - used[1]) < 1e-6,
+        f"orders {[round(o, 2) for o in used]} at 0.875, "
+        f"{BASE_POWER_UW}, 15 uW; sweeps use {NOISE_PHOTON_ORDER:.2f}",
+    )
+
     # -- 10. the detector model ----------------------------------------------
     rng = np.random.default_rng(12345)
 
@@ -4214,9 +5065,33 @@ def detector_from_args(args: argparse.Namespace) -> DetectorModel:
     return det
 
 
+def noise_from_args(args: argparse.Namespace) -> RateNoise:
+    """
+    Build the rate noise from --noise-* flags. Off by default, so omitting
+    them reproduces every earlier result. The noise sweeps set it per point
+    and ignore these flags.
+    """
+    sigma = getattr(args, "noise_sigma", None)
+    if sigma is None or float(sigma) <= 0.0:
+        return NOISE_OFF
+
+    order = getattr(args, "noise_photon_order", None)
+    nz = RateNoise(
+        sigma=float(sigma),
+        tau_c_ms=float(getattr(args, "noise_tau_ms", None) or NOISE_REF_TAU_MS),
+        kind=getattr(args, "noise_kind", None) or "ou",
+        photon_order=(
+            float(order) if order is not None else NOISE_PHOTON_ORDER
+        ),
+    )
+    nz.validate()
+    return nz
+
+
 def config_from_args(args: argparse.Namespace, spec: SweepSpec) -> RunConfig:
     cfg = RunConfig(
         detector=detector_from_args(args),
+        noise=noise_from_args(args),
         include_fixed_mmpp=spec.include_fixed_mmpp,
         verbose=not args.quiet,
     )
@@ -4284,7 +5159,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
     points = spec.build_points(cfg)
-    directory = run_directory(spec, Path(args.out), cfg.detector)
+    directory = run_directory(spec, Path(args.out), cfg.detector, cfg.noise)
 
     idx = _selected_indices(args.point, len(points))
 
@@ -4308,7 +5183,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_plot(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
-    directory = run_directory(spec, Path(args.out), cfg.detector)
+    directory = run_directory(spec, Path(args.out), cfg.detector, cfg.noise)
     results = load_results(spec, Path(args.out), cfg.detector, cfg)
 
     if not results:
@@ -4348,6 +5223,11 @@ _SPEEDUP_CSV_COLUMNS = [
     "p_bright_stationary",
     "gamma_tot_khz",
     "horizon_us",
+    "noise_sigma",
+    "noise_tau_c_ms",
+    "noise_kind",
+    "noise_photon_order",
+    "q_excess_finest_bin",
     "target_fidelity",
     "t_threshold_us",
     "t_adaptive_count_us",
@@ -4410,6 +5290,15 @@ def export_csv(
                 "gamma_tot_khz": reg["gamma_tot_khz"],
                 "horizon_us": res["horizon_us"],
             }
+            nz = res.get("noise")
+            if nz is not None:
+                base["noise_sigma"] = nz.sigma
+                base["noise_tau_c_ms"] = nz.tau_c_ms
+                base["noise_kind"] = nz.kind if not nz.is_off else "off"
+                base["noise_photon_order"] = nz.photon_order
+            q = res.get("q_calibration")
+            if q is not None and q["q_excess"]:
+                base["q_excess_finest_bin"] = q["q_excess"][0]
             for row in res["speedup_table"]:
                 out = dict(base)
                 for k in _SPEEDUP_CSV_COLUMNS:
@@ -4443,7 +5332,7 @@ def export_csv(
 def cmd_export(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
-    directory = run_directory(spec, Path(args.out), cfg.detector)
+    directory = run_directory(spec, Path(args.out), cfg.detector, cfg.noise)
     results = load_results(spec, Path(args.out), cfg.detector, cfg)
 
     if not results:
@@ -4543,6 +5432,16 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--afterpulse-prob", type=float, default=None)
         sp.add_argument("--afterpulse-tau-ns", type=float, default=None)
+        # Rate-noise switches. Off unless --noise-sigma is given.
+        sp.add_argument(
+            "--noise-sigma", type=float, default=None,
+            help="RMS fractional rate fluctuation; enables the noise model",
+        )
+        sp.add_argument("--noise-tau-ms", type=float, default=None)
+        sp.add_argument(
+            "--noise-kind", default=None, choices=["ou", "telegraph"],
+        )
+        sp.add_argument("--noise-photon-order", type=float, default=None)
         sp.add_argument(
             "--no-filter-correction", action="store_true",
             help=(
