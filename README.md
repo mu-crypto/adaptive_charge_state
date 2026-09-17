@@ -14,11 +14,26 @@ what used to be four scripts (`adaptive_charge_readout.py`,
 Always, on identical shots:
 
 1. **fixed-time count threshold** — the standard method, the baseline
-2. **adaptive count SPRT** — adaptive stopping, count statistic
-3. **adaptive MMPP SPRT** — adaptive stopping, event-time statistic
+2. **adaptive count SPRT** — stop at the n-th photon, decide on whether you got there
+3. **fixed-count MMPP** — same stopping rule as 2, decide with the calibrated MMPP LLR
+4. **adaptive MMPP SPRT** — stop when the LLR crosses a calibrated boundary
 
-Method 2 is the control that splits the gain: 1 → 2 is the value of adaptive
-stopping alone, 2 → 3 is the value of the event-time statistic on top of it.
+The design is a 2×2 of stopping rule against decision statistic:
+
+| stopping rule | decision statistic | method |
+|---|---|---|
+| fixed time | photon count | 1 fixed-time threshold |
+| fixed time | MMPP LLR | fixed-time MMPP (optional) |
+| fixed count | count (one bit) | 2 adaptive count SPRT |
+| fixed count | MMPP LLR | 3 fixed-count MMPP |
+| LLR boundary | MMPP LLR | 4 adaptive MMPP SPRT |
+
+Methods 2 and 3 share their stopping rule *exactly* — identical per-shot stop
+times, hence identical mean run time, which `validate` asserts — so 2 → 3
+isolates the value of the event-time statistic with stopping held fixed, and
+3 → 4 isolates the value of the LLR as a stopping rule with the statistic held
+fixed. Without both controls a speedup could be attributed to either axis.
+
 The `demo` experiment additionally runs a fixed-time MMPP baseline with a
 calibrated cutoff, plus a paired exact McNemar test.
 
@@ -44,7 +59,7 @@ python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
 ```
 
-A full five-point sweep takes well under two minutes; `--quick` runs a small
+A full five-point sweep takes a couple of minutes; `--quick` runs a small
 smoke version. Results are pickled under `out_master/<experiment>/<detector>/`
 so figures and the speedup analysis can be regenerated without re-simulating.
 

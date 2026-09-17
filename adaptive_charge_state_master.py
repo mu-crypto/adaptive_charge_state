@@ -23,17 +23,31 @@ Show that an adaptive (sequential) MMPP readout reaches the SAME initial-state
 charge fidelity as an optimized fixed-time count threshold in significantly
 LESS average run time.
 
-Three methods are always compared on identical shots:
+Four methods are always compared on identical shots:
 
     1. fixed-time count threshold   (the standard method; the baseline)
-    2. adaptive count SPRT          (adaptive stopping, count statistic)
-    3. adaptive MMPP SPRT           (adaptive stopping, event-time statistic)
+    2. adaptive count SPRT          (fixed-count stopping, count statistic)
+    3. fixed-count MMPP             (fixed-count stopping, event-time statistic)
+    4. adaptive MMPP SPRT           (LLR-boundary stopping, event-time statistic)
 
-Method 2 is the control that separates the two sources of gain: 1 -> 2 is the
-value of adaptive stopping alone, 2 -> 3 is the value of the event-time
-statistic on top of adaptivity. A fourth method, the fixed-time MMPP with a
-calibrated cutoff, is added when ``include_fixed_mmpp`` is set (the ``demo``
-experiment uses it; the sweeps deliberately omit it).
+Methods 2 and 3 are the controls that factor the gain along the two axes of the
+design, stopping rule and decision statistic:
+
+    stopping rule   decision statistic   method
+    -------------   ------------------   ---------------------------
+    fixed time      photon count         1  fixed-time threshold
+    fixed time      MMPP LLR                fixed-time MMPP (optional)
+    fixed count     count (one bit)      2  adaptive count SPRT
+    fixed count     MMPP LLR             3  fixed-count MMPP
+    LLR boundary    MMPP LLR             4  adaptive MMPP SPRT
+
+Methods 2 and 3 share their stopping rule exactly -- identical per-shot stop
+times, hence identical mean run time -- so 2 -> 3 isolates the value of the
+event-time statistic with stopping held fixed, and 3 -> 4 isolates the value of
+the LLR as a stopping rule with the statistic held fixed. Without both controls,
+a speedup could be attributed to either axis. A fifth method, the fixed-time
+MMPP with a calibrated cutoff, is added when ``include_fixed_mmpp`` is set (the
+``demo`` experiment uses it; the sweeps deliberately omit it).
 
 What the engine does that a grid filter does not
 ------------------------------------------------
@@ -1827,6 +1841,111 @@ def run_adaptive_count(
     return times_us, preds
 
 
+def llr_at_stop_times(
+    packed: PaddedRecords,
+    stop_times_us: np.ndarray,
+) -> np.ndarray:
+    """
+    Exact LLR at a PER-SHOT stop time. Returns shape (n_shots,).
+
+    `llr_at_times` evaluates a common time grid for every shot; this evaluates
+    each shot at its own stopping instant, which is what any data-dependent
+    stopping rule needs.
+
+    Boundary convention: the value returned is the LLR an instant BEFORE any
+    photon landing exactly at `stop_times_us`, because the interval search uses
+    a strict `t_start < t`. Callers that stop AT a photon and have therefore
+    observed it must use that photon's post-jump value instead -- see
+    `fixed_count_mmpp_statistic`, which does exactly that.
+    """
+    t = np.asarray(stop_times_us, dtype=float).reshape(-1) / 1000.0
+    spec = packed.spec
+    n = packed.n_shots
+
+    if t.size != n:
+        raise ValueError("stop_times_us must have one entry per shot.")
+
+    rows = np.arange(n)
+    k = np.maximum((packed.t_start < t[:, None]).sum(axis=1) - 1, 0)
+    dt = np.maximum(t - packed.t_start[rows, k], 0.0)
+    x = (
+        np.ones_like(dt)
+        if spec.degenerate
+        else np.exp(-2.0 * spec.delta * dt)
+    )
+    g0 = packed.alpha[rows, k, 0] + packed.beta[rows, k, 0] * x
+    g1 = packed.alpha[rows, k, 1] + packed.beta[rows, k, 1] * x
+    return packed.llr_start[rows, k] + np.log(g0) - np.log(g1)
+
+
+def fixed_count_mmpp_statistic(
+    packed: PaddedRecords,
+    click_times_ms: np.ndarray,
+    n_up: int,
+    deadline_us: float,
+    llr_at_deadline: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    FIXED-COUNT MMPP: stop at the n_up-th photon, decide with the MMPP LLR.
+
+    This completes the 2x2 of stopping rule against decision statistic:
+
+        stopping rule   decision statistic   method
+        -------------   ------------------   ------------------------
+        fixed time      photon count         fixed-time threshold (1)
+        fixed time      MMPP LLR             fixed-time MMPP (2)
+        fixed count     count (trivial)      adaptive count SPRT (3)
+        fixed count     MMPP LLR             fixed-count MMPP (this)
+        LLR boundary    MMPP LLR             adaptive MMPP SPRT (4)
+
+    It shares its stopping rule EXACTLY with `run_adaptive_count` -- same
+    per-shot stop times, hence the same mean run time -- so comparing the two
+    isolates the value of the decision statistic with the stopping rule held
+    fixed. Comparing it with the adaptive MMPP SPRT then isolates the value of
+    the LLR as a STOPPING rule, with the statistic held fixed. Method 3 is the
+    degenerate case where the statistic carries only one bit, "did n_up photons
+    arrive before the deadline".
+
+    Returns (stop_times_us, llr_at_stop). The caller calibrates a cutoff on the
+    returned statistic, exactly as the count threshold is calibrated.
+
+    A shot that reaches n_up has OBSERVED that photon, so its statistic is the
+    post-jump LLR at that arrival, not the pre-jump limit. Using the pre-jump
+    value would silently discard one photon of evidence and understate the
+    method.
+
+    `llr_at_deadline` may be passed in to avoid recomputing it for every n_up
+    that shares a deadline.
+    """
+    n_up = int(n_up)
+    if n_up < 1:
+        raise ValueError("n_up must be >= 1.")
+
+    deadline_ms = float(deadline_us) / 1000.0
+    n = packed.n_shots
+
+    if n_up > click_times_ms.shape[1]:
+        t_hit = np.full(n, np.inf)
+    else:
+        t_hit = click_times_ms[:, n_up - 1]
+
+    reached = t_hit <= deadline_ms
+    stop_ms = np.where(reached, t_hit, deadline_ms)
+
+    if llr_at_deadline is None:
+        llr_at_deadline = llr_at_times(packed, np.array([deadline_us]))[:, 0]
+
+    # Post-jump LLR at the n_up-th photon for the shots that got there.
+    if n_up > packed.llr_post.shape[1]:
+        llr_reached = np.full(n, -np.inf)
+    else:
+        llr_reached = packed.llr_post[:, n_up - 1]
+
+    llr = np.where(reached, llr_reached, llr_at_deadline)
+
+    return stop_ms * 1000.0, llr
+
+
 def _method_curve(
     labels: np.ndarray,
     correct: np.ndarray,
@@ -2138,6 +2257,42 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     cnt_time = np.column_stack(cnt_time)
     F_cnt, T_cnt = _method_curve(test_labels, cnt_correct, cnt_time)
 
+    # ---- 3b. fixed-count MMPP ----------------------------------------------
+    # Same stopping rule as method 3, but the decision uses the calibrated MMPP
+    # LLR at the stopping instant. The cutoff is fitted on calibration data and
+    # applied to test, exactly as the count threshold is.
+    cal_llr_deadline = {
+        float(dl): llr_at_times(cal_packed, np.array([dl]))[:, 0]
+        for dl in deadlines_us
+    }
+    test_llr_deadline = {
+        float(dl): llr_at_times(test_packed, np.array([dl]))[:, 0]
+        for dl in deadlines_us
+    }
+
+    fcm_correct, fcm_time, fcm_cal_F, fcm_cal_T = [], [], [], []
+    fcm_cutoffs = []
+    for n_up, dl in cnt_cfg:
+        tc, sc = fixed_count_mmpp_statistic(
+            cal_packed, cal_clicks, n_up, dl, cal_llr_deadline[float(dl)]
+        )
+        cut, _ = optimize_scalar_cutoff(sc, cal_labels)
+        fcm_cutoffs.append(float(cut))
+        pc = np.where(sc >= cut, 0, 1)
+        fcm_cal_F.append(balanced_fidelity(cal_labels, pc))
+        fcm_cal_T.append(balanced_mean_time(cal_labels, tc))
+
+        tt, st = fixed_count_mmpp_statistic(
+            test_packed, test_clicks, n_up, dl, test_llr_deadline[float(dl)]
+        )
+        pt = np.where(st >= cut, 0, 1)
+        fcm_correct.append((pt == test_labels).astype(float))
+        fcm_time.append(tt)
+
+    fcm_correct = np.column_stack(fcm_correct)
+    fcm_time = np.column_stack(fcm_time)
+    F_fcm, T_fcm = _method_curve(test_labels, fcm_correct, fcm_time)
+
     # ---- 4. adaptive MMPP SPRT ---------------------------------------------
     # Only (L, offset) pairs whose boundaries bracket LLR(0) = 0 are
     # meaningful; |offset| >= L decides the shot before any data arrives.
@@ -2171,6 +2326,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     # ---- matched-fidelity speedups + paired bootstrap ----------------------
     keep_ada = pareto_frontier(np.asarray(ada_cal_T), np.asarray(ada_cal_F))
     keep_cnt = pareto_frontier(np.asarray(cnt_cal_T), np.asarray(cnt_cal_F))
+    keep_fcm = pareto_frontier(np.asarray(fcm_cal_T), np.asarray(fcm_cal_F))
 
     boots = stratified_bootstrap_indices(test_labels, cfg.n_boot, seed + 991)
 
@@ -2200,6 +2356,16 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
                     cnt_time[np.ix_(i0, keep_cnt)].mean(axis=0)
                     + cnt_time[np.ix_(i1, keep_cnt)].mean(axis=0)
                 ),
+                0.5
+                * (
+                    fcm_correct[np.ix_(i0, keep_fcm)].mean(axis=0)
+                    + fcm_correct[np.ix_(i1, keep_fcm)].mean(axis=0)
+                ),
+                0.5
+                * (
+                    fcm_time[np.ix_(i0, keep_fcm)].mean(axis=0)
+                    + fcm_time[np.ix_(i1, keep_fcm)].mean(axis=0)
+                ),
             )
         )
 
@@ -2217,21 +2383,26 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         t_thr = time_for_fidelity_interp(T_thr, F_thr, F_star)
         t_cnt = time_for_fidelity_interp(T_cnt, F_cnt, F_star)
         t_ada = time_for_fidelity_interp(T_ada, F_ada, F_star)
+        t_fcm = time_for_fidelity_interp(T_fcm, F_fcm, F_star)
 
-        sp_m, sp_c = [], []
-        for Fb_thr, Fb_a, Tb_a, Fb_c, Tb_c in boot_curves:
+        sp_m, sp_c, sp_f = [], [], []
+        for Fb_thr, Fb_a, Tb_a, Fb_c, Tb_c, Fb_f, Tb_f in boot_curves:
             base = time_for_fidelity_interp(readout_times_us, Fb_thr, F_star)
             if not np.isfinite(base):
                 continue
             ta = time_for_fidelity_interp(Tb_a, Fb_a, F_star)
             tc = time_for_fidelity_interp(Tb_c, Fb_c, F_star)
+            tf = time_for_fidelity_interp(Tb_f, Fb_f, F_star)
             if np.isfinite(ta) and ta > 0:
                 sp_m.append(base / ta)
             if np.isfinite(tc) and tc > 0:
                 sp_c.append(base / tc)
+            if np.isfinite(tf) and tf > 0:
+                sp_f.append(base / tf)
 
         lo_m, hi_m = _ci(sp_m)
         lo_c, hi_c = _ci(sp_c)
+        lo_f, hi_f = _ci(sp_f)
 
         sp_mmpp = (
             t_thr / t_ada
@@ -2243,12 +2414,18 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
             if np.isfinite(t_thr) and np.isfinite(t_cnt) and t_cnt > 0
             else np.nan
         )
+        sp_fcm = (
+            t_thr / t_fcm
+            if np.isfinite(t_thr) and np.isfinite(t_fcm) and t_fcm > 0
+            else np.nan
+        )
 
         rows.append(
             {
                 "target_fidelity": float(F_star),
                 "t_threshold_us": t_thr,
                 "t_adaptive_count_us": t_cnt,
+                "t_fixed_count_mmpp_us": t_fcm,
                 "t_adaptive_mmpp_us": t_ada,
                 "speedup_mmpp": sp_mmpp,
                 "speedup_mmpp_ci_low": lo_m,
@@ -2256,6 +2433,9 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
                 "speedup_count": sp_count,
                 "speedup_count_ci_low": lo_c,
                 "speedup_count_ci_high": hi_c,
+                "speedup_fixed_count_mmpp": sp_fcm,
+                "speedup_fixed_count_mmpp_ci_low": lo_f,
+                "speedup_fixed_count_mmpp_ci_high": hi_f,
                 # Aliases kept so code written against the original
                 # run_speedup_study result dict still works.
                 "speedup_vs_threshold": sp_mmpp,
@@ -2267,22 +2447,26 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
 
     if cfg.verbose:
         print(
-            f"\n  {'F*':>6} {'t_thr':>10} {'t_cnt':>10} {'t_mmpp':>10} "
-            f"{'sp_mmpp':>8} {'sp_cnt':>8}"
+            f"\n  {'F*':>6} {'t_thr':>10} {'t_cnt':>10} {'t_fcm':>10} "
+            f"{'t_mmpp':>10} {'sp_mmpp':>8} {'sp_fcm':>8} {'sp_cnt':>8}"
         )
         for r in rows:
             if not np.isfinite(r["speedup_mmpp"]):
                 continue
             print(
                 f"  {r['target_fidelity']:6.2f} {r['t_threshold_us']:10.2f} "
-                f"{r['t_adaptive_count_us']:10.2f} {r['t_adaptive_mmpp_us']:10.2f} "
-                f"{r['speedup_mmpp']:8.2f} {r['speedup_count']:8.2f}"
+                f"{r['t_adaptive_count_us']:10.2f} "
+                f"{r['t_fixed_count_mmpp_us']:10.2f} "
+                f"{r['t_adaptive_mmpp_us']:10.2f} "
+                f"{r['speedup_mmpp']:8.2f} {r['speedup_fixed_count_mmpp']:8.2f} "
+                f"{r['speedup_count']:8.2f}"
             )
         ceil = f"threshold {F_thr.max():.4f}"
         if F_mmpp is not None:
             ceil += f", fixed MMPP {F_mmpp.max():.4f}"
         ceil += (
             f", adaptive count {F_cnt.max():.4f}, "
+            f"fixed-count MMPP {F_fcm.max():.4f}, "
             f"adaptive MMPP {F_ada.max():.4f}"
         )
         print(f"\n  ceilings: {ceil}")
@@ -2323,6 +2507,12 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         "F_adaptive_count": F_cnt,
         "T_adaptive_count": T_cnt,
         "frontier_adaptive_count": pareto_frontier(T_cnt, F_cnt),
+        # Fixed-count MMPP shares cnt_cfg: same (n_up, deadline) grid, same
+        # stopping rule, different decision statistic.
+        "F_fixed_count_mmpp": F_fcm,
+        "T_fixed_count_mmpp": T_fcm,
+        "frontier_fixed_count_mmpp": pareto_frontier(T_fcm, F_fcm),
+        "fixed_count_mmpp_cutoffs": np.asarray(fcm_cutoffs),
         "adaptive_mmpp_configs": ada_cfg,
         "F_adaptive_mmpp": F_ada,
         "T_adaptive_mmpp": T_ada,
@@ -2343,8 +2533,11 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         "ada_time": ada_time.astype(np.float32),
         "cnt_correct": cnt_correct.astype(bool),
         "cnt_time": cnt_time.astype(np.float32),
+        "fcm_correct": fcm_correct.astype(bool),
+        "fcm_time": fcm_time.astype(np.float32),
         "keep_ada": keep_ada,
         "keep_cnt": keep_cnt,
+        "keep_fcm": keep_fcm,
     }
 
     if mmpp_correct is not None:
@@ -2359,6 +2552,8 @@ def max_fidelity_summary(result: dict) -> dict:
     if result.get("F_fixed_mmpp") is not None:
         out["fixed_mmpp"] = float(np.max(result["F_fixed_mmpp"]))
     out["adaptive_count"] = float(np.max(result["F_adaptive_count"]))
+    if result.get("F_fixed_count_mmpp") is not None:
+        out["fixed_count_mmpp"] = float(np.max(result["F_fixed_count_mmpp"]))
     out["adaptive_mmpp"] = float(np.max(result["F_adaptive_mmpp"]))
     return out
 
@@ -2764,6 +2959,7 @@ def load_results(
 _METHOD_STYLES = {
     "threshold": dict(ls=":", lw=1.5, marker="o", ms=3.0),
     "count": dict(ls="--", lw=1.5, marker="^", ms=3.5),
+    "fixed_count_mmpp": dict(ls="-.", lw=1.6, marker="d", ms=3.2),
     "mmpp": dict(ls="-", lw=2.4, marker=None),
 }
 
@@ -2786,7 +2982,7 @@ def plot_sweep(
     plt = _pyplot()
     from matplotlib.lines import Line2D
 
-    fig, axes = plt.subplots(1, 3, figsize=(18.5, 5.4))
+    fig, axes = plt.subplots(1, 4, figsize=(24.0, 5.4))
 
     # ---- panel (a): fidelity vs mean run time ------------------------------
     ax = axes[0]
@@ -2803,6 +2999,14 @@ def plot_sweep(
             color=c,
             **_METHOD_STYLES["count"],
         )
+        if res.get("F_fixed_count_mmpp") is not None:
+            ff = res["frontier_fixed_count_mmpp"]
+            ax.plot(
+                np.asarray(res["T_fixed_count_mmpp"])[ff],
+                np.asarray(res["F_fixed_count_mmpp"])[ff],
+                color=c,
+                **_METHOD_STYLES["fixed_count_mmpp"],
+            )
         fa = res["frontier_adaptive_mmpp"]
         ax.plot(
             np.asarray(res["T_adaptive_mmpp"])[fa],
@@ -2834,6 +3038,10 @@ def plot_sweep(
         Line2D(
             [], [], color="0.35", label="adaptive count SPRT",
             **_METHOD_STYLES["count"],
+        ),
+        Line2D(
+            [], [], color="0.35", label="fixed-count MMPP",
+            **_METHOD_STYLES["fixed_count_mmpp"],
         ),
         Line2D(
             [], [], color="0.35", label="adaptive MMPP SPRT",
@@ -2875,8 +3083,35 @@ def plot_sweep(
     ax.legend(title=spec.legend_title, fontsize=9, title_fontsize=9)
     ax.grid(alpha=0.25)
 
-    # ---- panel (c): adaptive count speedup ---------------------------------
+    # ---- panel (c): fixed-count MMPP speedup -------------------------------
     ax = axes[2]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        tbl = res["speedup_table"]
+        F = np.array([r["target_fidelity"] for r in tbl])
+        S = np.array([r.get("speedup_fixed_count_mmpp", np.nan) for r in tbl])
+        lo = np.array(
+            [r.get("speedup_fixed_count_mmpp_ci_low", np.nan) for r in tbl]
+        )
+        hi = np.array(
+            [r.get("speedup_fixed_count_mmpp_ci_high", np.nan) for r in tbl]
+        )
+        m = np.isfinite(S)
+        ax.plot(F[m], S[m], "-.d", ms=3.6, color=c, lw=1.7, label=res["label"])
+        g = m & np.isfinite(lo) & np.isfinite(hi)
+        ax.fill_between(F[g], lo[g], hi[g], color=c, alpha=0.13)
+
+    ax.axhline(1.0, color="k", lw=0.8, ls=":")
+    ax.set_xlabel("target balanced fidelity")
+    ax.set_ylabel("run-time reduction vs fixed-time threshold")
+    ax.set_title(
+        "(c) fixed-count MMPP speedup (statistic alone)", fontsize=11
+    )
+    ax.legend(title=spec.legend_title, fontsize=9, title_fontsize=9)
+    ax.grid(alpha=0.25)
+
+    # ---- panel (d): adaptive count speedup ---------------------------------
+    ax = axes[3]
     for k, res in enumerate(results):
         c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
         tbl = res["speedup_table"]
@@ -2888,13 +3123,13 @@ def plot_sweep(
     ax.axhline(1.0, color="k", lw=0.8, ls=":")
     ax.set_xlabel("target balanced fidelity")
     ax.set_ylabel("run-time reduction vs fixed-time threshold")
-    ax.set_title("(c) adaptive count speedup (adaptivity alone)", fontsize=11)
+    ax.set_title("(d) adaptive count speedup (stopping alone)", fontsize=11)
     ax.legend(title=spec.legend_title, fontsize=9, title_fontsize=9)
     ax.grid(alpha=0.25)
 
-    ylim = max(axes[1].get_ylim()[1], axes[2].get_ylim()[1])
-    axes[1].set_ylim(0.6, ylim)
-    axes[2].set_ylim(0.6, ylim)
+    ylim = max(ax_.get_ylim()[1] for ax_ in axes[1:])
+    for ax_ in axes[1:]:
+        ax_.set_ylim(0.6, ylim)
 
     det = results[0]["detector"] if results else DETECTOR_OFF
     fig.suptitle(f"{spec.title}  --  {det.describe()}", fontsize=11)
@@ -2951,8 +3186,10 @@ def plot_sweep_vs_x(
         ("F_adaptive_count", "adaptive count SPRT", "--^"),
         ("F_adaptive_mmpp", "adaptive MMPP SPRT", "-s"),
     ]
+    if results and results[0].get("F_fixed_count_mmpp") is not None:
+        series.insert(2, ("F_fixed_count_mmpp", "fixed-count MMPP", "-.d"))
     if results and results[0].get("F_fixed_mmpp") is not None:
-        series.insert(1, ("F_fixed_mmpp", "fixed-time MMPP", "-.d"))
+        series.insert(1, ("F_fixed_mmpp", "fixed-time MMPP", "--*"))
 
     for key, lab, st in series:
         ceil = [
@@ -3007,6 +3244,15 @@ def plot_operating_point(result: dict, save_path: str | None = None):
         np.asarray(result["F_adaptive_count"])[fc],
         "^-", ms=3.5, lw=1.4, color="#2ca02c", label="adaptive count SPRT",
     )
+
+    if result.get("F_fixed_count_mmpp") is not None:
+        ff = result["frontier_fixed_count_mmpp"]
+        ax.plot(
+            np.asarray(result["T_fixed_count_mmpp"])[ff],
+            np.asarray(result["F_fixed_count_mmpp"])[ff],
+            "d-.", ms=3.5, lw=1.6, color="#9467bd",
+            label="fixed-count MMPP",
+        )
 
     fa = result["frontier_adaptive_mmpp"]
     ax.plot(
@@ -3063,10 +3309,17 @@ def plot_operating_point(result: dict, save_path: str | None = None):
         F[good], lo[good], hi[good], color="#d62728", alpha=0.18,
         label="95% paired bootstrap CI",
     )
+    S_fcm = np.array([r.get("speedup_fixed_count_mmpp", np.nan) for r in tbl])
+    ok3 = np.isfinite(S_fcm)
+    if ok3.any():
+        ax.plot(
+            F[ok3], S_fcm[ok3], "d-.", color="#9467bd",
+            label="fixed-count MMPP (statistic only)",
+        )
     ok2 = np.isfinite(S_cnt)
     ax.plot(
         F[ok2], S_cnt[ok2], "^--", color="#2ca02c",
-        label="adaptive count (adaptivity only)",
+        label="adaptive count (stopping only)",
     )
     ax.axhline(1.0, color="k", lw=0.8, ls=":")
     ax.axhline(
@@ -3105,10 +3358,10 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
     print("=" * 100)
     print(
         f"{'point':>14}{'ph/dwell':>10}{'F*':>7}{'t_thr(us)':>11}"
-        f"{'t_count(us)':>12}{'T_mmpp(us)':>12}{'sp_mmpp':>9}"
-        f"{'95% CI':>15}{'sp_count':>10}"
+        f"{'t_count(us)':>12}{'t_fcm(us)':>11}{'T_mmpp(us)':>12}"
+        f"{'sp_mmpp':>9}{'95% CI':>15}{'sp_fcm':>8}{'sp_count':>10}"
     )
-    print("-" * 100)
+    print("-" * 116)
     for res in results:
         ph = res["regime"]["photons_per_bright_dwell"]
         first = True
@@ -3125,12 +3378,17 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
                 if np.isfinite(r["speedup_count"])
                 else f"{'-':>10}"
             )
+            sf_v = r.get("speedup_fixed_count_mmpp", np.nan)
+            sf = f"{sf_v:8.2f}" if np.isfinite(sf_v) else f"{'-':>8}"
+            t_fcm = r.get("t_fixed_count_mmpp_us", np.nan)
+            tf = f"{t_fcm:11.2f}" if np.isfinite(t_fcm) else f"{'-':>11}"
             print(
                 f"{res['name'] if first else '':>14}"
                 f"{f'{ph:.1f}' if first else '':>10}"
                 f"{r['target_fidelity']:7.2f}{r['t_threshold_us']:11.2f}"
-                f"{r['t_adaptive_count_us']:12.2f}{r['t_adaptive_mmpp_us']:12.2f}"
-                f"{r['speedup_mmpp']:9.2f}{ci:>15}{sc}"
+                f"{r['t_adaptive_count_us']:12.2f}{tf}"
+                f"{r['t_adaptive_mmpp_us']:12.2f}"
+                f"{r['speedup_mmpp']:9.2f}{ci:>15}{sf}{sc}"
             )
             first = False
         if first:
@@ -3138,7 +3396,7 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
                 f"{res['name']:>14}{ph:10.1f}"
                 "   (no target fidelity reachable by both methods)"
             )
-        print("-" * 100)
+        print("-" * 116)
 
     print("\nfidelity ceiling by method")
     keys = list(max_fidelity_summary(results[0]).keys())
@@ -3681,6 +3939,57 @@ def validate_all(verbose: bool = True) -> int:
         f"Gamma_tot*t_R {reg['gamma_tot_t_R']:.3f}",
     )
 
+    # -- 9b. fixed-count MMPP ------------------------------------------------
+    clicks = click_time_matrix(packed)
+
+    same_time, post_ok, pre_ok, dl_ok = True, True, True, True
+    for n_up in (1, 2, 3, 5):
+        for dl in (10.0, 25.0, 50.0):
+            t_cnt, _ = run_adaptive_count(clicks, n_up, dl)
+            t_fcm, llr = fixed_count_mmpp_statistic(packed, clicks, n_up, dl)
+
+            # The two methods must stop at exactly the same instants; that
+            # identity is what makes 2 -> 3 a controlled comparison.
+            if not np.allclose(t_cnt, t_fcm, rtol=0, atol=0):
+                same_time = False
+
+            reached = packed.n_clicks >= n_up
+            reached &= clicks[:, min(n_up - 1, clicks.shape[1] - 1)] <= dl / 1000.0
+
+            # A shot that reached n_up must be scored with the POST-jump LLR of
+            # that photon. Scoring the pre-jump limit would discard one photon
+            # of evidence, and the two differ by construction.
+            for i in np.nonzero(reached)[0][:25]:
+                if abs(llr[i] - packed.llr_post[i, n_up - 1]) > 1e-12:
+                    post_ok = False
+                pre = llr_at_stop_times(packed, t_fcm)[i]
+                if abs(pre - llr[i]) < 1e-12:
+                    pre_ok = False   # must NOT coincide with the pre-jump value
+
+            # A shot that timed out must be scored at the deadline.
+            ref = llr_at_times(packed, np.array([dl]))[:, 0]
+            idx = np.nonzero(~reached)[0]
+            if idx.size and not np.allclose(llr[idx], ref[idx], atol=1e-12):
+                dl_ok = False
+
+    check("fixed-count MMPP stops exactly when adaptive count does", same_time)
+    check("fixed-count MMPP scores reached shots post-jump", post_ok)
+    check(
+        "post-jump score differs from the pre-jump limit (photon not discarded)",
+        pre_ok,
+    )
+    check("fixed-count MMPP scores timed-out shots at the deadline", dl_ok)
+
+    # llr_at_stop_times must agree with llr_at_times on a constant time vector.
+    t_const = 30.0
+    a_stop = llr_at_stop_times(packed, np.full(packed.n_shots, t_const))
+    a_grid = llr_at_times(packed, np.array([t_const]))[:, 0]
+    check(
+        "llr_at_stop_times == llr_at_times for a constant stop time",
+        np.allclose(a_stop, a_grid, atol=1e-12),
+        f"max diff {np.abs(a_stop - a_grid).max():.2e}",
+    )
+
     # -- 10. the detector model ----------------------------------------------
     rng = np.random.default_rng(12345)
 
@@ -4027,6 +4336,7 @@ _SPEEDUP_CSV_COLUMNS = [
     "target_fidelity",
     "t_threshold_us",
     "t_adaptive_count_us",
+    "t_fixed_count_mmpp_us",
     "t_adaptive_mmpp_us",
     "speedup_mmpp",
     "speedup_mmpp_ci_low",
@@ -4034,6 +4344,9 @@ _SPEEDUP_CSV_COLUMNS = [
     "speedup_count",
     "speedup_count_ci_low",
     "speedup_count_ci_high",
+    "speedup_fixed_count_mmpp",
+    "speedup_fixed_count_mmpp_ci_low",
+    "speedup_fixed_count_mmpp_ci_high",
 ]
 
 _CEILING_CSV_COLUMNS = [
