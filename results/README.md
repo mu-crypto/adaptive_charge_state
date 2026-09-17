@@ -34,7 +34,10 @@ Detector directories: `ideal`, `det_nonpar_dt50ns_ap0.01_tau100ns` (the
 
 Not committed, both regenerable: the per-shot pickles (~1.3 GB — they carry the
 correctness and stop-time matrices so the bootstrap can be redone without
-re-simulating; `run`) and the per-operating-point figures (`plot`).
+re-simulating; `run`) and the per-operating-point figures (`plot`). The pickles
+contain no custom classes, so a bare `pickle.load` with no imports works; the
+module's own `load_results` rehydrates the parameter, detector and noise fields
+into objects.
 
 ## Rate noise: the protocol is insensitive to it
 
@@ -77,11 +80,32 @@ delta = 0 as the laser setpoint instead — median gain 1.015, mean 1.568, click
 the mean rather than the median. Neither is uniquely right and at p ≈ 4 they
 differ enough to matter, so the claim has to hold under both. It does.
 
-The one effect at the edge of resolution is a ceiling drop under the setpoint
-convention at sigma = 0.3: adaptive MMPP 0.9117 → 0.8917, i.e. −0.020, just
-outside the ±0.01 Monte Carlo band. That is attributable to the 57% mean-rate
-inflation that convention deliberately permits, not to the time dependence —
-and mean-rate shifts are the thing already known to be absorbed.
+**The one real effect, and what it is not.** Under the setpoint convention at
+sigma = 0.3 the adaptive-MMPP ceiling drops 0.9117 → 0.8914, i.e. −0.020, just
+outside the ±0.01 Monte Carlo band. Two controls pin down what causes it.
+
+Handing the filter the correctly inflated mean rates — which
+`_filter_params_for` now does under this convention — moves the ceiling by
+−0.0003. So the drop is not a calibration error. And a *constant* Gamma × 1.558
+with no noise whatsoever reproduces the whole drop on its own:
+
+| case | threshold | adaptive MMPP |
+|---|---|---|
+| nominal, no noise | 0.9019 | 0.9117 |
+| Gamma × 1.558 constant, no noise | 0.8839 | 0.8892 |
+| setpoint noise, sigma = 0.3 | 0.8853 | 0.8914 |
+
+So the drop is entirely the mean-rate inflation acting through the *physics*,
+not through the filter: faster ionization means less time in the bright state,
+the information is simply gone, and no amount of correct calibration recovers
+it. A mean-rate shift is absorbed as a calibration error but not as physics —
+an earlier version of this file conflated the two.
+
+The time-dependent part of the noise therefore contributes nothing measurable.
+The noisy case is in fact marginally *better* than its constant-rate
+equivalent (0.8914 vs 0.8892), which is a sharper statement of the robustness
+result than "the sweeps show no effect": at these amplitudes only the noise's
+mean-rate footprint matters at all.
 
 **Tolerance in observable units.** sigma is not measurable; the Mandel Q excess
 it produces is. Across every noise point the excess stays within
@@ -376,4 +400,4 @@ python adaptive_charge_state_master.py export <experiment> --out results [detect
 ```
 
 The readout matrix takes about 25 minutes and the four noise experiments about 6 — 18 minutes of simulation plus
-figures and exports. `validate` passes 48/48 checks.
+figures and exports. `validate` passes 52/52 checks.
