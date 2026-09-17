@@ -884,6 +884,22 @@ class RateNoise:
     photon_order   exponent coupling switching to emission; 2.0 for the
                    two-photon ionization/recombination of 594 nm readout
     steps_per_tau  segments per correlation time in the simulator
+    renormalise    'mean' divides each gain by its ensemble mean, so the noise
+                   carries no mean-rate shift; 'none' treats delta = 0 as the
+                   laser setpoint and lets the mean move.
+
+                   Both are defensible and they differ a lot once
+                   photon_order is large, so the sweeps are run under both.
+                   'mean' isolates the time dependence from a mean shift,
+                   which matters because a mean shift is already known to be
+                   absorbed by the calibrated boundary. But E[(1+delta)^p] is
+                   1.57 at sigma = 0.3, p = 4, so dividing by it pushes the
+                   MEDIAN gain well below 1: the typical shot then sees slower
+                   switching than nominal, spends longer bright and yields
+                   more photons, which partly compensates the harm the sweep
+                   is trying to measure. 'none' is faithful to a laser
+                   fluctuating about its setpoint and has no such distortion,
+                   at the cost of confounding in the mean instead.
     """
 
     sigma: float = 0.0
@@ -891,6 +907,7 @@ class RateNoise:
     kind: str = "ou"
     photon_order: float = 2.0
     steps_per_tau: int = 12
+    renormalise: str = "mean"
 
     @property
     def is_off(self) -> bool:
@@ -905,6 +922,8 @@ class RateNoise:
             raise ValueError("kind must be 'ou' or 'telegraph'.")
         if self.steps_per_tau < 1:
             raise ValueError("steps_per_tau must be >= 1.")
+        if self.renormalise not in ("mean", "none"):
+            raise ValueError("renormalise must be 'mean' or 'none'.")
         # delta <= -1 drives a rate non-positive. For the telegraph process
         # that is a hard failure because the low state is reached with
         # probability 1/2; for the Gaussian it is a tail event, handled by
@@ -929,8 +948,9 @@ class RateNoise:
     def tag(self) -> str:
         if self.is_off:
             return "nonoise"
+        suffix = "" if self.renormalise == "mean" else "_setpoint"
         return (
-            f"noise_{self.kind}_s{self.sigma:g}_tau{self.tau_c_ms:g}ms"
+            f"noise_{self.kind}_s{self.sigma:g}_tau{self.tau_c_ms:g}ms{suffix}"
         )
 
     def describe(self) -> str:
@@ -938,7 +958,8 @@ class RateNoise:
             return "no rate noise"
         return (
             f"{self.kind} rate noise, sigma = {self.sigma:g}, "
-            f"tau_c = {self.tau_c_ms:g} ms, photon order {self.photon_order:g}"
+            f"tau_c = {self.tau_c_ms:g} ms, photon order "
+            f"{self.photon_order:g}, {self.renormalise}-renormalised"
         )
 
 
@@ -1085,10 +1106,14 @@ def modulated_rates(
 
     base = np.maximum(1.0 + delta, 0.0)
 
-    g_emis = base / _modulation_gain_mean(noise, 1.0)
-    g_swit = np.power(base, noise.photon_order) / _modulation_gain_mean(
-        noise, noise.photon_order
-    )
+    if noise.renormalise == "mean":
+        z_emis = _modulation_gain_mean(noise, 1.0)
+        z_swit = _modulation_gain_mean(noise, noise.photon_order)
+    else:
+        z_emis = z_swit = 1.0
+
+    g_emis = base / z_emis
+    g_swit = np.power(base, noise.photon_order) / z_swit
 
     return (
         params.lambda_minus_khz * g_emis,
@@ -3380,6 +3405,32 @@ def _noise_sigma_points(cfg: RunConfig) -> list[OperatingPoint]:
     return pts
 
 
+def _noise_setpoint_points(cfg: RunConfig) -> list[OperatingPoint]:
+    """The sigma sweep again, without mean renormalisation."""
+    base = _base_params()
+    pts = []
+    for sg in NOISE_SIGMAS:
+        noise = RateNoise(
+            sigma=float(sg),
+            tau_c_ms=NOISE_REF_TAU_MS,
+            kind="ou",
+            photon_order=NOISE_PHOTON_ORDER,
+            renormalise="none",
+        )
+        pts.append(
+            OperatingPoint(
+                name=f"sigma{sg:g}",
+                label=f"$\\sigma$ = {sg:g}" if sg else "no noise",
+                params=base,
+                sweep_value=float(sg),
+                power_uw=BASE_POWER_UW,
+                detection_efficiency=1.0,
+                noise=noise,
+            )
+        )
+    return pts
+
+
 def _noise_tau_points(cfg: RunConfig) -> list[OperatingPoint]:
     base = _base_params()
     pts = []
@@ -3525,6 +3576,24 @@ EXPERIMENTS: dict[str, SweepSpec] = {
             "linearly and switching quadratically, as the photon order "
             "requires. The filter is built from the NOMINAL rates, so this is "
             "the one error a calibrated boundary cannot absorb."
+        ),
+    ),
+    "noise_setpoint": SweepSpec(
+        key="noise_setpoint",
+        title=(
+            "Rate-noise amplitude sweep, setpoint convention "
+            "(no mean renormalisation)"
+        ),
+        xlabel=r"rate-noise amplitude $\sigma$",
+        legend_title="noise amplitude",
+        build_points=_noise_setpoint_points,
+        xscale="linear",
+        note=(
+            "Same sweep as `noise` but with delta = 0 taken as the laser "
+            "setpoint, so the mean rate is free to move. Mean-preserving "
+            "renormalisation pushes the median switching gain below 1 when "
+            "the photon order is ~4, which makes the typical shot easier and "
+            "could mask harm; this is the cross-check."
         ),
     ),
     "noise_tau": SweepSpec(
@@ -5083,6 +5152,7 @@ def noise_from_args(args: argparse.Namespace) -> RateNoise:
         photon_order=(
             float(order) if order is not None else NOISE_PHOTON_ORDER
         ),
+        renormalise=getattr(args, "noise_renormalise", None) or "mean",
     )
     nz.validate()
     return nz
@@ -5227,6 +5297,7 @@ _SPEEDUP_CSV_COLUMNS = [
     "noise_tau_c_ms",
     "noise_kind",
     "noise_photon_order",
+    "noise_renormalise",
     "q_excess_finest_bin",
     "target_fidelity",
     "t_threshold_us",
@@ -5296,6 +5367,7 @@ def export_csv(
                 base["noise_tau_c_ms"] = nz.tau_c_ms
                 base["noise_kind"] = nz.kind if not nz.is_off else "off"
                 base["noise_photon_order"] = nz.photon_order
+                base["noise_renormalise"] = nz.renormalise
             q = res.get("q_calibration")
             if q is not None and q["q_excess"]:
                 base["q_excess_finest_bin"] = q["q_excess"][0]
@@ -5442,6 +5514,10 @@ def build_parser() -> argparse.ArgumentParser:
             "--noise-kind", default=None, choices=["ou", "telegraph"],
         )
         sp.add_argument("--noise-photon-order", type=float, default=None)
+        sp.add_argument(
+            "--noise-renormalise", default=None, choices=["mean", "none"],
+            help="'mean' removes the mean-rate shift; 'none' is the setpoint",
+        )
         sp.add_argument(
             "--no-filter-correction", action="store_true",
             help=(
