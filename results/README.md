@@ -17,7 +17,8 @@ pruning had removed the configuration-selection noise from the resampling and
 so understated the uncertainty. Every point estimate, fidelity ceiling and
 decomposition below is numerically unchanged; only the intervals moved.
 
-All 5 experiments were run under 3 detector settings, 15 combinations total:
+All 5 readout experiments were run under 3 detector settings, 15 combinations
+total, plus 4 rate-noise experiments at the ideal detector:
 
 ```
 results/<experiment>/<detector>/
@@ -34,6 +35,67 @@ Detector directories: `ideal`, `det_nonpar_dt50ns_ap0.01_tau100ns` (the
 Not committed, both regenerable: the per-shot pickles (~1.3 GB — they carry the
 correctness and stop-time matrices so the bootstrap can be redone without
 re-simulating; `run`) and the per-operating-point figures (`plot`).
+
+## Rate noise: the protocol is insensitive to it
+
+This is the one noise channel nothing else here can express. Every other knob
+holds the rates constant for the duration of a shot, and a constant rate error
+only rescales the LLR, so the calibrated cutoff and SPRT boundaries absorb it --
+`run_parameter_robustness` measures exactly that and finds the speedup survives
+a 30% rate CV. Rates that vary *within* a shot have nothing constant to
+recalibrate against.
+
+A single fractional intensity fluctuation delta(t) drives emission linearly and
+switching with exponent `photon_order`, which is taken from the active rate laws
+rather than assumed: **3.98** at the 5.437 µW reference point, not 2, because
+emission saturates at 4 µW while ionization saturates at 12 µW. At sigma = 0.3
+that makes the switching-rate gain span a 5–95 percentile range of
+**[0.05, 3.17]**, a 60× excursion — this is a violent test, not a gentle one.
+
+| experiment | sweep | result |
+|---|---|---|
+| `noise` | sigma 0 → 0.3, Gaussian, tau_c = 100 µs | speedup 1.28× → 1.28× |
+| `noise_setpoint` | same, no mean renormalisation | speedup 1.28× → 1.29× |
+| `noise_tau` | tau_c 10 µs → 1 ms at sigma = 0.2 | speedup 1.28–1.32×, no trend |
+| `noise_kind` | Gaussian vs telegraph at matched variance | 1.31× vs 1.27× vs 1.28× off |
+
+Speedups quoted at matched headroom [0.02, 0.08), where the bootstrap CI width
+is 0.12–0.19. **Every variation across every sweep sits inside a single
+interval.** The ceilings move by ±0.01, which is the Monte Carlo scale
+established independently by the detector matrix, and non-monotonically in sigma
+— the right-hand panel of `noise/ideal/noise_vs_x.png` shows jitter, not a
+trend.
+
+**Why two normalisation conventions.** Mean-preserving renormalisation is
+confounded at this photon order. E[(1+delta)^3.98] = 1.57 at sigma = 0.3, so
+dividing by it leaves the mean gain at 1.007 but drives the **median** to 0.651:
+the typical shot then sees 35% slower ionization than nominal, stays bright
+longer and yields more photons (clicks per NV- shot rise 15.0 → 17.3), which
+partly compensates the harm being measured. The setpoint convention takes
+delta = 0 as the laser setpoint instead — median gain 1.015, mean 1.568, clicks
+14.25 — faithful to a laser fluctuating about its setpoint, but confounded in
+the mean rather than the median. Neither is uniquely right and at p ≈ 4 they
+differ enough to matter, so the claim has to hold under both. It does.
+
+The one effect at the edge of resolution is a ceiling drop under the setpoint
+convention at sigma = 0.3: adaptive MMPP 0.9117 → 0.8917, i.e. −0.020, just
+outside the ±0.01 Monte Carlo band. That is attributable to the 57% mean-rate
+inflation that convention deliberately permits, not to the time dependence —
+and mean-rate shifts are the thing already known to be absorbed.
+
+**Tolerance in observable units.** sigma is not measurable; the Mandel Q excess
+it produces is. Across every noise point the excess stays within
+−0.054 to +0.081 on a Q_MMPP of about 1 at the finest bin (16 µs). So the
+tolerance is: **the protocol shows no measurable speedup penalty up to a Q
+excess of ~0.08.** That cuts both ways, and the second half is the more useful
+statement — noise large enough to be visible in a Q measurement is already too
+small to hurt the readout. The closed-form Q null is verified against simulation
+to 0.1% at short bins, on shots initialised from the stationary distribution to
+match its assumption.
+
+Caveat: this is one operating point (5.437 µW, eta = 1, 637 µs horizon). The
+sparsity law predicts the noise sensitivity should differ where photons per
+bright dwell differ, and that is not tested here.
 
 ## The four methods
 
@@ -313,5 +375,5 @@ python adaptive_charge_state_master.py plot <experiment> --out results [detector
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]
 ```
 
-The whole matrix takes about 25 minutes — 18 minutes of simulation plus
-figures and exports. `validate` passes 30/30 checks.
+The readout matrix takes about 25 minutes and the four noise experiments about 6 — 18 minutes of simulation plus
+figures and exports. `validate` passes 48/48 checks.

@@ -1,0 +1,13 @@
+experiment,detector,point_index,point,sweep_value,method,max_balanced_fidelity
+noise_kind,ideal,0,off,0.0,threshold,0.9019444444444444
+noise_kind,ideal,0,off,0.0,adaptive_count,0.9013888888888889
+noise_kind,ideal,0,off,0.0,fixed_count_mmpp,0.9113888888888888
+noise_kind,ideal,0,off,0.0,adaptive_mmpp,0.9116666666666666
+noise_kind,ideal,1,ou,1.0,threshold,0.905
+noise_kind,ideal,1,ou,1.0,adaptive_count,0.9019444444444444
+noise_kind,ideal,1,ou,1.0,fixed_count_mmpp,0.9163888888888889
+noise_kind,ideal,1,ou,1.0,adaptive_mmpp,0.9183333333333333
+noise_kind,ideal,2,telegraph,2.0,threshold,0.9016666666666666
+noise_kind,ideal,2,telegraph,2.0,adaptive_count,0.9011111111111111
+noise_kind,ideal,2,telegraph,2.0,fixed_count_mmpp,0.9111111111111111
+noise_kind,ideal,2,telegraph,2.0,adaptive_mmpp,0.9116666666666666
