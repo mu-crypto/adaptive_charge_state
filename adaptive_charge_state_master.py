@@ -2324,9 +2324,24 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         )
 
     # ---- matched-fidelity speedups + paired bootstrap ----------------------
-    keep_ada = pareto_frontier(np.asarray(ada_cal_T), np.asarray(ada_cal_F))
-    keep_cnt = pareto_frontier(np.asarray(cnt_cal_T), np.asarray(cnt_cal_F))
-    keep_fcm = pareto_frontier(np.asarray(fcm_cal_T), np.asarray(fcm_cal_F))
+    # The point estimate and the bootstrap MUST range over the same set of
+    # configurations. The point estimates below (t_cnt, t_fcm, t_ada) take the
+    # interpolated time over the FULL configuration grid, so the resamples
+    # have to as well. Pruning the resamples to the calibration-frontier
+    # subset -- as this code previously did, for speed -- makes the interval
+    # estimate a different quantity from the point estimate, and the interval
+    # then need not contain it. Measured on the committed results, the point
+    # estimate fell outside its own 95% interval in 38% of rows.
+    #
+    # Using the full grid for both is also the symmetric choice: the
+    # fixed-time threshold baseline has its readout time optimized on the test
+    # set too, so no method is handicapped. Pruning instead to the full-sample
+    # TEST frontier and resampling within it would bias the interval
+    # optimistically, because that subset was selected using the same data it
+    # is then resampled from.
+    keep_ada = np.arange(ada_correct.shape[1])
+    keep_cnt = np.arange(cnt_correct.shape[1])
+    keep_fcm = np.arange(fcm_correct.shape[1])
 
     boots = stratified_bootstrap_indices(test_labels, cfg.n_boot, seed + 991)
 
