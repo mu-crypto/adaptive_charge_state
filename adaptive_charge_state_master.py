@@ -5157,13 +5157,26 @@ def apply_stopping_rule(
     paths: FilterPaths,
     coeffs: list[np.ndarray],
     econ: Economics,
-) -> tuple[np.ndarray, np.ndarray]:
+    decision_llr: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Run a fitted policy forward, on paths it was not fitted to.
 
     Fitting and applying must use different shots: the backward induction
     chooses its stopping set using the same realised payoffs it then scores,
-    so in-sample it reports a value no feasible policy attains.
+    so in-sample it reports a value no feasible policy attains. Measured
+    here, in-sample flatters the policy by about 23%.
+
+    `decision_llr` overrides the theoretical threshold log(b/a) with a cutoff
+    fitted on calibration data, which is how every other decision rule in
+    this file is treated -- the count threshold, the fixed-time MMPP cutoff
+    and the SPRT's offset are all calibrated rather than assumed. Leaving
+    this one at its theoretical value while the rules it is compared against
+    get a fitted one is the same unfairness the SPRT's free offset was
+    introduced to remove.
+
+    Returns (stop_us, preds, llr_at_stop); the third is what a cutoff is
+    calibrated on.
     """
     n, n_steps = paths.llr.shape[0], paths.llr.shape[1] - 1
     if len(coeffs) != n_steps:
@@ -5186,9 +5199,9 @@ def apply_stopping_rule(
         stopped[idx] = True
 
     rows = np.arange(n)
-    stop_us = paths.t_us[stop_k]
-    preds = (paths.llr[rows, stop_k] < bayes_decision_llr(econ)).astype(int)
-    return stop_us, preds
+    llr_stop = paths.llr[rows, stop_k]
+    cut = bayes_decision_llr(econ) if decision_llr is None else float(decision_llr)
+    return paths.t_us[stop_k], (llr_stop < cut).astype(int), llr_stop
 
 
 def sprt_on_epochs(
@@ -5196,6 +5209,7 @@ def sprt_on_epochs(
     L: float,
     offset: float,
     exhaustion_eps: float = 0.0,
+    deadline_us: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Truncated SPRT restricted to the epoch grid, optionally with the
@@ -5205,17 +5219,27 @@ def sprt_on_epochs(
     isolates the STOPPING RULE and not the filter or the action times. The
     exact grid-free SPRT elsewhere in this file is the stronger baseline and
     is measured alongside it.
+
+    `deadline_us` truncates earlier than the horizon, which is what lets this
+    rule trace a frontier by itself rather than needing one point per a/c.
     """
     n_steps = paths.llr.shape[1] - 1
     rows = np.arange(paths.n_paths)
     U, D = offset + L, offset - L
 
+    if deadline_us is None:
+        k_max = n_steps
+    else:
+        k_max = int(np.searchsorted(paths.t_us, float(deadline_us), side="right")) - 1
+        k_max = int(np.clip(k_max, 1, n_steps))
+
     out = (paths.llr >= U) | (paths.llr <= D)
     if exhaustion_eps > 0.0:
         out = out | (paths.gap <= exhaustion_eps)
+    out = out[:, : k_max + 1]
 
     has = out.any(axis=1)
-    k = np.where(has, out.argmax(axis=1), n_steps)
+    k = np.where(has, out.argmax(axis=1), k_max)
     preds = (paths.llr[rows, k] < offset).astype(int)
     return paths.t_us[k], preds
 
@@ -5275,7 +5299,13 @@ def exhaustion_times_us(paths: FilterPaths, eps: float) -> np.ndarray:
 # The grid is geometric and wide because the interesting range spans the whole
 # fidelity axis, and the learned policy needs enough points on the frontier for
 # the same log-time interpolation the other four methods get.
-A_OVER_C_GRID = np.geomspace(20.0, 20000.0, 16)
+#
+# The range has to cover the whole frontier at both ends, because unlike the
+# boundary rules the learned policy cannot trace one without it: at 20 us the
+# fastest policy still spent 2.9 us, well above the 0.2 us the fixed-time
+# threshold needs at F* = 0.55, and at 20000 us it had not yet reached the
+# deadline-limited ceiling.
+A_OVER_C_GRID = np.geomspace(2.0, 2.0e5, 24)
 
 # d <= EXHAUSTION_EPS means the remaining information about the initial state
 # is below 1e-9 in log-likelihood units. `validate` checks that the LLR really
@@ -5411,10 +5441,41 @@ def run_optimal_stopping(
     exact_time = np.column_stack(exact_time)
     F_exact, T_exact = _method_curve(test_labels, exact_correct, exact_time)
 
-    # ---- 3, 4, 5. epoch-restricted rules, one column per a/c ---------------
-    rows = []
+    # ---- 3, 4. epoch SPRT, with and without the exhaustion exit -----------
+    # Their fidelity-vs-time frontier comes from the SAME (L, offset,
+    # deadline) grid the exact rule uses, not from one point per a/c. Taking
+    # one point per a/c instead made the frontier an artifact of the a/c grid
+    # rather than of the rule: with a/c bottoming out at 20 us the epoch
+    # methods could not produce any point faster than 2.9 us, so every low
+    # target read as a 0.07x "slowdown" that was really just a missing
+    # column. The a/c sweep below still drives the Bayes-risk comparison,
+    # where a/c is the actual question and not a nuisance.
     grid_correct, grid_time = [], []
     exh_correct, exh_time = [], []
+    for dl in deadlines_us:
+        for b in np.asarray(cfg.offsets, dtype=float):
+            for L in np.asarray(cfg.boundary_widths, dtype=float):
+                if abs(float(b)) >= float(L):
+                    continue
+                for correct, times, eps in (
+                    (grid_correct, grid_time, 0.0),
+                    (exh_correct, exh_time, EXHAUSTION_EPS),
+                ):
+                    tt, pt = sprt_on_epochs(
+                        test_paths, float(L), float(b), eps, float(dl)
+                    )
+                    correct.append((pt == test_labels).astype(float))
+                    times.append(tt)
+
+    grid_correct = np.column_stack(grid_correct)
+    grid_time = np.column_stack(grid_time)
+    exh_correct = np.column_stack(exh_correct)
+    exh_time = np.column_stack(exh_time)
+
+    # ---- 5. the learned policy, one column per a/c ------------------------
+    # This one genuinely is parameterised by a/c: the policy IS the solution
+    # to a particular trade-off, so the frontier is traced by varying it.
+    rows = []
     lsm_correct, lsm_time = [], []
 
     for ac in ac_grid:
@@ -5430,15 +5491,15 @@ def run_optimal_stopping(
             test_paths, cal_exh["L"], cal_exh["offset"], EXHAUSTION_EPS
         )
         coeffs = fit_stopping_rule(cal_paths, econ)
-        st_l, pr_l = apply_stopping_rule(test_paths, coeffs, econ)
+        # The policy's terminal cutoff is calibrated on the same paths it
+        # was fitted to, then applied to test -- the convention every other
+        # decision rule here follows.
+        _, _, cal_llr_stop = apply_stopping_rule(cal_paths, coeffs, econ)
+        cut_l, _ = optimize_scalar_cutoff(cal_llr_stop, cal_labels)
+        st_l, pr_l, _ = apply_stopping_rule(test_paths, coeffs, econ, cut_l)
 
-        for correct, times, st, pr in (
-            (grid_correct, grid_time, st_g, pr_g),
-            (exh_correct, exh_time, st_x, pr_x),
-            (lsm_correct, lsm_time, st_l, pr_l),
-        ):
-            correct.append((pr == test_labels).astype(float))
-            times.append(st)
+        lsm_correct.append((pr_l == test_labels).astype(float))
+        lsm_time.append(st_l)
 
         rows.append(
             {
@@ -5454,6 +5515,7 @@ def run_optimal_stopping(
                 "T_learned": balanced_mean_time(test_labels, st_l),
                 "L": cal_base["L"],
                 "offset": cal_base["offset"],
+                "learned_cutoff": float(cut_l),
             }
         )
         rows[-1]["risk_reduction_pct"] = (
@@ -5462,10 +5524,6 @@ def run_optimal_stopping(
             / rows[-1]["risk_grid_sprt"]
         )
 
-    grid_correct = np.column_stack(grid_correct)
-    grid_time = np.column_stack(grid_time)
-    exh_correct = np.column_stack(exh_correct)
-    exh_time = np.column_stack(exh_time)
     lsm_correct = np.column_stack(lsm_correct)
     lsm_time = np.column_stack(lsm_time)
 
@@ -6528,8 +6586,8 @@ def validate_all(verbose: bool = True) -> int:
         os_te_shots, os_te_labels, os_params, 250.0, 250.0 / 64
     )
     coef_os = fit_stopping_rule(cal_paths_os, econ_a)
-    st_in, pr_in = apply_stopping_rule(cal_paths_os, coef_os, econ_a)
-    st_out, pr_out = apply_stopping_rule(te_paths_os, coef_os, econ_a)
+    st_in, pr_in, _ = apply_stopping_rule(cal_paths_os, coef_os, econ_a)
+    st_out, pr_out, _ = apply_stopping_rule(te_paths_os, coef_os, econ_a)
     r_in = bayes_risk(st_in, pr_in, cal_paths_os.labels, econ_a)
     r_out = bayes_risk(st_out, pr_out, te_paths_os.labels, econ_a)
     check(
@@ -7186,6 +7244,7 @@ _OPTIMAL_CSV_COLUMNS = [
     "T_learned",
     "L",
     "offset",
+    "learned_cutoff",
 ]
 
 _OPTIMAL_SPEEDUP_COLUMNS = [

@@ -1,0 +1,13 @@
+experiment,detector,physics_layer,point_index,point,sweep_value,method,max_balanced_fidelity
+noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,threshold,0.9404166666666667
+noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,adaptive_count,0.9370138888888888
+noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,fixed_count_mmpp,0.9470833333333333
+noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,adaptive_mmpp,0.9470833333333333
+noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,threshold,0.9361805555555556
+noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,adaptive_count,0.9295833333333333
+noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,fixed_count_mmpp,0.9427777777777777
+noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,adaptive_mmpp,0.944236111111111
+noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,threshold,0.9385416666666666
+noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,adaptive_count,0.9318055555555556
+noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,fixed_count_mmpp,0.94625
+noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,adaptive_mmpp,0.9483333333333333
