@@ -2029,6 +2029,11 @@ def regime_summary(params: MMPPParams, t_R_us: float | None = None) -> dict:
         switching_ratio = Gamma_-0 / Gamma_0-
             Ionization to recombination asymmetry; equals
             (1 - p_bright)/p_bright.
+
+        snr_per_bright_dwell
+            See `readout_snr`. Not an independent axis -- a function of the
+            three above -- but the combination that should control
+            discriminability, so it is reported on every point.
     """
     params.validate()
 
@@ -2052,6 +2057,7 @@ def regime_summary(params: MMPPParams, t_R_us: float | None = None) -> dict:
         "p_bright_stationary": (
             params.gamma_zero_to_minus_khz / gamma_tot if gamma_tot > 0 else np.nan
         ),
+        "snr_per_bright_dwell": readout_snr(params),
         "switching_ratio": (
             params.gamma_minus_to_zero_khz / params.gamma_zero_to_minus_khz
             if params.gamma_zero_to_minus_khz > 0
@@ -2069,6 +2075,131 @@ def regime_summary(params: MMPPParams, t_R_us: float | None = None) -> dict:
         out["gamma_tot_t_R"] = gamma_tot * float(t_R_us) / 1000.0
 
     return out
+
+
+def readout_snr(params: MMPPParams) -> float:
+    """
+    Photon-counting SNR accumulated over one mean bright dwell.
+
+    Over a time t the count difference between the two emission states is
+    dlambda * t and the counting noise is sqrt(lambda_bar * t), so the
+    dimensionless discriminability at time t is (dlambda / sqrt(lambda_bar))
+    * sqrt(t). Evaluated over the natural timescale of the problem, the mean
+    bright dwell t = 1 / Gamma_-0:
+
+        SNR = dlambda / sqrt(lambda_bar Gamma_-0)
+
+    with lambda_bar the STATIONARY mean rate, i.e. the noise level a typical
+    shot actually sees.
+
+    This is NOT a fourth independent axis. In terms of the dimensionless
+    parameters n = lambda_- / Gamma_-0 (sparsity), r = lambda_0 / lambda_-,
+    and p_b (stationary bright fraction),
+
+        SNR^2 = n (1 - r)^2 / (p_b + (1 - p_b) r),
+
+    so it is fixed by sparsity, contrast and the switching ratio, and is
+    invariant to an overall rate rescaling once those are fixed. Sweeping it
+    therefore means moving along some combination of the existing knobs; see
+    `params_with_snr` for the combination chosen and why.
+
+    Note the close relative in `mandel_q_mmpp`, whose amplitude is
+    2 dlambda^2 p_b (1 - p_b) / (lambda_bar Gamma_tot) -- the same
+    signal-over-noise grouping, which is why a Q measurement and an SNR
+    estimate probe overlapping information.
+    """
+    params.validate()
+
+    g_m0 = params.gamma_minus_to_zero_khz
+    gamma_tot = g_m0 + params.gamma_zero_to_minus_khz
+    p_b = params.gamma_zero_to_minus_khz / gamma_tot
+    d_lambda = params.lambda_minus_khz - params.lambda_zero_khz
+    lam_bar = (
+        p_b * params.lambda_minus_khz + (1.0 - p_b) * params.lambda_zero_khz
+    )
+
+    if lam_bar <= 0.0 or g_m0 <= 0.0:
+        return np.inf if d_lambda > 0 else 0.0
+
+    return float(d_lambda / np.sqrt(lam_bar * g_m0))
+
+
+def max_readout_snr(params: MMPPParams) -> float:
+    """
+    Largest SNR reachable at this sparsity and switching ratio, attained at
+    lambda_0 = 0 (perfect contrast): SNR_max = sqrt(n / p_b).
+    """
+    params.validate()
+    gamma_tot = (
+        params.gamma_minus_to_zero_khz + params.gamma_zero_to_minus_khz
+    )
+    p_b = params.gamma_zero_to_minus_khz / gamma_tot
+    n = params.lambda_minus_khz / params.gamma_minus_to_zero_khz
+    return float(np.sqrt(n / p_b))
+
+
+def params_with_snr(base: MMPPParams, snr_target: float) -> MMPPParams:
+    """
+    Set the SNR by adjusting the DARK rate only, holding lambda_-, Gamma_-0 and
+    Gamma_0- fixed.
+
+    Holding lambda_- and Gamma_-0 fixed holds photons per bright dwell fixed,
+    which is the point: the efficiency sweep moves SNR and sparsity together
+    (both scale with eta), so it cannot separate them. This sweep isolates SNR
+    at constant sparsity.
+
+    It does so by moving contrast, because at fixed sparsity and switching
+    ratio that is the only freedom left -- so this is the contrast sweep
+    reparameterised. The reason to run it anyway is coverage: the contrast grid
+    0.50-0.99 spans only SNR 3.4-9.2, whereas placing points uniformly in SNR
+    reaches below 1, where the readout genuinely fails and no existing sweep
+    goes.
+
+    Inverting SNR^2 = (lambda_- - x)^2 / ((p_b lambda_- + (1-p_b) x) Gamma_-0)
+    for x = lambda_0 is a quadratic:
+
+        x^2 - (2 lambda_- + S (1-p_b)) x + (lambda_-^2 - S p_b lambda_-) = 0,
+        S = SNR^2 Gamma_-0
+
+    of whose two roots exactly one lies in [0, lambda_-) for any reachable
+    target, since SNR is strictly decreasing in x over that interval.
+    """
+    base.validate()
+
+    target = float(snr_target)
+    if not (target > 0.0):
+        raise ValueError("snr_target must be positive.")
+
+    ceiling = max_readout_snr(base)
+    if target >= ceiling:
+        raise ValueError(
+            f"SNR {target:g} is not reachable at this operating point: the "
+            f"maximum is sqrt(n/p_bright) = {ceiling:.2f}, attained at zero "
+            "dark rate. Raise photons per bright dwell or lower the switching "
+            "ratio to go higher."
+        )
+
+    lam = base.lambda_minus_khz
+    g_m0 = base.gamma_minus_to_zero_khz
+    gamma_tot = g_m0 + base.gamma_zero_to_minus_khz
+    p_b = base.gamma_zero_to_minus_khz / gamma_tot
+
+    S = target * target * g_m0
+    b = -(2.0 * lam + S * (1.0 - p_b))
+    c = lam * lam - S * p_b * lam
+
+    disc = b * b - 4.0 * c
+    if disc < 0.0:
+        raise FloatingPointError("No real dark rate reproduces that SNR.")
+
+    roots = [(-b - np.sqrt(disc)) / 2.0, (-b + np.sqrt(disc)) / 2.0]
+    valid = [x for x in roots if -1e-12 <= x < lam]
+    if not valid:
+        raise FloatingPointError(
+            f"No dark rate in [0, lambda_-) reproduces SNR {target:g}."
+        )
+
+    return _replace_params(base, lambda_zero_khz=float(max(min(valid), 0.0)))
 
 
 def llr_at_times(packed: PaddedRecords, times_us: np.ndarray) -> np.ndarray:
@@ -2666,6 +2797,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         )
         print(
             f"  photons/bright dwell = {reg['photons_per_bright_dwell']:8.2f}   "
+            f"SNR = {reg['snr_per_bright_dwell']:.2f}   "
             f"contrast = {reg['contrast']:.3f}   "
             f"Gamma_-0/Gamma_0- = {reg['switching_ratio']:.2f}"
         )
@@ -3213,6 +3345,12 @@ CONTRASTS = [0.50, 0.70, 0.85, 0.95, 0.99]
 # Detected fraction of emitted photons.
 EFFICIENCIES = [0.02, 0.05, 0.15, 0.40, 1.00]
 
+# Photon-counting SNR over one mean bright dwell, dlambda/sqrt(lambda_bar
+# Gamma_-0). Geometric and spanning a factor 16, from well below 1 where the
+# readout fails up to near the ceiling sqrt(n/p_bright) = 9.39 at this
+# operating point. The base point sits at 8.58.
+SNR_TARGETS = [0.5, 1.0, 2.0, 4.0, 8.0]
+
 SWEEP_COLORS = ["#08306b", "#2171b5", "#6baed6", "#fd8d3c", "#a50f15"]
 
 # Rate-noise grids. sigma is the RMS fractional intensity fluctuation; tau_c is
@@ -3413,6 +3551,24 @@ def _efficiency_points(cfg: RunConfig) -> list[OperatingPoint]:
     return pts
 
 
+def _snr_points(cfg: RunConfig) -> list[OperatingPoint]:
+    base = _base_params()
+    pts = []
+    for snr in SNR_TARGETS:
+        params = params_with_snr(base, snr)
+        pts.append(
+            OperatingPoint(
+                name=f"snr{snr:g}",
+                label=f"SNR = {snr:g}",
+                params=params,
+                sweep_value=float(snr),
+                power_uw=BASE_POWER_UW,
+                detection_efficiency=1.0,
+            )
+        )
+    return pts
+
+
 def _noise_sigma_points(cfg: RunConfig) -> list[OperatingPoint]:
     base = _base_params()
     pts = []
@@ -3594,6 +3750,24 @@ EXPERIMENTS: dict[str, SweepSpec] = {
             "lambda_- is held fixed and lambda_0 is raised, so photons per "
             "bright dwell stay constant while the two states become harder "
             "to tell apart."
+        ),
+    ),
+    "snr": SweepSpec(
+        key="snr",
+        title="Photon-counting SNR sweep at fixed sparsity",
+        xlabel=(
+            r"SNR over one bright dwell, "
+            r"$\Delta\lambda/\sqrt{\bar\lambda\Gamma_{-0}}$"
+        ),
+        legend_title="SNR",
+        build_points=_snr_points,
+        note=(
+            "SNR is not an independent axis: SNR^2 = n (1-r)^2 / (p_b + "
+            "(1-p_b) r) in terms of sparsity, dark/bright rate ratio and "
+            "bright fraction. This sweep isolates it at FIXED photons per "
+            "bright dwell, which the efficiency sweep cannot do because eta "
+            "moves both. It reaches SNR < 1, which the contrast grid "
+            "(SNR 3.4-9.2) never does."
         ),
     ),
     "noise": SweepSpec(
@@ -4834,6 +5008,88 @@ def validate_all(verbose: bool = True) -> int:
         f"max diff {np.abs(a_stop - a_grid).max():.2e}",
     )
 
+    # -- 9bb. photon-counting SNR --------------------------------------------
+    base_snr = shields_2015_params(BASE_POWER_UW)
+
+    # readout_snr must agree with the closed form in dimensionless variables,
+    # which is the identity that makes SNR a derived quantity rather than a
+    # fourth axis.
+    worst_snr = 0.0
+    for c in (0.1, 0.5, 0.9, 0.99):
+        pp = params_with_contrast(base_snr, c)
+        reg_s = regime_summary(pp)
+        n = reg_s["photons_per_bright_dwell"]
+        r = pp.lambda_zero_khz / pp.lambda_minus_khz
+        p_b = reg_s["p_bright_stationary"]
+        closed = np.sqrt(n * (1.0 - r) ** 2 / (p_b + (1.0 - p_b) * r))
+        worst_snr = max(worst_snr, abs(readout_snr(pp) / closed - 1.0))
+    check(
+        "readout_snr matches SNR^2 = n (1-r)^2 / (p_b + (1-p_b) r)",
+        worst_snr < 1e-12,
+        f"max relative error {worst_snr:.1e}",
+    )
+
+    # Scale invariance: multiplying every rate by a constant leaves the three
+    # dimensionless parameters alone, so it must leave the SNR alone too.
+    scaled = _replace_params(
+        base_snr,
+        gamma_minus_to_zero_khz=3.0 * base_snr.gamma_minus_to_zero_khz,
+        gamma_zero_to_minus_khz=3.0 * base_snr.gamma_zero_to_minus_khz,
+        lambda_minus_khz=3.0 * base_snr.lambda_minus_khz,
+        lambda_zero_khz=3.0 * base_snr.lambda_zero_khz,
+    )
+    check(
+        "SNR is invariant under an overall rate rescaling",
+        abs(readout_snr(scaled) / readout_snr(base_snr) - 1.0) < 1e-12,
+        f"{readout_snr(base_snr):.4f} vs {readout_snr(scaled):.4f} at 3x rates",
+    )
+
+    # The sweep must hit each target and hold sparsity fixed while doing it.
+    snr_ok, spars_ok = True, True
+    n0 = regime_summary(base_snr)["photons_per_bright_dwell"]
+    for target in SNR_TARGETS:
+        pp = params_with_snr(base_snr, target)
+        reg_s = regime_summary(pp)
+        if abs(reg_s["snr_per_bright_dwell"] / target - 1.0) > 1e-9:
+            snr_ok = False
+        if abs(reg_s["photons_per_bright_dwell"] / n0 - 1.0) > 1e-12:
+            spars_ok = False
+    check("SNR sweep hits each requested SNR", snr_ok)
+    check(
+        "SNR sweep holds photons per bright dwell fixed",
+        spars_ok,
+        f"ph/dwell {n0:.2f} throughout, unlike the efficiency sweep where "
+        "SNR^2 and sparsity both scale with eta",
+    )
+
+    # The ceiling is sqrt(n / p_bright), reached at zero dark rate, and asking
+    # above it must fail loudly rather than return a nonsense dark rate.
+    ceiling = max_readout_snr(base_snr)
+    zero_dark = _replace_params(base_snr, lambda_zero_khz=0.0)
+    raised = False
+    try:
+        params_with_snr(base_snr, ceiling * 1.01)
+    except ValueError:
+        raised = True
+    check(
+        "max SNR is attained at zero dark rate and is enforced",
+        abs(readout_snr(zero_dark) / ceiling - 1.0) < 1e-12 and raised,
+        f"ceiling {ceiling:.2f}",
+    )
+
+    # Coverage claim: the SNR grid must reach below the contrast grid's floor,
+    # which is the reason for running it at all.
+    snr_of_contrast = [
+        readout_snr(params_with_contrast(base_snr, c)) for c in CONTRASTS
+    ]
+    check(
+        "SNR grid extends below the contrast grid's reach",
+        min(SNR_TARGETS) < 0.5 * min(snr_of_contrast),
+        f"contrast grid spans SNR "
+        f"[{min(snr_of_contrast):.2f}, {max(snr_of_contrast):.2f}], "
+        f"SNR grid starts at {min(SNR_TARGETS):g}",
+    )
+
     # -- 9c. rate noise ------------------------------------------------------
     rng = np.random.default_rng(20250917)
 
@@ -5393,6 +5649,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(
                 f"              [{i}] {p.name:<14} "
                 f"ph/dwell {reg['photons_per_bright_dwell']:7.2f}  "
+                f"SNR {reg['snr_per_bright_dwell']:5.2f}  "
                 f"contrast {reg['contrast']:.3f}  "
                 f"ratio {reg['switching_ratio']:7.2f}  "
                 f"Gamma_tot {reg['gamma_tot_khz']:7.3f} kHz"
@@ -5468,6 +5725,7 @@ _SPEEDUP_CSV_COLUMNS = [
     "photons_per_bright_dwell",
     "contrast",
     "switching_ratio",
+    "snr_per_bright_dwell",
     "p_bright_stationary",
     "gamma_tot_khz",
     "horizon_us",
@@ -5535,6 +5793,7 @@ def export_csv(
                 "photons_per_bright_dwell": reg["photons_per_bright_dwell"],
                 "contrast": reg["contrast"],
                 "switching_ratio": reg["switching_ratio"],
+                "snr_per_bright_dwell": reg["snr_per_bright_dwell"],
                 "p_bright_stationary": reg["p_bright_stationary"],
                 "gamma_tot_khz": reg["gamma_tot_khz"],
                 "horizon_us": res["horizon_us"],
