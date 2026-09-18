@@ -211,11 +211,16 @@ def report_factorization(rows: list[dict]) -> None:
 def report_ceilings(rows: list[dict], ceilings: dict) -> None:
     """Where the statistic pays: the achievable fidelity, not the run time."""
     section("Ceiling gains along the same two axes")
+    # Deduplicated: the same regime reached through several sweeps must not
+    # be averaged in more than once.
+    wanted = set(matched_rows(rows, dedup=True))
     keys = sorted(
         {
             (r["experiment"], r["detector"], r["point"])
             for r in rows
-            if r["_ideal"] and not r["_noisy"]
+            if r["_ideal"]
+            and not r["_noisy"]
+            and (r["experiment"], r["point"]) in wanted
         }
     )
     stat, stop, thr_vs_fcm, thr_vs_cnt = [], [], 0, 0
@@ -241,12 +246,46 @@ def report_ceilings(rows: list[dict], ceilings: dict) -> None:
     print(f"  adaptive count   ceiling beats the threshold's at {thr_vs_cnt}/{n}")
 
 
-def matched_rows(rows: list[dict]) -> dict:
-    """Per operating point, the matched-headroom summary the README tabulates."""
+def _physical_key(r: dict) -> tuple:
+    """
+    The four dimensionless numbers that define an operating point.
+
+    Several sweeps pass through the same physics: the 5.437 uW reference
+    point is the eta = 1 end of the efficiency sweep, the sigma = 0 end of
+    three noise sweeps and the `moderate` demo point, and 15 uW is both the
+    top of the power sweep and the `high_flux` demo point. Counting those as
+    five independent points would put five copies of one regime into a
+    pooled regression over ~25, which is not a small distortion.
+    """
+    return (
+        round(_f(r, "photons_per_bright_dwell"), 6),
+        round(_f(r, "contrast"), 6),
+        round(_f(r, "switching_ratio"), 6),
+        round(_f(r, "snr_per_bright_dwell"), 6),
+    )
+
+
+def matched_rows(rows: list[dict], dedup: bool = False) -> dict:
+    """
+    Per operating point, the matched-headroom summary the README tabulates.
+
+    With `dedup`, operating points that are physically the same regime are
+    collapsed to one, keeping the first sweep alphabetically. Use it for
+    anything that pools points; leave it off for the per-sweep table, where
+    the repetition is the point.
+    """
     per = defaultdict(list)
     for r in rows:
         if r["_ideal"] and not r["_noisy"]:
             per[(r["experiment"], r["point"])].append(r)
+
+    if dedup:
+        seen: dict = {}
+        for key in sorted(per):
+            phys = _physical_key(per[key][0])
+            if phys not in seen:
+                seen[phys] = key
+        per = {k: v for k, v in per.items() if k in set(seen.values())}
 
     out = {}
     for key, rs in per.items():
@@ -301,7 +340,7 @@ def report_collapse(rows: list[dict], ceilings: dict) -> None:
     each figure of merit on log SNR, log sparsity, and both.
     """
     section("Collapse test: SNR against sparsity, pooled over all sweeps")
-    table = matched_rows(rows)
+    table = matched_rows(rows, dedup=True)
 
     pts = []
     for (exp, pt), v in table.items():
@@ -348,7 +387,16 @@ def report_collapse(rows: list[dict], ceilings: dict) -> None:
 def report_danjou(rows: list[dict]) -> None:
     """D'Anjou gives 2x as the bound for decay readout. Does anything clear it?"""
     section("Rows exceeding the D'Anjou 2x bound (ideal detector)")
-    pool = [r for r in rows if r["_ideal"] and not r["_noisy"]]
+    # Deduplicated: the same regime appears in up to five sweeps, and a row
+    # that crosses 2x would otherwise be counted once per sweep.
+    wanted = set(matched_rows(rows, dedup=True))
+    pool = [
+        r
+        for r in rows
+        if r["_ideal"]
+        and not r["_noisy"]
+        and (r["experiment"], r["point"]) in wanted
+    ]
     hits = [r for r in pool if _f(r, "speedup_mmpp") > 2.0]
     n_def = sum(1 for r in pool if np.isfinite(_f(r, "speedup_mmpp")))
     print(f"{len(hits)} of {n_def} rows\n")

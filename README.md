@@ -17,8 +17,10 @@ Always, on identical shots:
 2. **adaptive count SPRT** — stop at the n-th photon, decide on whether you got there
 3. **fixed-count MMPP** — same stopping rule as 2, decide with the calibrated MMPP LLR
 4. **adaptive MMPP SPRT** — stop when the LLR crosses a calibrated boundary
+5. **learned optimal stopping** — the Bayes-optimal rule, via `optimal`
 
-The design is a 2×2 of stopping rule against decision statistic:
+The design is a 2×2 of stopping rule against decision statistic, plus the
+optimum the 2×2 is measured against:
 
 | stopping rule | decision statistic | method |
 |---|---|---|
@@ -27,6 +29,7 @@ The design is a 2×2 of stopping rule against decision statistic:
 | fixed count | count (one bit) | 2 adaptive count SPRT |
 | fixed count | MMPP LLR | 3 fixed-count MMPP |
 | LLR boundary | MMPP LLR | 4 adaptive MMPP SPRT |
+| learned, on (LLR, information gap) | MMPP LLR | 5 optimal stopping |
 
 Methods 2 and 3 share their stopping rule *exactly* — identical per-shot stop
 times, hence identical mean run time, which `validate` asserts — so 2 → 3
@@ -36,6 +39,34 @@ fixed. Without both controls a speedup could be attributed to either axis.
 
 The `demo` experiment additionally runs a fixed-time MMPP baseline with a
 calibrated cutoff, plus a paired exact McNemar test.
+
+## Optimal stopping
+
+Methods 1–4 are rules that were written down and then tuned; none is claimed
+optimal. Method 5 computes the one that is — the Ludkovski–Sezer Bayes
+problem on the augmented chain, solved by Longstaff–Schwartz regression Monte
+Carlo over the initial-state LLR and the information gap
+`d = logit(u) − logit(v)`.
+
+```bash
+python adaptive_charge_state_master.py optimal demo
+python adaptive_charge_state_master.py optimal power --point 2 --n-epochs 256
+```
+
+It reports two currencies: Bayes risk against `a/c` (microseconds of readout
+per avoided error), which is what the policy actually optimises, and time to
+reach a target fidelity with the same paired bootstrap as the other methods.
+
+It also measures the **information-exhaustion exit** separately. A photon
+translates both hypotheses equally in log-odds, so `d` is unchanged at every
+click and shrinks only while waiting; once it closes the LLR is frozen. At
+fixed boundary the exit therefore gives bit-identical decisions at
+never-longer run times — one comparison per epoch to implement, up to 130 µs
+a shot saved. `validate` asserts all three facts.
+
+Answer, at the three demo points: the tuned SPRT is within a few percent of
+the optimum over most of the frontier and loses only in the top ~2% of the
+fidelity range. See `results/README.md`.
 
 ## Experiments
 
@@ -54,8 +85,8 @@ calibrated cutoff, plus a paired exact McNemar test.
 
 `efficiency` and `snr` both move the readout's information content, but along
 different axes: η scales SNR² and sparsity together, while the SNR sweep holds
-sparsity fixed and moves the dark rate alone. Which knob controls what is the
-main structural result — see `results/README.md`.
+sparsity fixed and moves the dark rate alone. The `snr` sweep is what settles
+which of the two actually drives the speedup — see `results/README.md`.
 
 The four `noise_*` experiments vary the rates *within* a shot, which no other
 knob here can express: a rate error that is constant for a shot only rescales
@@ -65,12 +96,14 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 61 numerical checks
+python adaptive_charge_state_master.py validate          # 70 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
 python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
+python adaptive_charge_state_master.py optimal demo      # the Bayes-optimal rule
+python results/analysis.py                              # cross-experiment tables
 ```
 
 A full five-point sweep takes a couple of minutes; `--quick` runs a small
@@ -130,6 +163,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 61/61 on both.
+active, every saved result records it, and `validate` passes 70/70 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.
