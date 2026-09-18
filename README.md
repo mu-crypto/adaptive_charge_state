@@ -45,13 +45,27 @@ calibrated cutoff, plus a paired exact McNemar test.
 | `power` | 594 nm laser power over the measured Shields range, 0.875–15 µW |
 | `ratio` | Γ₋₀/Γ₀₋, ionization over recombination, at fixed Γ_tot |
 | `contrast` | (λ₋ − λ₀)/(λ₋ + λ₀) at fixed bright rate |
-| `efficiency` | detection efficiency η |
+| `efficiency` | detection efficiency η, at fixed contrast |
+| `snr` | Δλ/√(λ̄ Γ₋₀), at fixed photons per bright dwell |
+| `noise` | rate-noise amplitude σ (Gaussian, τ_c = 100 µs) |
+| `noise_setpoint` | the same, without mean renormalisation |
+| `noise_tau` | rate-noise correlation time τ_c |
+| `noise_kind` | Gaussian against telegraph noise at matched variance |
+
+`efficiency` and `snr` both move the readout's information content, but along
+different axes: η scales SNR² and sparsity together, while the SNR sweep holds
+sparsity fixed and moves the dark rate alone. Which knob controls what is the
+main structural result — see `results/README.md`.
+
+The four `noise_*` experiments vary the rates *within* a shot, which no other
+knob here can express: a rate error that is constant for a shot only rescales
+the LLR and is absorbed by the calibrated boundary.
 
 ## Usage
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 25 numerical checks
+python adaptive_charge_state_master.py validate          # 61 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
@@ -92,13 +106,30 @@ calibration measurement returns; `--no-filter-correction` measures what pure
 model mismatch costs instead. Each detector setting writes to its own output
 directory, so ideal and non-ideal runs never overwrite each other.
 
-## Dependency
+## Detection efficiency
 
-The physics primitives come from `nv_charge_readout_master_v1_4` when it is
-importable. When it is not, the file falls back to a self-contained reference
-implementation whose constants are pinned to the same 5.437 µW operating point
-(Γ_tot = 9.42 kHz, p_bright = 0.118) but are a documented stand-in, not a
-re-measurement. `list` and `validate` report which layer is active, and every
-saved result records it.
+`--efficiency-model` chooses how η acts on the count rates, and it is not a
+cosmetic choice:
+
+- `thin_all_counts` (default) multiplies both λ by η. Contrast is preserved
+  exactly, so the efficiency sweep moves one thing, photons per bright dwell.
+- `signal_only` leaves the state-independent background floor (0.268 kHz of
+  dark counts and stray fluorescence) in place and thins only the NV
+  fluorescence above it. That is what a real collection-efficiency loss does,
+  but contrast then degrades along with η — at η = 0.02 it falls 0.925 → 0.833
+  — so the sweep no longer isolates either variable.
+
+Non-default runs get their own output directory, so the two cannot overwrite
+each other.
+
+## Physics layer
+
+The rate laws, the MMPP parameter object and the fixed-time baseline come from
+`nv_charge_readout_master_v1_4`, which is in this repo. If it is ever absent
+the file falls back to a self-contained reference implementation pinned to the
+same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
+documented stand-in, not a re-measurement, and its emission rates and power
+dependence differ substantially. `list` and `validate` report which layer is
+active, every saved result records it, and `validate` passes 61/61 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.

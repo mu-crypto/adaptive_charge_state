@@ -12,3 +12,8 @@ __pycache__/
 # Per-operating-point figures, 13 MB across the matrix. The sweep-level figures
 # under results/ are committed; regenerate these with `plot`.
 results/**/point_*.png
+
+# Optimal-stopping run artifacts. The per-point pickle carries the full epoch
+# filter paths, so they are large; regenerate with `optimal`. The committed
+# CSVs and figures under results/ are derived from them.
+results/**/optimal/*.pkl
