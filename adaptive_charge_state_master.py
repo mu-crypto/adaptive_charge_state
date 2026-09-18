@@ -157,6 +157,13 @@ if _nv is not None:
     make_bayesian_switching_ensemble = _nv.make_bayesian_switching_ensemble
     _nv_simulate_mmpp_shot = _nv.simulate_mmpp_shot
 
+    # State-independent count rate folded into both lambdas by the rate fits:
+    # detector dark counts plus residual room and substrate fluorescence. It
+    # does not vanish with the NV signal, so it is what keeps the efficiency
+    # models and the photon-order coupling from degenerating (see the
+    # `efficiency sweep` and `photon order` checks in `validate_all`).
+    SHIELDS_BACKGROUND_KHZ = float(_nv.SHIELDS_BACKGROUND_KHZ)
+
     def _replace_params(params, **changes):
         """
         Copy of `params` with some rates changed.
@@ -204,6 +211,12 @@ else:
     _ANCHOR_POWER_UW = 5.437
     _ANCHOR_GAMMA_TOT_KHZ = 9.42
     _ANCHOR_P_BRIGHT = 0.118
+
+    # The stand-in carries no state-independent background: its lambdas are
+    # pure NV fluorescence. The two efficiency models below therefore coincide
+    # here, which they do NOT on the real layer -- see `apply_detection_
+    # efficiency` and the `efficiency sweep` checks.
+    SHIELDS_BACKGROUND_KHZ = 0.0
 
     _P_SAT_IONIZATION_UW = 12.0     # saturation of NV- -> NV0 (594 nm)
     _P_SAT_RECOMBINATION_UW = 25.0  # saturation of NV0 -> NV-
@@ -308,35 +321,50 @@ else:
         )
 
     def apply_detection_efficiency(  # type: ignore[no-redef]
-        params: "MMPPParams",
-        detection_efficiency: float,
-        model: str = "signal_only",
-        background_khz: float = 0.0,
+        base_params: "MMPPParams",
+        efficiency: float,
+        model: str = "thin_all_counts",
+        background_khz: float = SHIELDS_BACKGROUND_KHZ,
     ) -> "MMPPParams":
         """
         Thin the detected photon rates by eta, leaving the switching rates
         untouched (collection efficiency does not change the charge dynamics).
 
-        model
-            "signal_only"     : both rates scale by eta.
-            "with_background" : eta scales the signal, then a state-independent
-                                background rate is added to both.
-        """
-        eta = float(detection_efficiency)
-        if not (0.0 < eta <= 1.0):
-            raise ValueError("detection_efficiency must lie in (0, 1].")
+        Signature and semantics mirror the real layer exactly, so that
+        `RunConfig.efficiency_model` means the same thing whichever layer is
+        active. That matters: the two names below differ only when the
+        background is non-zero, and an earlier version of this stand-in used
+        "signal_only" for what the real module calls "thin_all_counts".
 
-        if model == "signal_only":
-            bg = 0.0
-        elif model == "with_background":
+        model
+            "thin_all_counts" : lambda_x -> eta * lambda_x. Contrast is
+                                preserved exactly; the sweep is a pure
+                                sparsity knob.
+            "signal_only"     : the background stays put and only fluorescence
+                                above it is thinned, which is what happens
+                                when the floor is detector dark counts. Then
+                                contrast FALLS with eta.
+
+        With this stand-in's zero background the two coincide.
+        """
+        eta = float(efficiency)
+        if not np.isfinite(eta) or not (0.0 < eta <= 1.0):
+            raise ValueError("efficiency must satisfy 0 < eta <= 1.")
+
+        if model == "thin_all_counts":
+            lam_minus = eta * base_params.lambda_minus_khz
+            lam_zero = eta * base_params.lambda_zero_khz
+        elif model == "signal_only":
             bg = float(background_khz)
+            lam_minus = eta * (base_params.lambda_minus_khz - bg) + bg
+            lam_zero = eta * (base_params.lambda_zero_khz - bg) + bg
         else:
             raise ValueError(f"Unknown efficiency model {model!r}.")
 
         return replace(
-            params,
-            lambda_minus_khz=eta * params.lambda_minus_khz + bg,
-            lambda_zero_khz=eta * params.lambda_zero_khz + bg,
+            base_params,
+            lambda_minus_khz=lam_minus,
+            lambda_zero_khz=lam_zero,
         )
 
     def balanced_initial_state_fidelity(  # type: ignore[no-redef]
@@ -2151,9 +2179,10 @@ def params_with_snr(base: MMPPParams, snr_target: float) -> MMPPParams:
     It does so by moving contrast, because at fixed sparsity and switching
     ratio that is the only freedom left -- so this is the contrast sweep
     reparameterised. The reason to run it anyway is coverage: the contrast grid
-    0.50-0.99 spans only SNR 3.4-9.2, whereas placing points uniformly in SNR
+    0.50-0.99 spans a limited SNR range, whereas placing points uniformly in SNR
     reaches below 1, where the readout genuinely fails and no existing sweep
-    goes.
+    goes. (The span is layer-dependent; `_CONTRAST_GRID_SNR` computes it, and
+    `list` prints it in the sweep note.)
 
     Inverting SNR^2 = (lambda_- - x)^2 / ((p_b lambda_- + (1-p_b) x) Gamma_-0)
     for x = lambda_0 is a quadratic:
@@ -2611,7 +2640,13 @@ class RunConfig:
     noise: RateNoise = NOISE_OFF
     include_fixed_mmpp: bool = False
     n_q_shots: int = 300
-    efficiency_model: str = "signal_only"
+    # "thin_all_counts": eta multiplies both lambdas, so contrast is held
+    # exactly and the efficiency sweep varies one thing, sparsity. Under
+    # "signal_only" the background floor survives the thinning, so efficiency
+    # and contrast move together and the sweep no longer isolates either --
+    # informative, but a different experiment. Selectable with
+    # --efficiency-model.
+    efficiency_model: str = "thin_all_counts"
     verbose: bool = True
 
     boundary_widths: np.ndarray = field(
@@ -3703,6 +3738,17 @@ class SweepSpec:
     note: str = ""
 
 
+# Numbers quoted in the sweep notes below are derived from the ACTIVE physics
+# layer rather than written in, because they are exactly the quantities that
+# move when the layer changes: the contrast grid's SNR reach, the photon-order
+# coupling and the bright dwell time all differ by a factor of two or more
+# between the real rate fits and the stand-in.
+_CONTRAST_GRID_SNR = [
+    readout_snr(params_with_contrast(_base_params(), c)) for c in CONTRASTS
+]
+_BRIGHT_DWELL_US = 1000.0 / _base_params().gamma_minus_to_zero_khz
+
+
 EXPERIMENTS: dict[str, SweepSpec] = {
     "demo": SweepSpec(
         key="demo",
@@ -3767,7 +3813,8 @@ EXPERIMENTS: dict[str, SweepSpec] = {
             "bright fraction. This sweep isolates it at FIXED photons per "
             "bright dwell, which the efficiency sweep cannot do because eta "
             "moves both. It reaches SNR < 1, which the contrast grid "
-            "(SNR 3.4-9.2) never does."
+            f"(SNR {min(_CONTRAST_GRID_SNR):.1f}-{max(_CONTRAST_GRID_SNR):.1f}) "
+            "never does."
         ),
     ),
     "noise": SweepSpec(
@@ -3797,9 +3844,10 @@ EXPERIMENTS: dict[str, SweepSpec] = {
         note=(
             "Same sweep as `noise` but with delta = 0 taken as the laser "
             "setpoint, so the mean rate is free to move. Mean-preserving "
-            "renormalisation pushes the median switching gain below 1 when "
-            "the photon order is ~4, which makes the typical shot easier and "
-            "could mask harm; this is the cross-check."
+            "renormalisation pushes the median switching gain below 1 "
+            f"(the photon order here is {NOISE_PHOTON_ORDER:.2f}), which "
+            "makes the typical shot easier and could mask harm; this is the "
+            "cross-check."
         ),
     ),
     "noise_tau": SweepSpec(
@@ -3809,7 +3857,8 @@ EXPERIMENTS: dict[str, SweepSpec] = {
         legend_title="correlation time",
         build_points=_noise_tau_points,
         note=(
-            "Noise much faster than the 120 us bright dwell averages out "
+            f"Noise much faster than the {_BRIGHT_DWELL_US:.0f} us bright "
+            "dwell averages out "
             "within a dwell; noise much slower is quasi-static and the "
             "calibrated cutoff absorbs it. The damage should peak in between."
         ),
@@ -3854,18 +3903,27 @@ def run_directory(
     out_root: Path,
     detector: DetectorModel,
     noise: RateNoise = NOISE_OFF,
+    efficiency_model: str = "thin_all_counts",
 ) -> Path:
     """
-    One directory per (experiment, detector, noise) so runs never collide.
+    One directory per (experiment, detector, noise, efficiency model) so runs
+    never collide.
 
     The noise tag is omitted when the noise is off, so existing output paths
     are unchanged. The noise sweeps vary the noise PER POINT, so their own
     directory tag stays "nonoise" and the per-point setting lives in the
     filename and the result.
+
+    The efficiency-model tag is likewise omitted for the default, and it only
+    ever bites the two sweeps that apply an efficiency at all -- but a
+    "signal_only" run of those produces different physics at the same point
+    name, so it must not land on top of the default run.
     """
     d = Path(out_root) / spec.key / detector.tag()
     if not noise.is_off:
         d = d / noise.tag()
+    if efficiency_model != "thin_all_counts":
+        d = d / f"eff-{efficiency_model}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -3960,7 +4018,9 @@ def load_results(
 ) -> list[dict]:
     """Load whatever points have been run, in sweep order."""
     cfg = cfg if cfg is not None else RunConfig(verbose=False)
-    directory = run_directory(spec, out_root, detector, cfg.noise)
+    directory = run_directory(
+        spec, out_root, detector, cfg.noise, cfg.efficiency_model
+    )
     points = spec.build_points(cfg)
 
     out = []
@@ -5302,18 +5362,59 @@ def validate_all(verbose: bool = True) -> int:
     )
 
     # The photon-order coupling is not a free choice: it must match the rate
-    # laws this file implements.
-    # The photon-order coupling is not a free choice, but it equals 2 only
-    # where BOTH processes are unsaturated. Assert the unsaturated limit, and
-    # report the value at the powers actually used so the saturation-driven
-    # rise is on the record rather than assumed away.
+    # laws this file implements. The textbook value is 2 -- switching is
+    # two-photon, emission is one-photon -- but the active laws never quite
+    # reach it, and they miss it from ABOVE at both ends for two unrelated
+    # reasons:
+    #
+    #   Gamma_-0 = a P^2 / (1 + P/53.2)   =>  dlnGamma/dlnP = 2 - P/(53.2+P)
+    #   lambda_- = b P / (1 + P/53) + bg  =>  dlnlambda/dlnP
+    #                                         = f_sig * (1 - P/(53+P))
+    #
+    # with f_sig = signal/(signal + background) <= 1. At low power the fixed
+    # detector background floors lambda_-, so emission responds to a power
+    # change by LESS than one order (f_sig < 1) and the ratio climbs. At high
+    # power emission saturates faster than switching does. Since the two
+    # saturation powers are nearly equal (53 vs 53.2) and f_sig <= 1, the
+    # ratio is bounded below by 2 everywhere, touching it only in the
+    # doubly-idealised limit P -> 0 with zero background.
+    #
+    # So assert the bound and locate the minimum, rather than asserting a
+    # limit the measured laws do not actually attain.
+    grid = np.geomspace(0.05, 15.0, 61)
+    orders = np.array([local_photon_order(P) for P in grid])
     low = [local_photon_order(P) for P in (0.05, 0.1, 0.2)]
     used = [local_photon_order(P) for P in (0.875, BASE_POWER_UW, 15.0)]
+    i_min = int(np.argmin(orders))
     check(
-        "photon order -> 2 in the unsaturated limit",
-        all(1.95 <= o <= 2.15 for o in low),
-        f"orders {[round(o, 2) for o in low]} at 0.05-0.2 uW",
+        "photon order is bounded below by 2, and nearly attains it",
+        orders.min() >= 2.0 and orders.min() < 2.05,
+        f"min {orders.min():.3f} at {grid[i_min]:.2f} uW"
+        + (
+            " (background dilution below, emission saturation above)"
+            if SHIELDS_BACKGROUND_KHZ > 0.0
+            else " (emission saturation only, this layer having no background)"
+        ),
     )
+    if SHIELDS_BACKGROUND_KHZ > 0.0:
+        bg_frac = [
+            100 * SHIELDS_BACKGROUND_KHZ / shields_2015_params(P).lambda_minus_khz
+            for P in (0.05, 0.2)
+        ]
+        check(
+            "background dilution raises the order at low power",
+            low[0] > low[1] > low[2] > orders.min(),
+            f"orders {[round(o, 2) for o in low]} at 0.05-0.2 uW, where the "
+            f"{SHIELDS_BACKGROUND_KHZ} kHz background is "
+            f"{bg_frac[0]:.0f}-{bg_frac[1]:.0f}% of the bright rate",
+        )
+    else:
+        check(
+            "without a background the order is monotone in power",
+            low[0] < low[1] < low[2] and abs(low[0] - 2.0) < 0.05,
+            f"orders {[round(o, 2) for o in low]} at 0.05-0.2 uW, rising "
+            f"from 2 with saturation alone",
+        )
     check(
         "photon order rises with emission saturation, and is used as measured",
         used[0] < used[1] < used[2]
@@ -5545,19 +5646,52 @@ def validate_all(verbose: bool = True) -> int:
         contrast_ok,
     )
 
+    # The sweep runs "thin_all_counts": eta multiplies both lambdas, so the
+    # switching rates and the contrast are both untouched and the only thing
+    # that moves is photons per dwell. That is what makes the efficiency axis
+    # comparable to the contrast axis instead of a blend of the two.
     eff_ok = True
     for eta in EFFICIENCIES:
-        p = apply_detection_efficiency(base, eta, "signal_only")
+        p = apply_detection_efficiency(base, eta, "thin_all_counts")
         reg_e = regime_summary(p)
         if (
             abs(p.lambda_minus_khz / (eta * base.lambda_minus_khz) - 1.0) > 1e-12
+            or abs(p.lambda_zero_khz / (eta * base.lambda_zero_khz) - 1.0) > 1e-12
             or abs(reg_e["contrast"] - regime_summary(base)["contrast"]) > 1e-12
             or abs(reg_e["gamma_tot_khz"] / gamma_tot_0 - 1.0) > 1e-12
         ):
             eff_ok = False
     check(
-        "efficiency sweep thins emission only, at fixed contrast", eff_ok
+        "efficiency sweep thins emission only, at fixed contrast",
+        eff_ok and RunConfig().efficiency_model == "thin_all_counts",
     )
+
+    # The two efficiency models are NOT interchangeable, and the name
+    # "signal_only" once meant opposite things on the two physics layers. Pin
+    # the distinction so a future rename cannot quietly swap the experiment:
+    # holding a real background fixed while thinning the signal degrades
+    # contrast, by a factor that grows as eta shrinks.
+    eta_low = min(EFFICIENCIES)
+    p_thin = apply_detection_efficiency(base, eta_low, "thin_all_counts")
+    p_sig = apply_detection_efficiency(base, eta_low, "signal_only")
+    c_base = regime_summary(base)["contrast"]
+    c_thin = regime_summary(p_thin)["contrast"]
+    c_sig = regime_summary(p_sig)["contrast"]
+    if SHIELDS_BACKGROUND_KHZ > 0.0:
+        check(
+            "the two efficiency models differ once a background is present",
+            abs(c_thin - c_base) < 1e-12 and c_sig < c_base - 1e-6,
+            f"at eta = {eta_low:g} contrast is {c_thin:.4f} thinning all "
+            f"counts (= base {c_base:.4f}) but {c_sig:.4f} holding the "
+            f"{SHIELDS_BACKGROUND_KHZ} kHz floor fixed",
+        )
+    else:
+        check(
+            "the two efficiency models coincide at zero background",
+            abs(c_thin - c_sig) < 1e-12 and abs(c_thin - c_base) < 1e-12,
+            f"contrast {c_thin:.4f} under both, this layer having no "
+            f"state-independent background",
+        )
 
     n_fail = sum(1 for _, ok in results if not ok)
     if verbose:
@@ -5648,6 +5782,8 @@ def config_from_args(args: argparse.Namespace, spec: SweepSpec) -> RunConfig:
         cfg = replace(cfg, n_test=int(args.n_test))
     if getattr(args, "n_boot", None) is not None:
         cfg = replace(cfg, n_boot=int(args.n_boot))
+    if getattr(args, "efficiency_model", None) is not None:
+        cfg = replace(cfg, efficiency_model=str(args.efficiency_model))
     return cfg
 
 
@@ -5703,7 +5839,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
     points = spec.build_points(cfg)
-    directory = run_directory(spec, Path(args.out), cfg.detector, cfg.noise)
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    )
 
     idx = _selected_indices(args.point, len(points))
 
@@ -5727,7 +5865,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_plot(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
-    directory = run_directory(spec, Path(args.out), cfg.detector, cfg.noise)
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    )
     results = load_results(spec, Path(args.out), cfg.detector, cfg)
 
     if not results:
@@ -5880,7 +6020,9 @@ def export_csv(
 def cmd_export(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
-    directory = run_directory(spec, Path(args.out), cfg.detector, cfg.noise)
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    )
     results = load_results(spec, Path(args.out), cfg.detector, cfg)
 
     if not results:
@@ -5993,6 +6135,17 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--noise-renormalise", default=None, choices=["mean", "none"],
             help="'mean' removes the mean-rate shift; 'none' is the setpoint",
+        )
+        sp.add_argument(
+            "--efficiency-model", default=None,
+            choices=["thin_all_counts", "signal_only"],
+            help=(
+                "how detection efficiency acts on the count rates. "
+                "'thin_all_counts' (default) multiplies both lambdas by eta, "
+                "holding contrast fixed; 'signal_only' leaves the "
+                "state-independent background floor in place, so contrast "
+                "degrades along with eta"
+            ),
         )
         sp.add_argument(
             "--no-filter-correction", action="store_true",
