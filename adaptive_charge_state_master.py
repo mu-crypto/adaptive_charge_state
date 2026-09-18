@@ -3926,6 +3926,19 @@ def _from_plain(result: dict) -> dict:
             continue
         d = {k: v for k, v in obj.items() if k != "__kind__"}
         out[key] = builders[obj.get("__kind__", kind)](d)
+
+    # The regime summary is a pure function of the parameters, so recompute it
+    # rather than trusting whatever was stored. A result saved before a new
+    # dimensionless quantity existed would otherwise be missing that key and
+    # break every consumer that reads it -- which is how this was found, when
+    # adding the SNR column made `export` fail on results pickled before it.
+    # Recomputed keys win; anything else stored is preserved.
+    if "params" in out and not isinstance(out["params"], dict):
+        out["regime"] = {
+            **out.get("regime", {}),
+            **regime_summary(out["params"]),
+        }
+
     return out
 
 
@@ -5088,6 +5101,32 @@ def validate_all(verbose: bool = True) -> int:
         f"contrast grid spans SNR "
         f"[{min(snr_of_contrast):.2f}, {max(snr_of_contrast):.2f}], "
         f"SNR grid starts at {min(SNR_TARGETS):g}",
+    )
+
+    # A result saved before a dimensionless quantity existed must still load
+    # with that quantity present, since the regime summary is recomputed from
+    # the stored parameters rather than trusted. Simulate the stale case by
+    # deleting the key from a plain-form result and rehydrating.
+    stale = _to_plain(
+        {
+            "params": base_snr,
+            "regime": {
+                k: v
+                for k, v in regime_summary(base_snr).items()
+                if k != "snr_per_bright_dwell"
+            },
+        }
+    )
+    revived = _from_plain(stale)
+    check(
+        "a stale saved result regains new regime keys on load",
+        "snr_per_bright_dwell" in revived["regime"]
+        and abs(
+            revived["regime"]["snr_per_bright_dwell"] / readout_snr(base_snr)
+            - 1.0
+        )
+        < 1e-12,
+        f"recovered SNR {revived['regime']['snr_per_bright_dwell']:.4f}",
     )
 
     # -- 9c. rate noise ------------------------------------------------------

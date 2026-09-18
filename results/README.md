@@ -18,7 +18,7 @@ so understated the uncertainty. Every point estimate, fidelity ceiling and
 decomposition below is numerically unchanged; only the intervals moved.
 
 All 5 readout experiments were run under 3 detector settings, 15 combinations
-total, plus 4 rate-noise experiments at the ideal detector:
+total, plus an SNR sweep and 4 rate-noise experiments at the ideal detector:
 
 ```
 results/<experiment>/<detector>/
@@ -38,6 +38,72 @@ re-simulating; `run`) and the per-operating-point figures (`plot`). The pickles
 contain no custom classes, so a bare `pickle.load` with no imports works; the
 module's own `load_results` rehydrates the parameter, detector and noise fields
 into objects.
+
+## SNR sets the ceiling; sparsity sets the speedup
+
+SNR is not an independent axis. Over one mean bright dwell the signal is
+Δλ/Γ₋₀ and the counting noise √(λ̄/Γ₋₀), so
+
+```
+SNR² = Δλ²/(λ̄ Γ₋₀) = n (1−r)² / (p_b + (1−p_b) r)
+```
+
+for sparsity n = λ₋/Γ₋₀, dark/bright ratio r = λ₀/λ₋ and bright fraction p_b —
+a function of the three dimensionless parameters already swept, and invariant
+under an overall rate rescaling once they are fixed. Both identities are
+asserted in `validate`. So an SNR sweep has to move along some combination of
+the existing knobs.
+
+The `snr` experiment moves the one that separates SNR from sparsity. The
+efficiency sweep cannot: η scales SNR² and n together. So `params_with_snr`
+adjusts the dark rate only, holding λ₋ and both switching rates fixed, which
+pins photons per bright dwell at 10.40 across the sweep. At fixed sparsity and
+switching ratio that leaves contrast as the only freedom, so this is the
+contrast sweep reparameterised — run anyway for coverage, since the contrast
+grid 0.50–0.99 spans only SNR 3.35–9.17 whereas placing points geometrically
+at SNR 0.5–8 reaches contrast 0.078 and the regime where readout fails.
+
+| point | SNR | contrast | thr ceiling | a.MMPP ceiling | speedup | ±CI |
+|---|---|---|---|---|---|---|
+| snr0.5 | 0.50 | 0.078 | 0.5742 | 0.5850 | 1.52× | 1.32 |
+| snr1 | 1.00 | 0.156 | 0.6133 | 0.6211 | 1.34× | 1.72 |
+| snr2 | 2.00 | 0.310 | 0.7097 | 0.7222 | 1.41× | 0.84 |
+| snr4 | 4.00 | 0.581 | 0.8078 | 0.8219 | 1.39× | 0.42 |
+| snr8 | 8.00 | 0.929 | 0.8925 | 0.9061 | 1.27× | 0.16 |
+
+The ceiling climbs 0.585 → 0.906, a 0.32 swing — the largest effect of any
+sweep in this repo, and monotone. The speedup column shows nothing: the CI
+width *exceeds the value itself* at SNR ≤ 1, because near F = 0.5 the
+time-to-target is barely determined. At SNR = 0.5 the readout is only just
+above chance, which is the point of extending coverage there.
+
+**The collapse test.** Pooling all 46 ideal-detector operating points from
+every sweep and regressing on log SNR, log sparsity, or both:
+
+| target | SNR only | sparsity only | both |
+|---|---|---|---|
+| fidelity ceiling | **R² = 0.925** | 0.463 | 0.949 |
+| speedup at matched headroom | 0.068 | **R² = 0.669** | 0.735 |
+
+Spearman rank correlations agree: for the ceiling, +0.926 against SNR and
++0.450 against sparsity; for the speedup, +0.375 and +0.462.
+
+So the two figures of merit are controlled by *different* variables, and
+adding the second regressor buys almost nothing in either case:
+
+- **SNR determines how well the readout can do.** It explains 93% of the
+  between-point variance in the achievable fidelity; sparsity explains half
+  that.
+- **Sparsity determines how much faster adaptive readout gets there.** It
+  explains 67% of the speedup variance; SNR explains essentially none (7%).
+
+This is the same dichotomy the fixed-count MMPP control found along a
+different cut, and the two reinforce each other. There, the decision
+*statistic* bought accuracy and the stopping *rule* bought speed. Here, SNR
+buys accuracy and sparsity buys speed. Accuracy and throughput are governed by
+separate physics, so they have to be engineered separately — a high-SNR, low-
+sparsity operating point will be accurate and gain little from adaptivity,
+and a low-SNR, high-sparsity one the reverse.
 
 ## Rate noise: the protocol is insensitive to it
 
@@ -400,4 +466,4 @@ python adaptive_charge_state_master.py export <experiment> --out results [detect
 ```
 
 The readout matrix takes about 25 minutes and the four noise experiments about 6 — 18 minutes of simulation plus
-figures and exports. `validate` passes 52/52 checks.
+figures and exports. `validate` passes 59/59 checks.
