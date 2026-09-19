@@ -5691,10 +5691,12 @@ def run_optimal_stopping(
         cfg.n_test, horizon_us / 1000.0, params, seed + 7717, detector, noise
     )
 
-    # Only the TEST records are packed: calibration is done on the epoch
-    # filter paths and on raw counts, so packing the calibration records too
-    # was building an unused array of every interval for every shot.
     spec = build_no_click_spectral(filter_params)
+    # The calibration records are packed because the EXACT boundary is tuned
+    # on them; the epoch-restricted rules use the filter paths instead.
+    cal_packed = pack_records(
+        build_records(cal_shots, horizon_us, filter_params, spec), spec
+    )
     test_packed = pack_records(
         build_records(test_shots, horizon_us, filter_params, spec), spec
     )
@@ -5787,6 +5789,17 @@ def run_optimal_stopping(
         st_x, pr_x = sprt_on_epochs(
             test_paths, cal_exh["L"], cal_exh["offset"], EXHAUSTION_EPS
         )
+        # The exact grid-free boundary, tuned under the same economics. Without
+        # it the risk comparison below would pit the learned policy against an
+        # epoch-restricted opponent and overstate its advantage -- measured at
+        # roughly 3x in the discard sweep before this was added.
+        cal_ex = best_exact_boundary(
+            cal_packed, cal_labels, econ, deadlines_us, EXHAUSTION_EPS
+        )
+        st_e, pr_e = run_sprt(
+            test_packed, cal_ex["L"], cal_ex["offset"], cal_ex["deadline_us"],
+            EXHAUSTION_EPS, econ,
+        )
         coeffs = fit_stopping_rule(cal_paths, econ)
         # The policy's terminal cutoff is calibrated on the same paths it
         # was fitted to, then applied to test -- the convention every other
@@ -5803,7 +5816,13 @@ def run_optimal_stopping(
                 "a_over_c": float(ac),
                 "risk_grid_sprt": bayes_risk(st_g, pr_g, test_labels, econ),
                 "risk_exhaustion": bayes_risk(st_x, pr_x, test_labels, econ),
+                "risk_exact_sprt": bayes_risk(st_e, pr_e, test_labels, econ),
                 "risk_learned": bayes_risk(st_l, pr_l, test_labels, econ),
+                "F_exact_sprt": balanced_fidelity(test_labels, pr_e),
+                "T_exact_sprt": balanced_mean_time(test_labels, st_e),
+                "exact_L": cal_ex["L"],
+                "exact_offset": cal_ex["offset"],
+                "exact_deadline_us": cal_ex["deadline_us"],
                 "F_grid_sprt": balanced_fidelity(test_labels, pr_g),
                 "T_grid_sprt": balanced_mean_time(test_labels, st_g),
                 "F_exhaustion": balanced_fidelity(test_labels, pr_x),
@@ -5815,10 +5834,16 @@ def run_optimal_stopping(
                 "learned_cutoff": float(cut_l),
             }
         )
+        # Against the BETTER of the two boundary rules, so the learned policy
+        # is never credited for beating a handicapped opponent.
+        best_boundary = min(
+            rows[-1]["risk_grid_sprt"],
+            rows[-1]["risk_exhaustion"],
+            rows[-1]["risk_exact_sprt"],
+        )
+        rows[-1]["best_boundary_risk"] = best_boundary
         rows[-1]["risk_reduction_pct"] = (
-            100.0
-            * (rows[-1]["risk_grid_sprt"] - rows[-1]["risk_learned"])
-            / rows[-1]["risk_grid_sprt"]
+            100.0 * (best_boundary - rows[-1]["risk_learned"]) / best_boundary
         )
 
     lsm_correct = np.column_stack(lsm_correct)
@@ -5912,14 +5937,15 @@ def run_optimal_stopping(
 
     if cfg.verbose:
         print(
-            f"\n{'a/c(us)':>9}{'risk SPRT':>11}{'+exh':>10}{'learned':>10}"
+            f"\n{'a/c(us)':>9}{'risk SPRT':>11}{'+exh':>10}{'exact':>10}{'learned':>10}"
             f"{'red.':>8} | {'T SPRT':>9}{'T +exh':>9}{'T learn':>9}"
             f" | {'F SPRT':>8}{'F learn':>8}"
         )
         for r in rows:
             print(
                 f"{r['a_over_c']:9.0f}{r['risk_grid_sprt']:11.4f}"
-                f"{r['risk_exhaustion']:10.4f}{r['risk_learned']:10.4f}"
+                f"{r['risk_exhaustion']:10.4f}{r['risk_exact_sprt']:10.4f}"
+                f"{r['risk_learned']:10.4f}"
                 f"{r['risk_reduction_pct']:7.1f}% | {r['T_grid_sprt']:9.1f}"
                 f"{r['T_exhaustion']:9.1f}{r['T_learned']:9.1f}"
                 f" | {r['F_grid_sprt']:8.4f}{r['F_learned']:8.4f}"
@@ -7851,12 +7877,16 @@ _OPTIMAL_CSV_COLUMNS = [
     "a_over_c",
     "risk_grid_sprt",
     "risk_exhaustion",
+    "risk_exact_sprt",
     "risk_learned",
+    "best_boundary_risk",
     "risk_reduction_pct",
     "F_grid_sprt",
     "T_grid_sprt",
     "F_exhaustion",
     "T_exhaustion",
+    "F_exact_sprt",
+    "T_exact_sprt",
     "F_learned",
     "T_learned",
     "L",
