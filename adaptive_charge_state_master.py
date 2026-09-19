@@ -8622,6 +8622,7 @@ def run_discard_sweep(
         "epoch_dt_us": dt_us,
         "a_over_c": float(a_over_c),
         "rows": rows,
+        "n_boot": int(cfg.n_boot),
         "module_version": MODULE_VERSION,
     }
 
@@ -8744,7 +8745,16 @@ def export_discard_csv(
 
 def plot_discard_sweep(result: dict, save_path: str | None = None):
     """
-    Four panels: what the band costs, what it buys, and whether it is worth it.
+    Six panels: what the band costs, what it buys, and whether it is worth it.
+
+    Panels (e) and (f) carry the Bayes risk, which is the quantity the whole
+    three-action problem is posed in and the only one of these panels that
+    the rules can be ranked by -- and they are the reason this figure gained
+    two panels. It had none, so the risk comparison was readable only in the
+    printed table, and even there without uncertainty. (f) is the one to
+    read: the marginal bands in (e) overlap almost everywhere, while the
+    paired difference resolves at several w, because every arm is scored on
+    the same resampled shots.
     """
     import matplotlib
 
@@ -8755,31 +8765,40 @@ def plot_discard_sweep(result: dict, save_path: str | None = None):
     finite = [r for r in rows if np.isfinite(r["cost_discard"])]
     two = next((r for r in rows if not np.isfinite(r["cost_discard"])), None)
     w = np.array([r["cost_discard"] for r in finite])
-
-    fig, ax = plt.subplots(2, 2, figsize=(13.0, 9.5))
-
-    p = ax[0, 0]
-    for key, name, col in (
+    ARMS = (
         ("sprt", "epoch-grid boundary", "#1f77b4"),
         ("exact", "exact grid-free boundary", "#9467bd"),
         ("learned", "learned policy", "#d62728"),
-    ):
+    )
+
+    def _w_axis(p):
+        """Label the w axis at the sampled costs only.
+
+        Matplotlib's default log minor ticks collide into an unreadable
+        smear at these spacings, and the sampled w are the only x values
+        that exist anyway.
+        """
+        p.set_xscale("log")
+        p.invert_xaxis()
+        p.set_xticks(w)
+        p.set_xticklabels([f"{v:g}" for v in w], fontsize=8)
+        p.set_xticks([], minor=True)
+        p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
+
+    fig, ax = plt.subplots(2, 3, figsize=(18.5, 9.5))
+
+    p = ax[0, 0]
+    for key, name, col in ARMS:
         p.plot(w, [100 * r[key]["discard_rate"] for r in finite], "-o",
                color=col, ms=5, label=name)
-    p.set_xscale("log")
-    p.invert_xaxis()
-    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
+    _w_axis(p)
     p.set_ylabel("shots abandoned (%)")
     p.set_title("(a) how much gets thrown away", fontsize=11)
     p.grid(alpha=0.25)
     p.legend(fontsize=9)
 
     p = ax[0, 1]
-    for key, name, col in (
-        ("sprt", "epoch-grid boundary", "#1f77b4"),
-        ("exact", "exact grid-free boundary", "#9467bd"),
-        ("learned", "learned policy", "#d62728"),
-    ):
+    for key, name, col in ARMS:
         p.plot([100 * r[key]["discard_rate"] for r in finite],
                [r[key]["accuracy_retained"] for r in finite],
                "-o", color=col, ms=5, label=name)
@@ -8794,26 +8813,20 @@ def plot_discard_sweep(result: dict, save_path: str | None = None):
     p.grid(alpha=0.25)
     p.legend(fontsize=9)
 
-    p = ax[1, 0]
-    for key, name, col in (
-        ("sprt", "epoch-grid boundary", "#1f77b4"),
-        ("exact", "exact grid-free boundary", "#9467bd"),
-        ("learned", "learned policy", "#d62728"),
-    ):
+    p = ax[0, 2]
+    for key, name, col in ARMS:
         p.plot(w, [r[key]["yield_per_ms"] for r in finite], "-o",
                color=col, ms=5, label=name)
         if two is not None:
             p.axhline(two[key]["yield_per_ms"], color=col, ls=":", lw=1.2,
                       label=f"{name}, no discard")
-    p.set_xscale("log")
-    p.invert_xaxis()
-    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
+    _w_axis(p)
     p.set_ylabel("retained shots per ms of readout")
     p.set_title("(c) throughput, which discarding cannot game", fontsize=11)
     p.grid(alpha=0.25)
     p.legend(fontsize=8)
 
-    p = ax[1, 1]
+    p = ax[1, 0]
     lo = np.array([r["band_lo"] for r in finite])
     hi = np.array([r["band_hi"] for r in finite])
     p.fill_between(w, lo, hi, color="#2ca02c", alpha=0.3,
@@ -8821,14 +8834,87 @@ def plot_discard_sweep(result: dict, save_path: str | None = None):
     p.plot(w, lo, "-", color="#2ca02c", lw=1.5)
     p.plot(w, hi, "-", color="#2ca02c", lw=1.5)
     p.axhline(0.0, color="k", lw=0.8, ls=":")
-    p.set_xscale("log")
-    p.invert_xaxis()
-    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
+    _w_axis(p)
     p.set_ylabel("LLR")
     p.set_title("(d) the inconclusive band widens as discard gets cheap",
                 fontsize=11)
     p.grid(alpha=0.25)
     p.legend(fontsize=9)
+
+    # (e) the currency the problem is actually posed in. The marginal bands
+    # are shaded rather than drawn as bars because they overlap so heavily
+    # that bars would be unreadable -- which is the point panel (f) makes.
+    p = ax[1, 1]
+    for key, name, col in ARMS:
+        r_mid = np.array([r[key]["risk"] for r in finite])
+        ci = np.array(
+            [r[key].get("risk_ci", (np.nan, np.nan)) for r in finite],
+            dtype=float,
+        )
+        p.plot(w, r_mid, "-o", color=col, ms=5, label=name)
+        if np.isfinite(ci).all():
+            p.fill_between(w, ci[:, 0], ci[:, 1], color=col, alpha=0.15, lw=0)
+        if two is not None:
+            p.axhline(two[key]["risk"], color=col, ls=":", lw=1.0)
+    # No rule can beat "abandon everything at t = 0", which costs exactly w.
+    p.plot(w, w, color="k", lw=1.2, ls="--",
+           label="abandon everything (risk = w)")
+    _w_axis(p)
+    p.set_yscale("log")
+    p.set_ylabel("Bayes risk")
+    p.set_title(
+        "(e) Bayes risk, 95% paired bands  (dotted = no discard allowed)",
+        fontsize=11,
+    )
+    p.grid(alpha=0.25, which="both")
+    p.legend(fontsize=8)
+
+    # (f) the paired difference, which is what the marginal bands in (e)
+    # cannot show. Against the BETTER boundary at each w, so the learned
+    # policy is never credited for beating a handicapped opponent.
+    p = ax[1, 2]
+    red = np.array([r["risk_reduction_pct"] for r in finite])
+    ref = [
+        "exact" if r["exact"]["risk"] <= r["sprt"]["risk"] else "sprt"
+        for r in finite
+    ]
+    pci = [
+        r.get("pair_ci", {}).get(f"learned_vs_{k}") for r, k in zip(finite, ref)
+    ]
+    lo_e = np.array(
+        [red[i] - (c["lo"] if c else np.nan) for i, c in enumerate(pci)]
+    )
+    hi_e = np.array(
+        [(c["hi"] if c else np.nan) - red[i] for i, c in enumerate(pci)]
+    )
+    resolved = np.array([bool(c and c["resolved"]) for c in pci])
+    xi = np.arange(len(finite))
+    for mask, col, lab in (
+        (resolved, "#d62728", "interval excludes zero"),
+        (~resolved, "#999999", "not resolved"),
+    ):
+        if mask.any():
+            p.errorbar(
+                xi[mask], red[mask],
+                yerr=np.vstack([lo_e[mask], hi_e[mask]]),
+                fmt="o", color=col, ms=6, capsize=4, lw=1.4, label=lab,
+            )
+    for i, r in enumerate(finite):
+        if r["degenerate"]:
+            p.annotate("(d)", (xi[i], red[i]), textcoords="offset points",
+                       xytext=(7, -3), fontsize=7, color="#555555")
+    p.axhline(0.0, color="k", lw=1.0)
+    p.set_xticks(xi)
+    p.set_xticklabels([f"{v:g}" for v in w], fontsize=8)
+    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
+    p.set_ylabel("learned vs better boundary (% risk reduction)")
+    p.set_title(
+        f"(f) the paired difference, {result.get('n_boot', 0)} resamples",
+        fontsize=11,
+    )
+    p.margins(y=0.18)
+    p.grid(alpha=0.25, axis="y")
+    p.legend(fontsize=8, loc="upper left")
 
     reg = result["regime"]
     fig.suptitle(

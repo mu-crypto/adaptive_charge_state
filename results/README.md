@@ -318,23 +318,42 @@ at the moderate point. The exact grid-free SPRT — the strongest rule in this
 repo, and the one every main sweep uses — could not discard at all, because
 `run_sprt` took no economics. It can now, and the comparison changes:
 
-| point | w | epoch boundary | **exact boundary** | learned | learned vs exact |
-|---|---|---|---|---|---|
-| moderate | ∞ | 0.1025 | **0.0907** | 0.0919 | −1.4% |
-| moderate | 0.45 | 0.1024 | **0.0907** | 0.0885 | +2.4% |
-| moderate | 0.25 | 0.1013 | **0.0857** | 0.0863 | −0.6% |
-| moderate | 0.15 | 0.1009 | **0.0809** | 0.0783 | +3.1% |
-| moderate | 0.08 | 0.0762 | **0.0746** | 0.0680 | **+8.8%** |
-| high flux | 0.25 | 0.1218 | **0.1115** | 0.1122 | −0.6% |
-| high flux | 0.15 | 0.1111 | **0.0961** | 0.0959 | +0.3% |
-| sparse | ∞ | 0.3206 | **0.3170** | 0.3196 | −0.8% |
+| point | w | epoch boundary | **exact boundary** | learned | learned vs exact | 95% CI |
+|---|---|---|---|---|---|---|
+| moderate | ∞ | 0.1025 | **0.0907** | 0.0919 | −1.4% | [−4.2, +1.2] ns |
+| moderate | 0.45 | 0.1024 | **0.0907** | 0.0885 | **+2.4%** | [+0.2, +4.8] |
+| moderate | 0.35 | 0.1021 | **0.0889** | 0.0884 | +0.5% | [−1.4, +2.5] ns |
+| moderate | 0.25 | 0.1013 | **0.0857** | 0.0863 | −0.6% | [−2.8, +1.3] ns |
+| moderate | 0.15 | 0.1009 | **0.0809** | 0.0783 | **+3.1%** | [+0.8, +5.2] |
+| moderate | 0.08 | 0.0762 | **0.0746** | 0.0680 | **+8.8%** | [+5.3, +12.4] |
+| high flux | 0.25 | 0.1218 | **0.1115** | 0.1122 | −0.6% | [−2.1, +1.0] ns |
+| high flux | 0.15 | 0.1111 | **0.0961** | 0.0959 | +0.3% | [−1.0, +1.5] ns |
+| high flux | 0.04 | 0.0403 | **0.0397** | 0.0374 | **+5.9%** | [+4.1, +8.1] |
+| sparse | ∞ | 0.3206 | **0.3170** | 0.3196 | **−0.8%** | [−1.3, −0.3] |
+
+(`ns` = the paired interval contains zero. 7200 test shots per state, 400
+stratified paired resamples; the resampling is over test shots with the
+tuned configuration held fixed, so the estimand is the risk of *this fitted
+rule* on the population.)
 
 Almost the whole apparent advantage was the epoch grid, not the policy.
-Against the proper incumbent the learned policy is a **wash** — it wins 7 of
-the 17 non-degenerate (point, w) settings and the exact boundary wins 10,
-with margins under 1% in most of them. The one place it clearly leads is
-w ≈ 0.08 at the moderate point, +8.8%, where it abandons 17% of shots
-against the boundary's 70% and still comes out cheaper.
+
+**Corrected again, by putting intervals on it.** An earlier version of this
+paragraph read the point estimates as a scoreboard — "wins 7 of the 17
+non-degenerate settings, the exact boundary wins 10". Most of those margins
+are smaller than their own uncertainty. Of the 17, only **7 have a paired
+interval excluding zero**: four wins for the learned policy (+2.4%, +3.1%,
++8.8% at the moderate point, +5.9% at high flux) and three losses (the three
+sparse rows at w ≥ 0.35, all −0.8%, where the band is too narrow to abstain
+and the comparison collapses onto the two-action one). The other ten are
+ties. "Wins 7, loses 10" was reporting the sign of noise.
+
+The conclusion survives and is if anything cleaner: against the proper
+incumbent the learned policy is a **wash almost everywhere**, with a real
+but narrow advantage where the discard cost is low enough to matter. The
+clearest case is w ≈ 0.08 at the moderate point, +8.8% [+5.3, +12.4], where
+it abandons 17% of shots against the boundary's 70% and still comes out
+cheaper.
 
 This reinforces rather than undermines the earlier optimal-stopping finding:
 a tuned constant boundary with a calibrated offset is close to the Bayes
@@ -351,13 +370,19 @@ costing the boundary rule real time, not just decision resolution.
 
 **Abandoning every shot at t = 0 is always feasible and costs exactly w, so
 no optimal rule can exceed w.** That is the sharpest available check on the
-whole formulation, and it separates the two rules cleanly: the learned policy
-respects it at every discard cost tested, while the tuned constant boundary
-**violates it** at w = 0.04 and 0.02 (risk 0.0425 and 0.0232 against w = 0.04
-and 0.02 at the moderate point). It has no way to express "abandon
-immediately" — it cannot stop before its boundary is crossed. With only two
-actions the boundary rule was merely suboptimal; with three it is
-*inadmissible* at small w, beaten by doing nothing.
+whole formulation, and it separates the rules cleanly. Across the 21 rows
+with a finite w, the learned policy violates the bound **0 times**, the
+epoch boundary **8** and even the exact grid-free boundary **7** — including
+every row at the sparse point, where the epoch rule pays 0.1550 against
+w = 0.15 and 0.0896 against w = 0.08. Neither boundary rule has any way to
+express "abandon immediately" — it cannot stop before its boundary is
+crossed, and the cheapest thing it can do is cross one early and pay for
+the shot anyway.
+With only two actions the boundary rule was merely suboptimal; with three it
+is *inadmissible* at small w, beaten by doing nothing. This is the one place
+in the whole comparison where the learned policy is not merely competitive
+with the exact boundary but categorically better, and it is structural
+rather than statistical — no amount of tuning (L, offset, deadline) fixes it.
 
 **The degenerate solution is real and is flagged, not hidden.** Below
 w ≈ 0.04 the optimal policy is to discard everything: risk w exactly, yield
