@@ -1935,7 +1935,6 @@ def run_sprt(
     offset: float,
     deadline_us: float,
     exhaustion_eps: float = 0.0,
-    econ: Economics | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Vectorized truncated SPRT over all shots at once.
@@ -1944,13 +1943,6 @@ def run_sprt(
     Exact: the upper boundary is tested only at clicks, the lower boundary only
     inside no-click intervals, and the lower crossing time is closed form.
     Matches the scalar `first_passage` to machine precision.
-
-    `econ` only changes the TERMINAL DECISION, never where the rule stops.
-    With a finite cost_discard it is taken by `decide`, so a shot stopping
-    inside the inconclusive band is abandoned rather than forced into a near
-    coin flip; otherwise the decision is the sign of the stopping LLR
-    relative to `offset`, which is what every result before this existed
-    used. Passing econ=None reproduces that exactly.
     """
     L = float(boundary_half_width)
     b = float(offset)
@@ -2048,20 +2040,11 @@ def run_sprt(
     llr_at_cap = llr_eff[rows, n_valid - 1]
 
     stop_ms = np.where(lower_first, t_lower, np.where(upper_first, t_upper, t_cap))
-
-    # LLR at the stopping instant, tracked explicitly so the decision can be
-    # taken once, at the end, by whichever rule applies. At the lower
-    # boundary it is D exactly, by construction of the crossing; at the upper
-    # it is the post-click value that triggered it; otherwise the deadline
-    # value. Deciding by sign against `offset` on this array reproduces the
-    # old branch-by-branch rule identically, since D < offset < U.
-    llr_stop = np.where(
+    preds = np.where(
         lower_first,
-        D,
-        np.where(
-            upper_first, packed.llr_post[rows, np.where(hit_U, k_U, 0)], llr_at_cap
-        ),
-    )
+        1,
+        np.where(upper_first, 0, np.where(llr_at_cap >= b, 0, 1)),
+    ).astype(int)
 
     # ---- third exit: the initial-state information is exhausted -----------
     # Once the Hilbert gap closes the two hypothesis columns coincide, the
@@ -2089,14 +2072,11 @@ def run_sprt(
         t_exh = packed.t_start[rows, kE]
 
         earlier = hit_E & (t_exh < stop_ms)
+        llr_frozen = packed.llr_start[rows, kE]
         stop_ms = np.where(earlier, t_exh, stop_ms)
-        llr_stop = np.where(earlier, packed.llr_start[rows, kE], llr_stop)
-
-    preds = (
-        decide(llr_stop, econ)
-        if econ is not None and econ.discard_allowed
-        else (llr_stop < b).astype(int)
-    )
+        preds = np.where(
+            earlier, np.where(llr_frozen >= b, 0, 1), preds
+        ).astype(int)
 
     return stop_ms * 1000.0, preds
 
@@ -5525,53 +5505,6 @@ def best_constant_boundary(
     return best
 
 
-def best_exact_boundary(
-    packed: PaddedRecords,
-    labels: np.ndarray,
-    econ: Economics,
-    deadlines_us: Sequence[float],
-    exhaustion_eps: float = 0.0,
-    widths: Sequence[float] | None = None,
-    offsets: Sequence[float] = (-1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0),
-) -> dict:
-    """
-    Cheapest (L, offset, deadline) for the EXACT grid-free SPRT under these
-    economics -- `best_constant_boundary` for the engine that is not
-    restricted to an epoch grid.
-
-    The exact rule is the strongest incumbent in this repo, so comparing a
-    learned policy only against the epoch-restricted one would be beating a
-    handicapped opponent. It needs its own deadline axis because, unlike the
-    epoch version, it has no natural truncation index.
-
-    Tune on calibration, score the winner on test, exactly as elsewhere.
-    """
-    if widths is None:
-        widths = np.geomspace(0.1, 12.0, 24)
-    best = None
-    for dl in deadlines_us:
-        for L in widths:
-            for off in offsets:
-                if abs(off) >= L:
-                    continue
-                st, pr = run_sprt(
-                    packed, float(L), float(off), float(dl), exhaustion_eps, econ
-                )
-                r = bayes_risk(st, pr, labels, econ)
-                if best is None or r < best["risk"]:
-                    best = {
-                        "risk": r,
-                        "L": float(L),
-                        "offset": float(off),
-                        "deadline_us": float(dl),
-                        "stop_us": st,
-                        "preds": pr,
-                    }
-    if best is None:
-        raise ValueError("no (L, offset) pair satisfied |offset| < L")
-    return best
-
-
 def exhaustion_times_us(paths: FilterPaths, eps: float) -> np.ndarray:
     """
     First epoch at which d <= eps, or nan if the deadline arrives first.
@@ -7172,43 +7105,6 @@ def validate_all(verbose: bool = True) -> int:
         "reproduced exactly",
     )
 
-    # The exact engine gained an `econ` argument so the third action reaches
-    # the strongest rule here, not only the epoch-restricted one. Two things
-    # must hold: it changes only the DECISION, never the stopping, and with
-    # no discard it reproduces the two-action code byte for byte.
-    ex_dl = 250.0
-    econ_none, econ_inf = None, Economics(cost_per_us=1.0 / 500.0)
-    same_inf = True
-    for L, off in ((0.5, 0.0), (2.0, -0.3), (6.0, 0.5)):
-        t_a, p_a = run_sprt(ex_packed, L, off, ex_dl, EXHAUSTION_EPS, econ_none)
-        t_b, p_b = run_sprt(ex_packed, L, off, ex_dl, EXHAUSTION_EPS, econ_inf)
-        same_inf &= bool(np.array_equal(t_a, t_b) and np.array_equal(p_a, p_b))
-    check(
-        "an Economics without discard leaves the exact engine unchanged",
-        same_inf,
-        "cost_discard = inf is bit-identical to passing no economics at all, "
-        "so every result produced before the third action existed stands",
-    )
-
-    stops_fixed, nested_ok = True, True
-    prev_disc = None
-    for w_ in (0.45, 0.35, 0.25, 0.15, 0.08):
-        e_ = Economics(cost_per_us=1.0 / 500.0, cost_discard=w_)
-        t_w, p_w = run_sprt(ex_packed, 2.0, -0.3, ex_dl, EXHAUSTION_EPS, e_)
-        t_0, _ = run_sprt(ex_packed, 2.0, -0.3, ex_dl, EXHAUSTION_EPS, None)
-        stops_fixed &= bool(np.array_equal(t_w, t_0))
-        disc = p_w == DISCARD
-        if prev_disc is not None and not np.all(prev_disc <= disc):
-            nested_ok = False
-        prev_disc = disc
-    check(
-        "discard changes the exact engine's decision, never its stopping",
-        stops_fixed and nested_ok,
-        f"stop times identical to the two-action run at every w, and the "
-        f"abandoned set nests as the band widens (up to "
-        f"{100 * float(prev_disc.mean()):.0f}% at w = 0.08)",
-    )
-
     # A rule that stops every shot at t = 0 measured nothing, so its
     # throughput is undefined rather than astronomically good. Dividing by a
     # 1e-12 floor used to report 1e15 retained shots per ms.
@@ -8206,16 +8102,6 @@ def run_discard_sweep(
     test_paths = filter_on_grid(
         test_shots, test_labels, filter_params, horizon_us, dt_us, spec
     )
-    # The exact grid-free engine needs packed event-time records, and its own
-    # deadline axis, since it has no epoch index to truncate at.
-    cal_packed = pack_records(
-        build_records(cal_shots, horizon_us, filter_params, spec), spec
-    )
-    test_packed = pack_records(
-        build_records(test_shots, horizon_us, filter_params, spec), spec
-    )
-    t_floor_us = time_grid_floor_us(params, horizon_us)
-    deadlines_us = np.geomspace(4.0 * t_floor_us, horizon_us, cfg.n_deadlines)
     if cfg.verbose:
         print(f"  filter built in {time.time() - t0:.1f} s")
 
@@ -8236,15 +8122,6 @@ def run_discard_sweep(
         )
         m_sprt = three_action_metrics(st_s, pr_s, test_labels, econ)
 
-        exact = best_exact_boundary(
-            cal_packed, cal_labels, econ, deadlines_us, EXHAUSTION_EPS
-        )
-        st_x, pr_x = run_sprt(
-            test_packed, exact["L"], exact["offset"], exact["deadline_us"],
-            EXHAUSTION_EPS, econ,
-        )
-        m_exact = three_action_metrics(st_x, pr_x, test_labels, econ)
-
         coeffs = fit_stopping_rule(cal_paths, econ)
         st_l, pr_l, _ = apply_stopping_rule(test_paths, coeffs, econ)
         m_lsm = three_action_metrics(st_l, pr_l, test_labels, econ)
@@ -8256,57 +8133,45 @@ def run_discard_sweep(
                 "band_hi": hi,
                 "L": base["L"],
                 "offset": base["offset"],
-                "exact_L": exact["L"],
-                "exact_offset": exact["offset"],
-                "exact_deadline_us": exact["deadline_us"],
                 "sprt": m_sprt,
-                "exact": m_exact,
                 "learned": m_lsm,
-                # Measured against the stronger of the two boundary rules,
-                # so the learned policy is never credited for beating a
-                # handicapped opponent.
                 "risk_reduction_pct": (
-                    100.0
-                    * (min(m_sprt["risk"], m_exact["risk"]) - m_lsm["risk"])
-                    / min(m_sprt["risk"], m_exact["risk"])
+                    100.0 * (m_sprt["risk"] - m_lsm["risk"]) / m_sprt["risk"]
                 ),
                 # Degenerate either because essentially everything is
                 # abandoned, or because the rule stops at t = 0 and so makes
                 # no measurement at all. Both have a low Bayes risk that
                 # means nothing on its own.
                 "degenerate": bool(
-                    any(
-                        m["discard_rate"] > 0.99 or m["T"] <= 0.0
-                        for m in (m_sprt, m_exact, m_lsm)
-                    )
+                    m_sprt["discard_rate"] > 0.99
+                    or m_lsm["discard_rate"] > 0.99
+                    or m_sprt["T"] <= 0.0
+                    or m_lsm["T"] <= 0.0
                 ),
             }
         )
 
     if cfg.verbose:
         print(
-            f"\n{'w':>6}{'band':>15} | "
-            + " | ".join(
-                f"{tag:>8}{'disc':>6}{'acc_ret':>9}{'yld/ms':>8}{'T':>7}"
-                for tag in ("epochSPRT", "exactSPRT", "learned")
-            )
-            + f" | {'red.':>7}"
+            f"\n{'w':>6}{'band':>16} | {'SPRT risk':>10}{'disc':>7}{'acc_ret':>9}"
+            f"{'yield/ms':>10}{'T':>7} | {'LSM risk':>9}{'disc':>7}"
+            f"{'acc_ret':>9}{'yield/ms':>10}{'T':>7} | {'red.':>7}"
         )
         for r in rows:
             band = (
-                " (two actions)"
+                "  (two actions)"
                 if not np.isfinite(r["band_lo"])
                 else f"[{r['band_lo']:+.2f},{r['band_hi']:+.2f}]"
             )
+            s_, l_ = r["sprt"], r["learned"]
             flag = " *" if r["degenerate"] else ""
-            cells = " | ".join(
-                f"{m['risk']:8.4f}{100 * m['discard_rate']:5.0f}%"
-                f"{m['accuracy_retained']:9.4f}{m['yield_per_ms']:8.1f}{m['T']:7.1f}"
-                for m in (r["sprt"], r["exact"], r["learned"])
-            )
             print(
-                f"{r['cost_discard']:6.2f}{band:>15} | {cells}"
-                f" | {r['risk_reduction_pct']:6.1f}%{flag}"
+                f"{r['cost_discard']:6.2f}{band:>16} | {s_['risk']:10.4f}"
+                f"{100 * s_['discard_rate']:6.0f}%{s_['accuracy_retained']:9.4f}"
+                f"{s_['yield_per_ms']:10.1f}{s_['T']:7.1f}"
+                f" | {l_['risk']:9.4f}{100 * l_['discard_rate']:6.0f}%"
+                f"{l_['accuracy_retained']:9.4f}{l_['yield_per_ms']:10.1f}"
+                f"{l_['T']:7.1f} | {r['risk_reduction_pct']:6.1f}%{flag}"
             )
         if any(r["degenerate"] for r in rows):
             print(
@@ -8350,22 +8215,13 @@ _DISCARD_CSV_COLUMNS = [
     "band_hi",
     "L",
     "offset",
-    "exact_L",
-    "exact_offset",
-    "exact_deadline_us",
     "degenerate",
     "sprt_risk",
-    "exact_risk",
     "sprt_discard_rate",
-    "exact_discard_rate",
     "sprt_accuracy_retained",
-    "exact_accuracy_retained",
     "sprt_fidelity_all_shots",
-    "exact_fidelity_all_shots",
     "sprt_yield_per_ms",
-    "exact_yield_per_ms",
     "sprt_T_us",
-    "exact_T_us",
     "learned_risk",
     "learned_discard_rate",
     "learned_accuracy_retained",
@@ -8407,16 +8263,11 @@ def export_discard_csv(
                         "band_hi": row["band_hi"],
                         "L": row["L"],
                         "offset": row["offset"],
-                        "exact_L": row["exact_L"],
-                        "exact_offset": row["exact_offset"],
-                        "exact_deadline_us": row["exact_deadline_us"],
                         "degenerate": int(row["degenerate"]),
                         "risk_reduction_pct": row["risk_reduction_pct"],
                     }
                 )
-                for tag, key in (
-                    ("sprt", "sprt"), ("exact", "exact"), ("learned", "learned")
-                ):
+                for tag, key in (("sprt", "sprt"), ("learned", "learned")):
                     m = row[key]
                     out[f"{tag}_risk"] = m["risk"]
                     out[f"{tag}_discard_rate"] = m["discard_rate"]
@@ -8446,8 +8297,7 @@ def plot_discard_sweep(result: dict, save_path: str | None = None):
 
     p = ax[0, 0]
     for key, name, col in (
-        ("sprt", "epoch-grid boundary", "#1f77b4"),
-        ("exact", "exact grid-free boundary", "#9467bd"),
+        ("sprt", "constant boundary", "#1f77b4"),
         ("learned", "learned policy", "#d62728"),
     ):
         p.plot(w, [100 * r[key]["discard_rate"] for r in finite], "-o",
@@ -8462,8 +8312,7 @@ def plot_discard_sweep(result: dict, save_path: str | None = None):
 
     p = ax[0, 1]
     for key, name, col in (
-        ("sprt", "epoch-grid boundary", "#1f77b4"),
-        ("exact", "exact grid-free boundary", "#9467bd"),
+        ("sprt", "constant boundary", "#1f77b4"),
         ("learned", "learned policy", "#d62728"),
     ):
         p.plot([100 * r[key]["discard_rate"] for r in finite],
@@ -8482,8 +8331,7 @@ def plot_discard_sweep(result: dict, save_path: str | None = None):
 
     p = ax[1, 0]
     for key, name, col in (
-        ("sprt", "epoch-grid boundary", "#1f77b4"),
-        ("exact", "exact grid-free boundary", "#9467bd"),
+        ("sprt", "constant boundary", "#1f77b4"),
         ("learned", "learned policy", "#d62728"),
     ):
         p.plot(w, [r[key]["yield_per_ms"] for r in finite], "-o",
