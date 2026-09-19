@@ -663,6 +663,42 @@ the third action would be reading the cost constant, not the physics.
 
 ## Bootstrap intervals
 
+Three different intervals appear in these results, and they are not
+interchangeable. Reading a band width across panels without knowing which
+kind it is will mislead.
+
+| kind | what is resampled | where it appears | typical width |
+|---|---|---|---|
+| **marginal** | test shots, one rule at a time | risk curves, shaded | wide |
+| **paired** | the same test shots for every rule | every rule-vs-rule gain | ~4× narrower |
+| **unpaired ratio** | two independent samples, combined | noise degradation vs clean | widest |
+
+The paired form is the one nearly every comparison here uses, and it is
+doing most of the work. On a validation fixture built so the two arms
+differ by a few percent, the marginal intervals overlap almost completely
+while the paired gain is resolved; the widths are **9%** paired against
+**37%** unpaired on the same contrast. That factor is why the tables can
+resolve three-percent differences from 7200 shots at all.
+
+The noise degradation is the one comparison that *cannot* be paired: the
+clean and noisy conditions are separate simulations sharing no shots, so
+nothing cancels. Its intervals are genuinely much wider, and the panels and
+tables say so rather than leaving a reader to compare band widths across
+panels and conclude the noise effects are better measured than they are.
+
+In all three, the tuned configuration is held **fixed** across resamples
+and calibration is a separate dataset that is not resampled. So the
+estimand is "the risk of this fitted rule on the population", not "the risk
+of refitting this rule" — the former is what an experiment deploying a
+calibrated rule actually faces.
+
+**Every Bayes-risk number in this file went through a period with no
+interval at all.** `discard` and `noiserisk` bootstrapped nothing;
+`optimal` bootstrapped only its speedup table, not the risk panels the
+conclusions were read off. Differences of one to three percent were
+reported as findings. Where adding the intervals changed a conclusion the
+section says so explicitly rather than quietly restating it.
+
 | band | median 95% CI width on the adaptive-MMPP speedup |
 |---|---|
 | all rows | 0.068 |
