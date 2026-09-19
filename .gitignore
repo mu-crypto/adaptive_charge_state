@@ -17,3 +17,4 @@ results/**/point_*.png
 # filter paths, so they are large; regenerate with `optimal`. The committed
 # CSVs and figures under results/ are derived from them.
 results/**/optimal/*.pkl
+results/**/discard/*.pkl

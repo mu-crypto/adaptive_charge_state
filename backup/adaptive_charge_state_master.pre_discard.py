@@ -5030,154 +5030,45 @@ def filter_on_grid(
     )
 
 
-# The action set. The first two are the only ones the rest of this file
-# knows about, and their integer codes match the label convention (0 = NV-,
-# 1 = NV0) so that `preds == labels` keeps meaning "correct".
-DECLARE_MINUS, DECLARE_ZERO, DISCARD = 0, 1, 2
-
-
 @dataclass(frozen=True)
 class Economics:
     """
-    The numbers the theory needs and the rest of this file leaves implicit.
+    The three numbers the theory needs and the rest of this file leaves implicit.
 
     cost_per_us   value of one microsecond of readout            (c)
     cost_miss     cost of declaring NV0 when the shot started NV- (a)
     cost_false    cost of declaring NV- when the shot started NV0 (b)
-    cost_discard  cost of abandoning the shot instead of calling it (w)
 
-    Only the ratios to c matter. Sweeping a/c traces out the entire
+    Only the ratios a/c and b/c matter. Sweeping a/c traces out the entire
     fidelity-versus-time frontier, so it is the knob, not a nuisance.
-
-    `cost_discard = inf` (the default) reproduces the two-action problem
-    exactly. Making it finite adds a THIRD action, which is what turns the
-    terminal payoff from a max of two linear functions of the posterior into
-    a max of three -- so by Remark 4.3 of Ludkovski-Sezer each stopping
-    region is still convex, and the decision becomes two thresholds with an
-    inconclusive band between them rather than one threshold. That band is
-    the post-selection experimentalists already do by hand; here its edges
-    follow from the costs instead of being tuned.
     """
 
     cost_per_us: float = 1.0 / 500.0
     cost_miss: float = 1.0
     cost_false: float = 1.0
-    cost_discard: float = np.inf
-
-    @property
-    def discard_allowed(self) -> bool:
-        return bool(np.isfinite(self.cost_discard))
-
-    @property
-    def max_useful_discard_cost(self) -> float:
-        """
-        Largest w for which discard is ever the cheapest action.
-
-        Discard wins at posterior p iff w < min(a p, b(1-p)). That minimum is
-        maximised at a p = b (1-p), i.e. p* = b/(a+b), where it equals
-        a b / (a + b). Above that, one of the two declarations is cheaper at
-        EVERY p and the band is empty.
-
-        Note this is strictly below min(a, b) whenever both are finite -- at
-        a = b = 1 it is 0.5, not 1. Using min(a, b) as the bound (as an
-        earlier version of this code did) silently admits settings where
-        discard is available in principle and never chosen in practice, which
-        looks like "the third action does not help" when it was never on.
-        """
-        a, b = float(self.cost_miss), float(self.cost_false)
-        return a * b / (a + b)
-
-    def validate(self) -> None:
-        """
-        Reject discard costs that make the third action degenerate.
-
-        Below zero it dominates everything and every shot is abandoned; at or
-        above `max_useful_discard_cost` the band is empty and the problem
-        silently collapses back to two actions.
-        """
-        if not self.discard_allowed:
-            return
-        hi = self.max_useful_discard_cost
-        if not (0.0 < self.cost_discard < hi):
-            raise ValueError(
-                f"cost_discard must lie in (0, {hi:g}) = "
-                f"(0, a b / (a + b)) to be non-degenerate; got "
-                f"{self.cost_discard:g}. At or above the upper limit one of "
-                f"the two declarations is cheaper at every posterior, so the "
-                f"discard band is empty."
-            )
 
 
 def terminal_reward(llr: np.ndarray, econ: Economics) -> np.ndarray:
     """
-    H = -min{ b(1-p_hat), a p_hat [, w] },  p_hat = sigmoid(llr), even prior.
+    H = -min{ b(1-p_hat), a p_hat },  p_hat = sigmoid(llr) under an even prior.
 
-    Without discard this is the Peskir-Shiryaev gain function g_{a,b} negated,
-    which is the consistency check that the two formulations agree. With
-    discard it gains a third, constant branch, which caps the payoff at -w and
-    flattens the middle of the curve -- that flat region is exactly where
-    continuing is worth least, so it changes the stopping rule and not only
-    the decision.
+    Equal to the Peskir-Shiryaev gain function g_{a,b} negated, which is the
+    consistency check that the two formulations agree.
     """
     p = 1.0 / (1.0 + np.exp(-np.clip(llr, -700, 700)))
-    best = np.minimum(econ.cost_false * (1.0 - p), econ.cost_miss * p)
-    if econ.discard_allowed:
-        best = np.minimum(best, econ.cost_discard)
-    return -best
+    return -np.minimum(econ.cost_false * (1.0 - p), econ.cost_miss * p)
 
 
 def bayes_decision_llr(econ: Economics) -> float:
     """
     LLR at which declaring NV0 becomes cheaper than declaring NV-.
 
-    a p < b (1-p)  <=>  llr < log(b/a). Meaningful only in the two-action
-    case; with discard there are two thresholds, see `discard_thresholds`.
+    a p < b (1-p)  <=>  llr < log(b/a). At a = b this is 0, but the sweep
+    below varies only a/c, so it stays 0 throughout; it is written out
+    because the asymmetric case is a one-line change and the SPRT baseline
+    is allowed a free offset here.
     """
     return float(np.log(econ.cost_false / econ.cost_miss))
-
-
-def discard_thresholds(econ: Economics) -> tuple[float, float]:
-    """
-    The two LLR thresholds bounding the inconclusive band, (low, high).
-
-    Declare NV0 below the low one, NV- above the high one, discard between:
-
-        p < w/a      declaring NV0 is cheaper than abandoning
-        p > 1 - w/b  declaring NV- is cheaper than abandoning
-
-    Returns (nan, nan) when discard is not allowed, and (nan, nan) rather
-    than an inverted interval when the band is empty.
-    """
-    if not econ.discard_allowed:
-        return (np.nan, np.nan)
-    p_lo = econ.cost_discard / econ.cost_miss
-    p_hi = 1.0 - econ.cost_discard / econ.cost_false
-    if not (0.0 < p_lo < p_hi < 1.0):
-        return (np.nan, np.nan)
-    lo = float(np.log(p_lo) - np.log1p(-p_lo))
-    hi = float(np.log(p_hi) - np.log1p(-p_hi))
-    return (lo, hi)
-
-
-def decide(llr: np.ndarray, econ: Economics) -> np.ndarray:
-    """
-    Terminal decision: whichever of the (up to three) actions costs least.
-
-    With two actions this is the single threshold llr >= log(b/a). With three
-    it becomes two thresholds and a middle band. Ties go to a declaration
-    rather than to discard, so the two-action limit is recovered exactly as
-    w -> the band-empty boundary rather than flipping at it.
-    """
-    llr = np.asarray(llr, dtype=float)
-    p = 1.0 / (1.0 + np.exp(-np.clip(llr, -700, 700)))
-    c_minus = econ.cost_false * (1.0 - p)
-    c_zero = econ.cost_miss * p
-    if not econ.discard_allowed:
-        return np.where(c_minus <= c_zero, DECLARE_MINUS, DECLARE_ZERO).astype(int)
-    out = np.where(c_minus <= c_zero, DECLARE_MINUS, DECLARE_ZERO).astype(int)
-    # Strict inequality: discard only when it is genuinely cheaper.
-    take = econ.cost_discard < np.minimum(c_minus, c_zero)
-    return np.where(take, DISCARD, out).astype(int)
 
 
 def bayes_risk(
@@ -5186,32 +5077,17 @@ def bayes_risk(
     labels: np.ndarray,
     econ: Economics,
 ) -> float:
-    """
-    c E[tau] + a P(say NV0 | NV-) + b P(say NV- | NV0) [+ w P(discard)],
-    class-balanced.
-
-    The discard term is what keeps this a meaningful objective once shots can
-    be thrown away -- see `three_action_metrics` for why fidelity alone stops
-    being one.
-    """
+    """c E[tau] + a P(say NV0 | NV-) + b P(say NV- | NV0), class-balanced."""
     labels = np.asarray(labels, dtype=int)
-    preds = np.asarray(preds, dtype=int)
     m0, m1 = labels == 0, labels == 1
     t = 0.5 * (stop_us[m0].mean() + stop_us[m1].mean())
-    miss = float((preds[m0] == DECLARE_ZERO).mean())
-    false = float((preds[m1] == DECLARE_MINUS).mean())
-    risk = (
+    miss = float((preds[m0] == 1).mean())
+    false = float((preds[m1] == 0).mean())
+    return float(
         econ.cost_per_us * t
         + 0.5 * econ.cost_miss * miss
         + 0.5 * econ.cost_false * false
     )
-    if econ.discard_allowed:
-        disc = 0.5 * (
-            float((preds[m0] == DISCARD).mean())
-            + float((preds[m1] == DISCARD).mean())
-        )
-        risk += econ.cost_discard * disc
-    return float(risk)
 
 
 def _optimal_features(llr: np.ndarray, gap: np.ndarray) -> np.ndarray:
@@ -5324,22 +5200,8 @@ def apply_stopping_rule(
 
     rows = np.arange(n)
     llr_stop = paths.llr[rows, stop_k]
-
-    if econ.discard_allowed:
-        # Three actions: the decision is two thresholds and a band, both set
-        # by the costs. A fitted single cutoff cannot express that, so it is
-        # ignored here rather than silently collapsing the band -- a shot
-        # stopping mid-band must be discarded, not forced into a coin flip.
-        preds = decide(llr_stop, econ)
-    else:
-        cut = (
-            bayes_decision_llr(econ)
-            if decision_llr is None
-            else float(decision_llr)
-        )
-        preds = (llr_stop < cut).astype(int)
-
-    return paths.t_us[stop_k], preds, llr_stop
+    cut = bayes_decision_llr(econ) if decision_llr is None else float(decision_llr)
+    return paths.t_us[stop_k], (llr_stop < cut).astype(int), llr_stop
 
 
 def sprt_on_epochs(
@@ -5348,7 +5210,6 @@ def sprt_on_epochs(
     offset: float,
     exhaustion_eps: float = 0.0,
     deadline_us: float | None = None,
-    econ: Economics | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Truncated SPRT restricted to the epoch grid, optionally with the
@@ -5361,13 +5222,6 @@ def sprt_on_epochs(
 
     `deadline_us` truncates earlier than the horizon, which is what lets this
     rule trace a frontier by itself rather than needing one point per a/c.
-
-    `offset` shifts the STOPPING boundary. When `econ` is given the terminal
-    decision comes from `decide` instead of the boundary centre, which is
-    what makes the three-action case work: a shot that stops mid-band is
-    discarded rather than forced into a near coin flip. Passing econ=None
-    keeps the two-action behaviour of deciding by sign relative to the
-    offset, which is what the fidelity-vs-time frontier wants.
     """
     n_steps = paths.llr.shape[1] - 1
     rows = np.arange(paths.n_paths)
@@ -5386,12 +5240,7 @@ def sprt_on_epochs(
 
     has = out.any(axis=1)
     k = np.where(has, out.argmax(axis=1), k_max)
-    llr_stop = paths.llr[rows, k]
-    preds = (
-        decide(llr_stop, econ)
-        if econ is not None
-        else (llr_stop < offset).astype(int)
-    )
+    preds = (paths.llr[rows, k] < offset).astype(int)
     return paths.t_us[k], preds
 
 
@@ -5418,9 +5267,7 @@ def best_constant_boundary(
         for off in offsets:
             if abs(off) >= L:
                 continue
-            st, pr = sprt_on_epochs(
-                paths, float(L), float(off), exhaustion_eps, None, econ
-            )
+            st, pr = sprt_on_epochs(paths, float(L), float(off), exhaustion_eps)
             r = bayes_risk(st, pr, paths.labels, econ)
             if best is None or r < best["risk"]:
                 best = {
@@ -6772,191 +6619,6 @@ def validate_all(verbose: bool = True) -> int:
         f"({base_in['L']:.2f}, {base_in['offset']:.2f}) at {base_in['risk']:.4f}",
     )
 
-    # -------------------------------------------------------------------------
-    # The third action: declare NV-, declare NV0, or abandon the shot.
-    # -------------------------------------------------------------------------
-
-    # The two-action problem has to survive exactly, or every result above
-    # this point is silently rebased.
-    econ_2 = Economics(cost_per_us=1.0 / 500.0)
-    ll_d = np.linspace(-8.0, 8.0, 4001)
-    check(
-        "cost_discard = inf reproduces the two-action problem exactly",
-        (not econ_2.discard_allowed)
-        and np.array_equal(
-            decide(ll_d, econ_2), (ll_d < bayes_decision_llr(econ_2)).astype(int)
-        )
-        and np.allclose(
-            terminal_reward(ll_d, econ_2),
-            -np.minimum(
-                econ_2.cost_false / (1.0 + np.exp(ll_d)),
-                econ_2.cost_miss / (1.0 + np.exp(-ll_d)),
-            ),
-        ),
-        "default Economics carries no third action at all",
-    )
-
-    # Discard is only ever cheapest when w < a b / (a + b). That is strictly
-    # below min(a, b) -- 0.5 rather than 1 at a = b = 1 -- and an earlier
-    # version of this code used min(a, b), which admits settings where the
-    # band is empty and the third action silently never fires.
-    bound_ok = True
-    for a_, b_ in ((1.0, 1.0), (4.0, 1.0), (1.0, 3.0)):
-        e_ = Economics(cost_miss=a_, cost_false=b_)
-        w_max = e_.max_useful_discard_cost
-        if abs(w_max - a_ * b_ / (a_ + b_)) > 1e-12 or w_max >= min(a_, b_):
-            bound_ok = False
-        # just inside: a non-empty band; just outside: none
-        lo_in, hi_in = discard_thresholds(
-            Economics(cost_miss=a_, cost_false=b_, cost_discard=0.99 * w_max)
-        )
-        lo_out, _ = discard_thresholds(
-            Economics(cost_miss=a_, cost_false=b_, cost_discard=1.01 * w_max)
-        )
-        if not (np.isfinite(lo_in) and hi_in > lo_in and not np.isfinite(lo_out)):
-            bound_ok = False
-    check(
-        "the discard band is non-empty exactly below a b / (a + b)",
-        bound_ok,
-        "0.5 at a = b = 1, not min(a, b) = 1",
-    )
-
-    reject_ok = True
-    for bad in (0.0, -0.1, 0.5, 0.8, 1.5):
-        try:
-            Economics(cost_discard=bad).validate()
-            reject_ok = False
-        except ValueError:
-            pass
-    try:
-        Economics(cost_discard=0.2).validate()
-        Economics().validate()
-    except ValueError:
-        reject_ok = False
-    check(
-        "degenerate discard costs are rejected, useful ones accepted",
-        reject_ok,
-        "w <= 0 discards everything; w >= 0.5 at a = b = 1 discards nothing",
-    )
-
-    # The action must flip exactly where the cost ordering says it does.
-    band_ok = True
-    for w_ in (0.45, 0.25, 0.08):
-        for a_, b_ in ((1.0, 1.0), (4.0, 1.0)):
-            e_ = Economics(cost_miss=a_, cost_false=b_, cost_discard=w_)
-            if w_ >= e_.max_useful_discard_cost:
-                continue
-            lo_, hi_ = discard_thresholds(e_)
-            acts = decide(ll_d, e_)
-            expect = np.where(
-                ll_d < lo_, DECLARE_ZERO, np.where(ll_d > hi_, DECLARE_MINUS, DISCARD)
-            )
-            # allow disagreement only within one grid step of an edge
-            near = (np.abs(ll_d - lo_) < 1e-2) | (np.abs(ll_d - hi_) < 1e-2)
-            if not np.array_equal(acts[~near], expect[~near]):
-                band_ok = False
-            p_ = 1.0 / (1.0 + np.exp(-ll_d))
-            three = -np.minimum(
-                np.minimum(b_ * (1.0 - p_), a_ * p_), w_
-            )
-            if not np.allclose(terminal_reward(ll_d, e_), three):
-                band_ok = False
-            if terminal_reward(np.array([0.0]), e_)[0] < -w_ - 1e-12:
-                band_ok = False
-    check(
-        "decide and terminal_reward agree with the two band edges",
-        band_ok,
-        "the payoff is capped at -w and the action flips exactly at "
-        "log(p/(1-p)) for p = w/a and p = 1 - w/b",
-    )
-
-    # Lowering w widens the band, so the set of discarded shots must GROW.
-    # At fixed stopping-time LLRs this is exact nesting, not a tendency.
-    rng_d = np.random.default_rng(4242)
-    llr_fixed = rng_d.normal(0.0, 3.0, 5000)
-    nested = True
-    prev = None
-    for w_ in (0.45, 0.35, 0.25, 0.15, 0.08, 0.04):
-        cur = decide(llr_fixed, Economics(cost_discard=w_)) == DISCARD
-        if prev is not None and not np.all(prev <= cur):
-            nested = False
-        prev = cur
-    check(
-        "cheaper discard strictly nests the discarded set",
-        nested,
-        "w 0.45 -> 0.04 grows the abandoned fraction from "
-        f"{100 * (decide(llr_fixed, Economics(cost_discard=0.45)) == DISCARD).mean():.0f}% to "
-        f"{100 * (decide(llr_fixed, Economics(cost_discard=0.04)) == DISCARD).mean():.0f}%",
-    )
-
-    # The reported risk must be the mean realised per-shot cost, including
-    # the discard term -- otherwise the sweep optimises a different objective
-    # from the one it prints.
-    lab_d = np.array([0, 0, 0, 1, 1, 1])
-    pr_d = np.array(
-        [DECLARE_MINUS, DECLARE_ZERO, DISCARD, DECLARE_ZERO, DECLARE_MINUS, DISCARD]
-    )
-    st_d = np.full(6, 10.0)
-    e_d = Economics(cost_per_us=1.0 / 500.0, cost_miss=1.0, cost_false=1.0,
-                    cost_discard=0.2)
-    manual = (
-        e_d.cost_per_us * 10.0
-        + 0.5 * e_d.cost_miss * (1.0 / 3.0)      # one miss of three NV- shots
-        + 0.5 * e_d.cost_false * (1.0 / 3.0)     # one false of three NV0 shots
-        + e_d.cost_discard * 0.5 * (1.0 / 3.0 + 1.0 / 3.0)
-    )
-    check(
-        "bayes_risk prices the discard action",
-        abs(bayes_risk(st_d, pr_d, lab_d, e_d) - manual) < 1e-12,
-        f"{bayes_risk(st_d, pr_d, lab_d, e_d):.6f} vs {manual:.6f} by hand",
-    )
-
-    m_d = three_action_metrics(st_d, pr_d, lab_d, e_d)
-    check(
-        "three-action metrics separate retention from accuracy",
-        abs(m_d["discard_rate"] - 1.0 / 3.0) < 1e-12
-        and abs(m_d["accuracy_retained"] - 0.5) < 1e-12
-        and abs(m_d["fidelity_all_shots"] - 1.0 / 3.0) < 1e-12,
-        f"discard {m_d['discard_rate']:.3f}, accuracy among retained "
-        f"{m_d['accuracy_retained']:.3f}, fidelity counting discards as "
-        f"errors {m_d['fidelity_all_shots']:.3f}",
-    )
-
-    # Abandoning every shot at t = 0 is always feasible and costs exactly w,
-    # so no OPTIMAL rule can do worse than w. This is the sharpest available
-    # check that the learned policy is solving the right problem -- and the
-    # constant boundary fails it at small w, which is a real result rather
-    # than a bug: it cannot stop before its boundary is crossed, so it has no
-    # way to express "abandon immediately".
-    d_params = shields_2015_params(BASE_POWER_UW)
-    d_cal_s, d_cal_l = simulate_balanced_dataset(400, 0.250, d_params, 71)
-    d_te_s, d_te_l = simulate_balanced_dataset(400, 0.250, d_params, 1171)
-    d_cal = filter_on_grid(d_cal_s, d_cal_l, d_params, 250.0, 250.0 / 48)
-    d_te = filter_on_grid(d_te_s, d_te_l, d_params, 250.0, 250.0 / 48)
-
-    lsm_ok, lsm_worst, sprt_violates = True, 0.0, 0
-    for w_ in (0.25, 0.08, 0.04, 0.02):
-        e_ = Economics(cost_per_us=1.0 / 500.0, cost_discard=w_)
-        cf = fit_stopping_rule(d_cal, e_)
-        st_, pr_, _ = apply_stopping_rule(d_te, cf, e_)
-        r_ = bayes_risk(st_, pr_, d_te_l, e_)
-        lsm_worst = max(lsm_worst, r_ - w_)
-        if r_ > w_ + 1e-9:
-            lsm_ok = False
-        bb = best_constant_boundary(d_cal, e_, EXHAUSTION_EPS)
-        sst, spr = sprt_on_epochs(
-            d_te, bb["L"], bb["offset"], EXHAUSTION_EPS, None, e_
-        )
-        if bayes_risk(sst, spr, d_te_l, e_) > w_ + 1e-9:
-            sprt_violates += 1
-    check(
-        "the learned policy never costs more than abandoning every shot",
-        lsm_ok,
-        f"worst excess over w is {lsm_worst:+.2e}; the constant boundary "
-        f"exceeds w at {sprt_violates} of 4 discard costs, having no way to "
-        f"stop before its boundary is crossed",
-    )
-
     # An enabled-but-trivial detector must not perturb the physics.
     det_trivial = DetectorModel(
         enabled=True, dead_time_ns=0.0, afterpulse_probability=0.0
@@ -7767,455 +7429,6 @@ def cmd_optimal(args: argparse.Namespace) -> int:
     return 0
 
 
-
-# Cost of abandoning a shot, as a fraction of the cost of being wrong. The
-# grid stops short of `max_useful_discard_cost` = a b / (a + b) = 0.5 at
-# a = b = 1, since at or above it the band is empty and the problem is the
-# two-action one again -- which `inf` already covers exactly.
-DISCARD_COSTS = (np.inf, 0.45, 0.35, 0.25, 0.15, 0.08, 0.04, 0.02)
-
-
-def three_action_metrics(
-    stop_us: np.ndarray,
-    preds: np.ndarray,
-    labels: np.ndarray,
-    econ: Economics,
-) -> dict:
-    """
-    Reporting for the discard case.
-
-    Balanced fidelity STOPS BEING A VALID FIGURE OF MERIT the moment shots
-    can be thrown away: abstain on everything and the retained-shot accuracy
-    goes to 1. So the primary number here is the Bayes risk, which prices the
-    discard explicitly, and accuracy is reported conditioned on retention --
-    the post-selected number an experimentalist would quote -- always
-    alongside the discard rate that bought it. Quoting either alone is
-    meaningless.
-
-    `yield_per_ms` is the throughput figure that makes the trade concrete:
-    retained shots per millisecond of readout. Unlike accuracy it cannot be
-    gamed by discarding more, because the numerator falls as the denominator
-    does, so it is the number to maximise if the experiment is repetition
-    limited rather than fidelity limited.
-
-    `accuracy_retained` is UNBALANCED on purpose. Retention here is strongly
-    class-asymmetric -- with cheap discard the optimal rule keeps mostly
-    shots that clicked, since a silent record cannot distinguish a dark shot
-    from a bright one that ionised immediately -- so the per-class
-    conditional accuracies are computed over wildly different subsample
-    sizes, and averaging them reports 0.5 whenever one class is never
-    confidently declared. That is uninformative rather than bad.
-    `accuracy_retained_balanced` is kept for completeness.
-    """
-    labels = np.asarray(labels, dtype=int)
-    preds = np.asarray(preds, dtype=int)
-    stop_us = np.asarray(stop_us, dtype=float)
-    m0, m1 = labels == 0, labels == 1
-    kept = preds != DISCARD
-
-    def _cond(mask):
-        k = mask & kept
-        return float((preds[k] == labels[k]).mean()) if np.any(k) else np.nan
-
-    f0, f1 = _cond(m0), _cond(m1)
-    acc_ret = float((preds[kept] == labels[kept]).mean()) if np.any(kept) else np.nan
-    # Both nan means nothing was retained at all; np.nanmean warns on that
-    # rather than simply propagating, and the answer is nan either way.
-    acc_bal = (
-        np.nan
-        if not (np.isfinite(f0) or np.isfinite(f1))
-        else float(np.nanmean([f0, f1]))
-    )
-
-    disc0 = float((preds[m0] == DISCARD).mean())
-    disc1 = float((preds[m1] == DISCARD).mean())
-    disc = 0.5 * (disc0 + disc1)
-    T = float(0.5 * (stop_us[m0].mean() + stop_us[m1].mean()))
-
-    return {
-        "risk": bayes_risk(stop_us, preds, labels, econ),
-        "discard_rate": disc,
-        "discard_rate_bright": disc0,
-        "discard_rate_dark": disc1,
-        "accuracy_retained": acc_ret,
-        "accuracy_retained_balanced": acc_bal,
-        # Every discard counted as an error: the fidelity you would quote if
-        # you were NOT allowed to post-select. Monotonically worse than the
-        # two-action fidelity, which is the honest framing of the cost.
-        "fidelity_all_shots": float(
-            0.5
-            * (
-                (preds[m0] == DECLARE_MINUS).mean()
-                + (preds[m1] == DECLARE_ZERO).mean()
-            )
-        ),
-        "T": T,
-        "yield_per_ms": float(1000.0 * (1.0 - disc) / max(T, 1e-12)),
-    }
-
-
-def run_discard_sweep(
-    point: OperatingPoint,
-    cfg: RunConfig,
-    n_epochs: int = N_EPOCHS_DEFAULT,
-    a_over_c: float = 500.0,
-    discard_costs: Sequence[float] = DISCARD_COSTS,
-) -> dict:
-    """
-    Sweep the cost of throwing a shot away, at fixed a/c.
-
-    `cost_discard = inf` is the two-action problem this repo has measured
-    everywhere else. Lowering it widens the inconclusive band, so more shots
-    are abandoned and the retained ones are cleaner. The trade is PRICED, not
-    tuned: the band edges follow from the costs through
-    `discard_thresholds`, which is the whole point -- post-selection in the
-    literature is usually a hand-chosen count window.
-
-    Both the constant-boundary rule and the learned policy are re-solved at
-    each discard cost, because the optimal STOPPING rule depends on what
-    terminal options exist: a flat middle in the payoff makes continuing
-    worth less there, so the policy stops earlier on ambiguous shots rather
-    than paying to resolve them.
-
-    The degenerate solution to watch for is "abandon everything at t = 0",
-    which has risk w and zero yield. It is legitimate whenever w is below
-    what the readout can achieve, and it is reported rather than hidden:
-    `degenerate` flags any row whose discard rate exceeds 99%.
-    """
-    params = point.params
-    seed = cfg.seed + 51_501
-    horizon_us = (
-        float(point.horizon_us)
-        if point.horizon_us is not None
-        else choose_horizon_us(params)
-    )
-    dt_us = horizon_us / float(n_epochs)
-    filter_params = _filter_params_for(params, cfg.detector, cfg.noise)
-    reg = regime_summary(params)
-
-    if cfg.verbose:
-        print("\n" + "=" * 78)
-        print(f"{point.label}  |  horizon = {horizon_us:.1f} us, a/c = {a_over_c:.0f} us")
-        print(
-            f"  photons/bright dwell = {reg['photons_per_bright_dwell']:.2f}"
-            f"   SNR = {reg['snr_per_bright_dwell']:.2f}"
-        )
-        print("=" * 78)
-
-    t0 = time.time()
-    cal_shots, cal_labels = simulate_balanced_dataset(
-        cfg.n_cal, horizon_us / 1000.0, params, seed, cfg.detector, cfg.noise
-    )
-    test_shots, test_labels = simulate_balanced_dataset(
-        cfg.n_test, horizon_us / 1000.0, params, seed + 7717,
-        cfg.detector, cfg.noise,
-    )
-    spec = build_no_click_spectral(filter_params)
-    cal_paths = filter_on_grid(
-        cal_shots, cal_labels, filter_params, horizon_us, dt_us, spec
-    )
-    test_paths = filter_on_grid(
-        test_shots, test_labels, filter_params, horizon_us, dt_us, spec
-    )
-    if cfg.verbose:
-        print(f"  filter built in {time.time() - t0:.1f} s")
-
-    rows = []
-    for w in discard_costs:
-        econ = Economics(
-            cost_per_us=1.0 / float(a_over_c),
-            cost_miss=1.0,
-            cost_false=1.0,
-            cost_discard=float(w),
-        )
-        econ.validate()
-        lo, hi = discard_thresholds(econ)
-
-        base = best_constant_boundary(cal_paths, econ, EXHAUSTION_EPS)
-        st_s, pr_s = sprt_on_epochs(
-            test_paths, base["L"], base["offset"], EXHAUSTION_EPS, None, econ
-        )
-        m_sprt = three_action_metrics(st_s, pr_s, test_labels, econ)
-
-        coeffs = fit_stopping_rule(cal_paths, econ)
-        st_l, pr_l, _ = apply_stopping_rule(test_paths, coeffs, econ)
-        m_lsm = three_action_metrics(st_l, pr_l, test_labels, econ)
-
-        rows.append(
-            {
-                "cost_discard": float(w),
-                "band_lo": lo,
-                "band_hi": hi,
-                "L": base["L"],
-                "offset": base["offset"],
-                "sprt": m_sprt,
-                "learned": m_lsm,
-                "risk_reduction_pct": (
-                    100.0 * (m_sprt["risk"] - m_lsm["risk"]) / m_sprt["risk"]
-                ),
-                "degenerate": bool(
-                    m_sprt["discard_rate"] > 0.99 or m_lsm["discard_rate"] > 0.99
-                ),
-            }
-        )
-
-    if cfg.verbose:
-        print(
-            f"\n{'w':>6}{'band':>16} | {'SPRT risk':>10}{'disc':>7}{'acc_ret':>9}"
-            f"{'yield/ms':>10}{'T':>7} | {'LSM risk':>9}{'disc':>7}"
-            f"{'acc_ret':>9}{'yield/ms':>10}{'T':>7} | {'red.':>7}"
-        )
-        for r in rows:
-            band = (
-                "  (two actions)"
-                if not np.isfinite(r["band_lo"])
-                else f"[{r['band_lo']:+.2f},{r['band_hi']:+.2f}]"
-            )
-            s_, l_ = r["sprt"], r["learned"]
-            flag = " *" if r["degenerate"] else ""
-            print(
-                f"{r['cost_discard']:6.2f}{band:>16} | {s_['risk']:10.4f}"
-                f"{100 * s_['discard_rate']:6.0f}%{s_['accuracy_retained']:9.4f}"
-                f"{s_['yield_per_ms']:10.1f}{s_['T']:7.1f}"
-                f" | {l_['risk']:9.4f}{100 * l_['discard_rate']:6.0f}%"
-                f"{l_['accuracy_retained']:9.4f}{l_['yield_per_ms']:10.1f}"
-                f"{l_['T']:7.1f} | {r['risk_reduction_pct']:6.1f}%{flag}"
-            )
-        if any(r["degenerate"] for r in rows):
-            print(
-                "  * discard rate above 99%: abandoning essentially every "
-                "shot is cheaper than reading it out at this w"
-            )
-        print(f"  total {time.time() - t0:.1f} s")
-
-    return {
-        "name": point.name,
-        "label": point.label,
-        "params": params,
-        "detector": cfg.detector,
-        "noise": cfg.noise,
-        "physics_layer": PHYSICS_LAYER,
-        "efficiency_model": cfg.efficiency_model,
-        "sweep_value": point.sweep_value,
-        "power_uw": point.power_uw,
-        "detection_efficiency": point.detection_efficiency,
-        "regime": reg,
-        "horizon_us": horizon_us,
-        "n_epochs": int(n_epochs),
-        "epoch_dt_us": dt_us,
-        "a_over_c": float(a_over_c),
-        "rows": rows,
-        "module_version": MODULE_VERSION,
-    }
-
-
-_DISCARD_CSV_COLUMNS = [
-    "experiment",
-    "detector",
-    "physics_layer",
-    "point_index",
-    "point",
-    "photons_per_bright_dwell",
-    "snr_per_bright_dwell",
-    "a_over_c",
-    "cost_discard",
-    "band_lo",
-    "band_hi",
-    "L",
-    "offset",
-    "degenerate",
-    "sprt_risk",
-    "sprt_discard_rate",
-    "sprt_accuracy_retained",
-    "sprt_fidelity_all_shots",
-    "sprt_yield_per_ms",
-    "sprt_T_us",
-    "learned_risk",
-    "learned_discard_rate",
-    "learned_accuracy_retained",
-    "learned_fidelity_all_shots",
-    "learned_yield_per_ms",
-    "learned_T_us",
-    "risk_reduction_pct",
-]
-
-
-def export_discard_csv(
-    results: list[dict],
-    spec: SweepSpec,
-    directory: Path,
-) -> list[Path]:
-    fp = directory / "discard_sweep.csv"
-    with open(fp, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=_DISCARD_CSV_COLUMNS)
-        w.writeheader()
-        for res in results:
-            base = {
-                "experiment": spec.key,
-                "detector": res["detector"].tag(),
-                "physics_layer": res.get("physics_layer", PHYSICS_LAYER),
-                "point_index": res.get("point_index"),
-                "point": res["name"],
-                "photons_per_bright_dwell": res["regime"][
-                    "photons_per_bright_dwell"
-                ],
-                "snr_per_bright_dwell": res["regime"]["snr_per_bright_dwell"],
-                "a_over_c": res["a_over_c"],
-            }
-            for row in res["rows"]:
-                out = dict(base)
-                out.update(
-                    {
-                        "cost_discard": row["cost_discard"],
-                        "band_lo": row["band_lo"],
-                        "band_hi": row["band_hi"],
-                        "L": row["L"],
-                        "offset": row["offset"],
-                        "degenerate": int(row["degenerate"]),
-                        "risk_reduction_pct": row["risk_reduction_pct"],
-                    }
-                )
-                for tag, key in (("sprt", "sprt"), ("learned", "learned")):
-                    m = row[key]
-                    out[f"{tag}_risk"] = m["risk"]
-                    out[f"{tag}_discard_rate"] = m["discard_rate"]
-                    out[f"{tag}_accuracy_retained"] = m["accuracy_retained"]
-                    out[f"{tag}_fidelity_all_shots"] = m["fidelity_all_shots"]
-                    out[f"{tag}_yield_per_ms"] = m["yield_per_ms"]
-                    out[f"{tag}_T_us"] = m["T"]
-                w.writerow(out)
-    return [fp]
-
-
-def plot_discard_sweep(result: dict, save_path: str | None = None):
-    """
-    Four panels: what the band costs, what it buys, and whether it is worth it.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    rows = result["rows"]
-    finite = [r for r in rows if np.isfinite(r["cost_discard"])]
-    two = next((r for r in rows if not np.isfinite(r["cost_discard"])), None)
-    w = np.array([r["cost_discard"] for r in finite])
-
-    fig, ax = plt.subplots(2, 2, figsize=(13.0, 9.5))
-
-    p = ax[0, 0]
-    for key, name, col in (
-        ("sprt", "constant boundary", "#1f77b4"),
-        ("learned", "learned policy", "#d62728"),
-    ):
-        p.plot(w, [100 * r[key]["discard_rate"] for r in finite], "-o",
-               color=col, ms=5, label=name)
-    p.set_xscale("log")
-    p.invert_xaxis()
-    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
-    p.set_ylabel("shots abandoned (%)")
-    p.set_title("(a) how much gets thrown away", fontsize=11)
-    p.grid(alpha=0.25)
-    p.legend(fontsize=9)
-
-    p = ax[0, 1]
-    for key, name, col in (
-        ("sprt", "constant boundary", "#1f77b4"),
-        ("learned", "learned policy", "#d62728"),
-    ):
-        p.plot([100 * r[key]["discard_rate"] for r in finite],
-               [r[key]["accuracy_retained"] for r in finite],
-               "-o", color=col, ms=5, label=name)
-        if two is not None:
-            p.plot([0], [two[key]["accuracy_retained"]], "*", color=col, ms=14)
-    p.set_xlabel("shots abandoned (%)")
-    p.set_ylabel("accuracy among retained shots")
-    p.set_title(
-        "(b) what post-selection buys  (star = no discard allowed)",
-        fontsize=11,
-    )
-    p.grid(alpha=0.25)
-    p.legend(fontsize=9)
-
-    p = ax[1, 0]
-    for key, name, col in (
-        ("sprt", "constant boundary", "#1f77b4"),
-        ("learned", "learned policy", "#d62728"),
-    ):
-        p.plot(w, [r[key]["yield_per_ms"] for r in finite], "-o",
-               color=col, ms=5, label=name)
-        if two is not None:
-            p.axhline(two[key]["yield_per_ms"], color=col, ls=":", lw=1.2,
-                      label=f"{name}, no discard")
-    p.set_xscale("log")
-    p.invert_xaxis()
-    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
-    p.set_ylabel("retained shots per ms of readout")
-    p.set_title("(c) throughput, which discarding cannot game", fontsize=11)
-    p.grid(alpha=0.25)
-    p.legend(fontsize=8)
-
-    p = ax[1, 1]
-    lo = np.array([r["band_lo"] for r in finite])
-    hi = np.array([r["band_hi"] for r in finite])
-    p.fill_between(w, lo, hi, color="#2ca02c", alpha=0.3,
-                   label="discard band (from the costs, not tuned)")
-    p.plot(w, lo, "-", color="#2ca02c", lw=1.5)
-    p.plot(w, hi, "-", color="#2ca02c", lw=1.5)
-    p.axhline(0.0, color="k", lw=0.8, ls=":")
-    p.set_xscale("log")
-    p.invert_xaxis()
-    p.set_xlabel("cost of discarding a shot, w  (cheaper to the right)")
-    p.set_ylabel("LLR")
-    p.set_title("(d) the inconclusive band widens as discard gets cheap",
-                fontsize=11)
-    p.grid(alpha=0.25)
-    p.legend(fontsize=9)
-
-    reg = result["regime"]
-    fig.suptitle(
-        f"Three actions: declare NV-, declare NV0, or abandon the shot  |  "
-        f"{result['label']}  |  {reg['photons_per_bright_dwell']:.1f} "
-        f"photons/bright dwell, a/c = {result['a_over_c']:.0f} us",
-        fontsize=11.5,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-    return fig
-
-
-def cmd_discard(args: argparse.Namespace) -> int:
-    spec = _resolve_spec(args.experiment)
-    cfg = config_from_args(args, spec)
-    points = spec.build_points(cfg)
-    wanted = _selected_indices(args.point, len(points))
-
-    directory = run_directory(
-        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
-    ) / "discard"
-    directory.mkdir(parents=True, exist_ok=True)
-
-    results = []
-    for i in wanted:
-        res = run_discard_sweep(
-            points[i], cfg, n_epochs=args.n_epochs, a_over_c=args.a_over_c
-        )
-        res["point_index"] = i
-        results.append(res)
-        with open(directory / f"discard_{i:02d}_{points[i].name}.pkl", "wb") as f:
-            pickle.dump(_to_plain(res), f)
-        if not args.no_plot:
-            plot_discard_sweep(
-                res, str(directory / f"discard_{i:02d}_{points[i].name}.png")
-            )
-
-    for fp in export_discard_csv(results, spec, directory):
-        print(f"\nwrote {fp}")
-    return 0
-
-
 def cmd_validate(args: argparse.Namespace) -> int:
     return 1 if validate_all() else 0
 
@@ -8364,25 +7577,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--no-plot", action="store_true")
     sp.set_defaults(func=cmd_optimal)
-
-    sp = sub.add_parser(
-        "discard",
-        help="third action: declare NV-, declare NV0, or abandon the shot",
-    )
-    add_common(sp)
-    sp.add_argument("--point", default="all")
-    sp.add_argument("--quick", action="store_true", help="small fast smoke run")
-    sp.add_argument("--seed", type=int, default=None)
-    sp.add_argument("--n-cal", type=int, default=None)
-    sp.add_argument("--n-test", type=int, default=None)
-    sp.add_argument("--n-boot", type=int, default=None)
-    sp.add_argument("--n-epochs", type=int, default=N_EPOCHS_DEFAULT)
-    sp.add_argument(
-        "--a-over-c", type=float, default=500.0,
-        help="microseconds of readout per avoided error (default: 500)",
-    )
-    sp.add_argument("--no-plot", action="store_true")
-    sp.set_defaults(func=cmd_discard)
 
     sp = sub.add_parser("validate", help="run the numerical validation suite")
     sp.set_defaults(func=cmd_validate)
