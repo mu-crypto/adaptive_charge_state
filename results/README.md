@@ -179,25 +179,31 @@ with a/c swept from 2 to 2×10⁵ µs. Unlike "time to reach F*", this objective
 requires naming what a microsecond is worth — which is the point: a/c is the
 knob that traces the frontier.
 
-At the moderate reference point, against the constant boundary tuned under
-the same economics on the same calibration paths:
+**Corrected.** An earlier version of this table compared the learned policy
+only against the **epoch-restricted** boundary and reported +3% to +22% "in
+the real regime". The exact grid-free SPRT could not be scored in this
+currency at the time because `run_sprt` took no economics. It can now, and
+against the best of the three boundary variants the advantage largely
+evaporates:
 
-| a/c (µs) | regime | learned vs tuned boundary |
+| point | learned vs *best* boundary | wins |
 |---|---|---|
-| < 15 | degenerate — stop at t = 0 and guess | not meaningful |
-| 24–66 | tie | 0.0% to −0.5% |
-| 110–6000 | **the real regime** | **+3% to +22%** |
-| > 9900 | time nearly free | −3% to −7% |
+| high flux | median **+0.4%**, range [−3.8%, +4.5%] | 14 of 24 a/c |
+| moderate | median **−1.2%**, range [−5.4%, +9.5%] | 9 of 24 a/c |
+| sparse | median **−0.0%**, range [−0.9%, +56.1%] | 12 of 24 a/c |
 
-Median over the whole a/c grid is +8.2%, which flatters the ends and
-understates the middle. Two honest caveats sit at the edges. Below a/c = 15
+At the moderate point the learned policy is *behind* the exact boundary at
+most values of a/c. Where it leads is a narrow band around a/c ≈ 200–1300
+(+0.5% to +5.0%) and the degenerate a/c < 10 corner, where it can abandon at
+t = 0 and the boundary cannot. The epoch grid, not the policy, was most of
+the earlier number. Two honest caveats sit at the edges. Below a/c = 15
 the "win" is only that the policy may stop at epoch 0 while the boundary rule
 must wait one epoch. Above a/c ≈ 10⁴ the policy **loses**: it plateaus at
-F = 0.9443 and T = 32 µs while the boundary runs to a long deadline and
-reaches 0.9497. At near-free time the value differences the regression must
-resolve become tiny against the payoff scale, and it stops too early. That is
-a limitation of regression Monte Carlo at extreme economics, not of the
-formulation.
+F ≈ 0.943 and T ≈ 26 µs while the exact boundary keeps buying accuracy with
+time, reaching 0.9456 at 34 µs. At near-free time the value differences the
+regression must resolve become tiny against the payoff scale, and it stops
+too early. That is a limitation of regression Monte Carlo at extreme
+economics, not of the formulation.
 
 On the fidelity-vs-time currency, against the **exact grid-free** SPRT — the
 stronger incumbent, since methods 3–5 are restricted to a 128-epoch grid:
@@ -214,16 +220,17 @@ stronger incumbent, since methods 3–5 are restricted to a 128-epoch grid:
 **The conclusion is a negative one, and it is the useful kind.** The tuned
 SPRT is within a few percent of the Bayes optimum over most of the frontier,
 and loses only in the top ~3% of the fidelity range, where the learned policy
-is 9–23% faster. Across the other two demo points the median risk reduction
-is +1.0% (high flux) and +0.5% (sparse) — inside the noise. There is no large
-unclaimed gain sitting in a smarter stopping rule; the SPRT with a calibrated
-asymmetric boundary is close to all there is.
+is 9–23% faster. In the Bayes-risk currency, against the best boundary
+variant, the median advantage is **+0.4%, −1.2% and −0.0%** at the three
+points — i.e. nothing. There is no large unclaimed gain sitting in a smarter
+stopping rule; the SPRT with a calibrated asymmetric boundary is close to all
+there is, and the earlier double-digit figures were measuring the epoch grid.
 
 | point | ph/dwell | thr ceiling | exact MMPP | learned | median risk reduction |
 |---|---|---|---|---|---|
-| high flux | 9.93 | 0.8807 | 0.8962 | 0.8960 | +1.0% |
-| moderate | 27.43 | 0.9397 | 0.9461 | 0.9432 | +8.2% |
-| sparse | 2.74 | 0.7941 | 0.7991 | 0.7983 | +0.5% |
+| high flux | 9.93 | 0.8807 | 0.8962 | 0.8960 | +0.4% |
+| moderate | 27.43 | 0.9397 | 0.9461 | 0.9432 | −1.2% |
+| sparse | 2.74 | 0.7941 | 0.7991 | 0.7983 | −0.0% |
 
 ### The information-exhaustion exit is free, and worth taking
 
@@ -663,7 +670,7 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 84 checks
+python adaptive_charge_state_master.py validate                  # 86 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]

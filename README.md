@@ -137,7 +137,7 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 84 numerical checks
+python adaptive_charge_state_master.py validate          # 86 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
@@ -206,6 +206,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 84/84 on both.
+active, every saved result records it, and `validate` passes 86/86 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.
