@@ -65,7 +65,7 @@ never-longer run times — one comparison per epoch to implement, up to 130 µs
 a shot saved. `validate` asserts all three facts.
 
 Answer, at the three demo points: the tuned SPRT is within a few percent of
-the optimum over most of the frontier and loses only in the top ~2% of the
+the optimum over most of the frontier and loses only in the top ~3% of the
 fidelity range. See `results/README.md`.
 
 ## A third action: abandoning the shot
@@ -118,7 +118,7 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 78 numerical checks
+python adaptive_charge_state_master.py validate          # 83 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
@@ -186,6 +186,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 78/78 on both.
+active, every saved result records it, and `validate` passes 83/83 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.

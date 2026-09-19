@@ -64,16 +64,17 @@ the table", which methods 1–4 cannot answer among themselves.
 
 ## Headline: the speed comes from the stopping rule, the accuracy from the statistic
 
-Factoring at matched target, as medians of per-row ratios over 1000+ rows:
+Factoring at matched target, as medians of per-row ratios over 820 rows
+(deduplicated — see the note on repeated regimes below):
 
 | step | what changes | factor |
 |---|---|---|
-| threshold → adaptive count | stopping rule: fixed time → fixed count | 1.057× |
+| threshold → adaptive count | stopping rule: fixed time → fixed count | 1.053× |
 | adaptive count → fixed-count MMPP | decision statistic: count → MMPP LLR | **1.000×** |
-| fixed-count MMPP → adaptive MMPP | stopping rule: fixed count → LLR boundary | **1.128×** |
+| fixed-count MMPP → adaptive MMPP | stopping rule: fixed count → LLR boundary | **1.137×** |
 
 Swapping in the MMPP likelihood while holding the stopping rule fixed buys
-**no speed at all** — median 1.000, above 1.01 in 12% of rows. The reason is
+**no speed at all** — median 1.000, above 1.01 in 13% of rows. The reason is
 structural: methods 2 and 3 have identical run-time distributions by
 construction, so a better statistic can only lift the fidelity-vs-time curve
 *up*, never shift it *left*. Speed at matched fidelity is a horizontal
@@ -81,9 +82,9 @@ displacement, and only a data-dependent stopping rule produces one.
 
 | method | median speedup | CI above 1 | CI below 1 | max |
 |---|---|---|---|---|
-| adaptive count (stopping only) | 1.057× | 56% | 28% | 1.46× |
-| fixed-count MMPP (statistic only) | 1.062× | 55% | 26% | 1.82× |
-| adaptive MMPP (both) | 1.160× | **94%** | **0%** | 2.54× |
+| adaptive count (stopping only) | 1.053× | 55% | 28% | 1.46× |
+| fixed-count MMPP (statistic only) | 1.056× | 54% | 27% | 1.82× |
+| adaptive MMPP (both) | 1.159× | **93%** | **0%** | 2.54× |
 
 Only the LLR-boundary rule is never significantly slower than the baseline,
 and it is the only one significantly faster in a large majority of rows.
@@ -104,6 +105,17 @@ all of the *speed*.
 Practical reading unchanged: if you are limited by fidelity, implement the
 event-time likelihood and keep a trivial "stop at the n-th photon" trigger.
 If you are limited by throughput, you need the sequential boundary test.
+
+
+**Repeated regimes are counted once.** The 5.437 µW reference point is reached
+by five different sweeps (`efficiency` η = 1, the σ = 0 end of three noise
+sweeps, and the `moderate` demo point) and 15 µW by two (`power` and
+`high_flux`). Left in, 16% of the pooled rows would be repeats of two
+operating points, weighting those regimes five- and two-fold in every median
+and every "fraction of rows" here. `ideal_pool` in `results/analysis.py`
+removes them. The effect on the conclusions is nil — the statistic-only step
+stays exactly 1.000× — but it moves the stopping-rule step from 1.128× to
+1.137× and the pooled median from 1.160× to 1.159×.
 
 ## Correction: SNR drives both figures of merit, not one each
 
@@ -174,10 +186,10 @@ the same economics on the same calibration paths:
 |---|---|---|
 | < 15 | degenerate — stop at t = 0 and guess | not meaningful |
 | 24–66 | tie | 0.0% to −0.5% |
-| 110–6000 | **the real regime** | **+3% to +20%** |
+| 110–6000 | **the real regime** | **+3% to +22%** |
 | > 9900 | time nearly free | −3% to −7% |
 
-Median over the whole a/c grid is +4.7%, which flatters the ends and
+Median over the whole a/c grid is +8.2%, which flatters the ends and
 understates the middle. Two honest caveats sit at the edges. Below a/c = 15
 the "win" is only that the policy may stop at epoch 0 while the boundary rule
 must wait one epoch. Above a/c ≈ 10⁴ the policy **loses**: it plateaus at
@@ -192,26 +204,26 @@ stronger incumbent, since methods 3–5 are restricted to a 128-epoch grid:
 
 | F* | t_thr | t_exact SPRT | t_learned | sp_exact | sp_learned |
 |---|---|---|---|---|---|
-| 0.85 | 6.63 | 4.97 | 5.42 | 1.33× | 1.22× |
-| 0.89 | 9.74 | 7.05 | 7.22 | 1.38× | 1.35× |
-| 0.90 | 11.56 | 7.53 | 7.95 | 1.54× | 1.45× |
-| 0.92 | 17.62 | 11.29 | 9.90 | 1.56× | **1.78×** |
-| 0.93 | 19.91 | 12.16 | 11.46 | 1.64× | **1.74×** |
-| 0.94 | 23.56 | 15.61 | 13.93 | 1.51× | **1.69×** |
+| 0.88 | 8.70 | 6.31 | 6.67 | 1.38× | 1.30× |
+| 0.89 | 9.79 | 7.04 | 7.28 | 1.39× | 1.35× |
+| 0.90 | 12.21 | 8.03 | 7.95 | 1.52× | 1.54× |
+| 0.91 | 16.47 | 10.68 | 8.68 | 1.54× | **1.90×** |
+| 0.92 | 17.96 | 12.24 | 9.76 | 1.47× | **1.84×** |
+| 0.93 | 20.11 | 12.28 | 11.22 | 1.64× | **1.79×** |
 
 **The conclusion is a negative one, and it is the useful kind.** The tuned
 SPRT is within a few percent of the Bayes optimum over most of the frontier,
-and loses only in the top ~2% of the fidelity range, where the learned policy
-is 10–15% faster. Across the other two demo points the median risk reduction
-is +0.7% (high flux) and +0.9% (sparse) — inside the noise. There is no large
+and loses only in the top ~3% of the fidelity range, where the learned policy
+is 9–23% faster. Across the other two demo points the median risk reduction
+is +1.0% (high flux) and +0.5% (sparse) — inside the noise. There is no large
 unclaimed gain sitting in a smarter stopping rule; the SPRT with a calibrated
 asymmetric boundary is close to all there is.
 
 | point | ph/dwell | thr ceiling | exact MMPP | learned | median risk reduction |
 |---|---|---|---|---|---|
-| high flux | 9.93 | 0.8808 | 0.8909 | 0.8904 | +0.7% |
-| moderate | 27.43 | 0.9433 | 0.9499 | 0.9443 | +4.7% |
-| sparse | 2.74 | 0.7963 | 0.7999 | 0.7994 | +0.9% |
+| high flux | 9.93 | 0.8807 | 0.8962 | 0.8960 | +1.0% |
+| moderate | 27.43 | 0.9397 | 0.9461 | 0.9432 | +8.2% |
+| sparse | 2.74 | 0.7941 | 0.7991 | 0.7983 | +0.5% |
 
 ### The information-exhaustion exit is free, and worth taking
 
@@ -235,8 +247,8 @@ Two things the exit does *not* do, worth separating because it is easy to
 conflate them. It does not change any decision at fixed configuration. But
 across a tuning sweep it changes *which* boundary is cheapest — a wider,
 more accurate one becomes affordable once indecisive shots stop paying the
-full deadline — so accuracy moves too. Median risk reduction is +1.3% at the
-moderate point, +0.3% at high flux, 0.0% at sparse.
+full deadline — so accuracy moves too. Median risk reduction is +0.8% at the
+moderate point, +0.1% at high flux, 0.0% at sparse.
 
 ## The third action: abandoning a shot
 
@@ -274,20 +286,20 @@ At a/c = 500 µs, 7200 test shots per state, ideal detector:
 | high flux | 0.25 | [−1.10, +1.10] | 14% | 0.9251 | 132.2 | 0.1122 |
 | high flux | 0.15 | [−1.73, +1.73] | **18%** | **0.9316** | 131.0 | 0.0959 |
 | high flux | 0.08 | [−2.44, +2.44] | 70% | 0.9837 | 100.1 | 0.0670 |
-| moderate | ∞ | two actions | 0% | 0.9439 | 69.9 | 0.0847 |
-| moderate | 0.15 | [−1.73, +1.73] | **11%** | **0.9644** | 61.3 | 0.0773 |
-| moderate | 0.08 | [−2.44, +2.44] | 17% | 0.9700 | 57.4 | 0.0675 |
-| sparse | ∞ | two actions | 0% | 0.7735 | 21.9 | 0.3180 |
-| sparse | 0.25 | [−1.10, +1.10] | 93% | 0.9533 | 10.7 | 0.2489 |
+| moderate | ∞ | two actions | 0% | 0.9419 | 59.1 | 0.0919 |
+| moderate | 0.15 | [−1.73, +1.73] | **11%** | **0.9637** | 59.9 | 0.0783 |
+| moderate | 0.08 | [−2.44, +2.44] | 17% | 0.9702 | 55.8 | 0.0680 |
+| sparse | ∞ | two actions | 0% | 0.7715 | 22.0 | 0.3196 |
+| sparse | 0.25 | [−1.10, +1.10] | 88% | 0.9616 | 10.2 | 0.2481 |
 
 (learned policy; the full table with the constant-boundary rule alongside is
 in `results/demo/ideal/discard/discard_sweep.csv`)
 
 **The trade is good where information is plentiful and brutal where it is
-not.** At the moderate point, throwing away 11% of shots buys +0.021 in
-fidelity and costs 12% of throughput. At high flux, 18% buys +0.041. At the
-sparse point nothing happens until w = 0.25 and then it jumps straight to 93%
-discard for +0.18 — there is so little information per shot that the only way
+not.** At the moderate point, throwing away 11% of shots buys +0.022 in
+fidelity and costs nothing measurable in throughput. At high flux, 18% buys
++0.041. At the sparse point nothing happens until w = 0.25 and then it jumps
+straight to 88% discard for +0.19 — there is so little information per shot that the only way
 to be confident is to keep almost nothing. Post-selection is a way to spend
 surplus information, so it pays where there is surplus.
 
@@ -297,7 +309,7 @@ surplus information, so it pays where there is surplus.
 no optimal rule can exceed w.** That is the sharpest available check on the
 whole formulation, and it separates the two rules cleanly: the learned policy
 respects it at every discard cost tested, while the tuned constant boundary
-**violates it** at w = 0.04 and 0.02 (risk 0.0424 and 0.0232 against w = 0.04
+**violates it** at w = 0.04 and 0.02 (risk 0.0425 and 0.0232 against w = 0.04
 and 0.02 at the moderate point). It has no way to express "abandon
 immediately" — it cannot stop before its boundary is crossed. With only two
 actions the boundary rule was merely suboptimal; with three it is
@@ -317,17 +329,17 @@ fixed-time threshold curve is non-monotone — fidelity rises, peaks, then falls
 as the charge state scrambles — so `t_threshold` diverges as the target
 approaches the threshold's own ceiling, and the speedup diverges with it.
 
-Medians by headroom below the threshold's own ceiling (1015 rows where the
+Medians by headroom below the threshold's own ceiling (821 rows where the
 adaptive MMPP speedup is defined):
 
 | headroom `F_thr_max − F*` | n rows | adaptive MMPP | fixed-count MMPP | adaptive count |
 |---|---|---|---|---|
-| [0.00, 0.01) | 31 | 1.56× | 1.12× | 1.12× |
-| [0.01, 0.02) | 31 | 1.49× | 1.18× | 1.16× |
-| [0.02, 0.05) | 90 | 1.49× | 1.05× | 1.05× |
-| [0.05, 0.10) | 147 | 1.33× | 1.18× | 1.18× |
-| [0.10, 0.20) | 274 | 1.19× | 1.10× | 1.10× |
-| [0.20, 1.00) | 442 | 1.09× | 0.94× | 0.94× |
+| [0.00, 0.01) | 26 | 1.41× | 1.15× | 1.12× |
+| [0.01, 0.02) | 26 | 1.42× | 1.17× | 1.13× |
+| [0.02, 0.05) | 75 | 1.46× | 1.04× | 1.03× |
+| [0.05, 0.10) | 122 | 1.32× | 1.15× | 1.15× |
+| [0.10, 0.20) | 224 | 1.20× | 1.09× | 1.10× |
+| [0.20, 1.00) | 348 | 1.09× | 0.94× | 0.94× |
 
 Note the last row: far from the ceiling both fixed-count methods are actively
 **slower** than an optimized fixed window. Stopping at the n-th photon is a
@@ -477,9 +489,9 @@ Caveat: this is one operating point (5.437 µW, η = 1, 637 µs horizon).
 
 | band | median 95% CI width on the adaptive-MMPP speedup |
 |---|---|
-| all rows | 0.065 |
-| matched headroom [0.02, 0.08) | 0.142 |
-| near the ceiling [0.00, 0.01) | 0.346 |
+| all rows | 0.068 |
+| matched headroom [0.02, 0.08) | 0.153 |
+| near the ceiling [0.00, 0.01) | 0.422 |
 
 The point estimate falls outside its own interval in 1 of 3199 rows (0.03%),
 the expected percentile-boundary residue. An earlier version of the code had
@@ -555,7 +567,7 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 78 checks
+python adaptive_charge_state_master.py validate                  # 83 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]

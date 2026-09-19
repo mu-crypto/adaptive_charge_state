@@ -119,10 +119,26 @@ def section(title: str) -> None:
 # -----------------------------------------------------------------------------
 
 
+def ideal_pool(rows: list[dict], dedup: bool = True) -> list[dict]:
+    """
+    Ideal-detector, noise-free rows, with duplicated regimes removed.
+
+    The 5.437 uW reference point is reached by five different sweeps and
+    15 uW by two, so 16% of the pooled rows are repeats of two operating
+    points. Leaving them in silently weights those two regimes five- and
+    two-fold in every median and every "fraction of rows" below.
+    """
+    pool = [r for r in rows if r["_ideal"] and not r["_noisy"]]
+    if not dedup:
+        return pool
+    keep = set(matched_rows(rows, dedup=True))
+    return [r for r in pool if (r["experiment"], r["point"]) in keep]
+
+
 def report_headroom_bands(rows: list[dict]) -> None:
     """Median speedup by distance below the threshold's ceiling."""
     section("Median speedup by headroom (ideal detector, no rate noise)")
-    pool = [r for r in rows if r["_ideal"] and not r["_noisy"]]
+    pool = ideal_pool(rows)
     n_def = sum(1 for r in pool if np.isfinite(_f(r, "speedup_mmpp")))
     print(f"{n_def} rows where the adaptive-MMPP speedup is defined\n")
     print(f"{'headroom':>14} {'n':>5} {'a.MMPP':>9} {'fc.MMPP':>9} {'a.count':>9}")
@@ -147,7 +163,7 @@ def report_factorization(rows: list[dict]) -> None:
     per-row ratios, which is paired at matched target.
     """
     section("Stopping rule vs decision statistic")
-    pool = [r for r in rows if r["_ideal"] and not r["_noisy"]]
+    pool = ideal_pool(rows)
 
     steps = [
         ("threshold -> adaptive count", "stopping: time -> count", "speedup_count", None),
@@ -389,14 +405,7 @@ def report_danjou(rows: list[dict]) -> None:
     section("Rows exceeding the D'Anjou 2x bound (ideal detector)")
     # Deduplicated: the same regime appears in up to five sweeps, and a row
     # that crosses 2x would otherwise be counted once per sweep.
-    wanted = set(matched_rows(rows, dedup=True))
-    pool = [
-        r
-        for r in rows
-        if r["_ideal"]
-        and not r["_noisy"]
-        and (r["experiment"], r["point"]) in wanted
-    ]
+    pool = ideal_pool(rows)
     hits = [r for r in pool if _f(r, "speedup_mmpp") > 2.0]
     n_def = sum(1 for r in pool if np.isfinite(_f(r, "speedup_mmpp")))
     print(f"{len(hits)} of {n_def} rows\n")
@@ -561,7 +570,7 @@ def report_snr_sweep(rows: list[dict], ceilings: dict) -> None:
 
 def report_ci_widths(rows: list[dict]) -> None:
     section("Bootstrap interval widths")
-    pool = [r for r in rows if r["_ideal"] and not r["_noisy"]]
+    pool = ideal_pool(rows)
     for label, sel in (
         ("all rows", pool),
         (f"matched headroom [{BAND[0]}, {BAND[1]})", [r for r in pool if in_band(r, *BAND)]),
