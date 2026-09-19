@@ -5652,7 +5652,54 @@ def risk_bootstrap(
                 "resolved": bool(lo * hi > 0.0),
             }
 
-    return {"risk_ci": risk_ci, "pair_ci": pair_ci, "n_boot": len(boots)}
+    # The raw draws are returned as well, because some comparisons are
+    # ACROSS calls rather than within one -- the noise degradation is a
+    # clean condition against a noisy one, simulated separately, so it
+    # cannot be paired over shots and has to be combined from two
+    # independent bootstrap samples. Percentiles alone cannot do that.
+    return {
+        "risk_ci": risk_ci,
+        "pair_ci": pair_ci,
+        "draws": draws,
+        "n_boot": len(boots),
+    }
+
+
+def ratio_ci_independent(
+    num: np.ndarray,
+    den: np.ndarray,
+    pct: bool = True,
+    seed: int = 20240917,
+) -> dict:
+    """
+    Interval on (num - den) / den from two INDEPENDENT bootstrap samples.
+
+    Used for the noise degradation, where the clean and noisy conditions
+    are different simulations and so share no shots, so there is nothing to
+    pair over and nothing cancels. These intervals are correspondingly
+    wider than the within-condition paired ones.
+
+    The denominator is permuted before the two are combined elementwise.
+    Reading them off in their original order would give the right answer
+    only because the two calls happen to use different bootstrap seeds --
+    and would silently collapse to an interval of zero width if they ever
+    did not. Permuting makes the independence assumption explicit instead
+    of incidental; on genuinely independent inputs it changes nothing.
+    """
+    num = np.asarray(num, dtype=float)
+    den = np.asarray(den, dtype=float)
+    n = min(num.size, den.size)
+    if n < 20:
+        return {"lo": np.nan, "hi": np.nan, "resolved": False}
+    den = np.random.default_rng(seed).permutation(den[:n])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g = (num[:n] - den) / den
+    g = g[np.isfinite(g)] * (100.0 if pct else 1.0)
+    if g.size < 20:
+        return {"lo": np.nan, "hi": np.nan, "resolved": False}
+    lo = float(np.percentile(g, 2.5))
+    hi = float(np.percentile(g, 97.5))
+    return {"lo": lo, "hi": hi, "resolved": bool(lo * hi > 0.0)}
 
 
 def exhaustion_times_us(paths: FilterPaths, eps: float) -> np.ndarray:
@@ -7453,6 +7500,36 @@ def validate_all(verbose: bool = True) -> int:
         risk_bootstrap({"a": (base_t, pr_a)}, rb_lab, econ_rb, 0, 1)["n_boot"]
         == 0,
         "n_boot = 0 returns empty intervals rather than raising",
+    )
+
+    # The mirror image, and the reason `ratio_ci_independent` exists: the
+    # noise degradation compares two separate simulations, so there is
+    # nothing to pair over. Feeding the SAME arm's draws in as both sides
+    # must still produce a non-degenerate interval around zero -- if the
+    # helper read the two vectors off in step it would return exactly
+    # [0, 0] and every degradation would look perfectly resolved.
+    ind = ratio_ci_independent(rb["draws"]["a"], rb["draws"]["a"])
+    paired_self = rb["pair_ci"].get("a_vs_a")
+    check(
+        "an unpaired ratio of one arm against itself is wide, not zero",
+        (
+            ind["hi"] - ind["lo"] > 1.0
+            and ind["lo"] < 0.0 < ind["hi"]
+            and not ind["resolved"]
+            and paired_self is None
+        ),
+        f"[{ind['lo']:+.2f}%, {ind['hi']:+.2f}%] straddling zero, against "
+        f"the exactly-zero width a paired comparison would give",
+    )
+
+    # And it must be wider than the paired interval on the same contrast,
+    # because nothing cancels.
+    ind_ab = ratio_ci_independent(rb["draws"]["b"], rb["draws"]["a"])
+    check(
+        "unpaired intervals are wider than paired ones on the same contrast",
+        (ind_ab["hi"] - ind_ab["lo"]) > (pc["hi"] - pc["lo"]),
+        f"unpaired width {ind_ab['hi'] - ind_ab['lo']:.2f}% vs paired "
+        f"{pc['hi'] - pc['lo']:.2f}%",
     )
 
     # A rule that stops every shot at t = 0 measured nothing, so its
@@ -9400,6 +9477,7 @@ def run_noise_risk_comparison(
         )
 
     results = []
+    draws_by_cond: dict[str, list[dict]] = {}
     for j, (tag, nz) in enumerate(conditions):
         d = clean if nz is None else _paths(nz, seed + 500 + 37 * j)
         by_actions = {}
@@ -9432,6 +9510,7 @@ def run_noise_risk_comparison(
             for mkey, (lo, hi) in bs["risk_ci"].items():
                 by_actions[name][mkey]["risk_ci"] = (lo, hi)
             by_actions[name]["_pair_ci"] = bs["pair_ci"]
+            draws_by_cond.setdefault(name, []).append(bs["draws"])
 
         # The third action is a paired change on the SAME shots, so its gain
         # carries its own interval rather than inheriting either arm's. Both
@@ -9489,6 +9568,24 @@ def run_noise_risk_comparison(
                 f"  {tag:<14} Gamma_tot*tau_c = "
                 f"{results[-1]['gamma_tau']:6.2f}   ({time.time() - t0:.0f}s)"
             )
+
+    # Degradation against the clean condition. This is the one comparison in
+    # this function that is NOT paired: clean and noisy are separate
+    # simulations sharing no shots, so it is combined from two independent
+    # bootstrap samples and its intervals are correspondingly wider. The
+    # panels reporting it had no uncertainty at all while the writeup quoted
+    # ranges like "+7.1% to +16.1%" off them.
+    for aset in ("two", "three"):
+        per_cond = draws_by_cond.get(aset, [])
+        if len(per_cond) != len(results):
+            continue
+        base = per_cond[0]
+        for j, res in enumerate(results):
+            dci = {}
+            for key, _, _, _ in METHOD_ORDER:
+                if key in base and key in per_cond[j]:
+                    dci[key] = ratio_ci_independent(per_cond[j][key], base[key])
+            res.setdefault("degradation_ci", {})[aset] = dci
 
     if cfg.verbose:
         hdr = f"\n{'method':<36}" + "".join(
@@ -9548,19 +9645,32 @@ def run_noise_risk_comparison(
                 f"and says nothing about the rule"
             )
 
+        any_deg_ci = False
         for aset in ("two", "three"):
             print(
-                f"\n{aset} actions, relative to the clean case (+ = worse){hdr}"
+                f"\n{aset} actions, relative to the clean case "
+                f"(+ = worse), * = 95% CI excludes zero{hdr}"
             )
             for key, name, _, _ in METHOD_ORDER:
                 base = results[0][aset][key]["risk"]
-                print(
-                    f"{name:<36}"
-                    + "".join(
-                        f"{100 * (r[aset][key]['risk'] - base) / base:9.1f}%"
-                        for r in results
+                cells = []
+                for r in results:
+                    v = 100 * (r[aset][key]["risk"] - base) / base
+                    ci = r.get("degradation_ci", {}).get(aset, {}).get(key)
+                    any_deg_ci |= ci is not None
+                    cells.append(
+                        f"{v:8.1f}%{'*' if ci and ci['resolved'] else ' '}"
                     )
-                )
+                print(f"{name:<36}" + "".join(cells))
+        if any_deg_ci:
+            # Worth saying explicitly: unlike every other interval printed
+            # above, this one is not paired. Clean and noisy are separate
+            # simulations, so nothing cancels and these are wider.
+            print(
+                "  combined from two independent bootstrap samples (clean "
+                "and noisy share no shots), so these are wider than the "
+                "paired intervals above"
+            )
         print(f"\n  total {time.time() - t0:.0f} s")
 
     return {
@@ -9612,6 +9722,9 @@ _NOISE_RISK_CSV_COLUMNS = [
     "third_action_gain_resolved",
     "risk_ci_low",
     "risk_ci_high",
+    "risk_vs_clean_ci_low",
+    "risk_vs_clean_ci_high",
+    "risk_vs_clean_resolved",
     "discard_rate",
     "degenerate",
     "F",
@@ -9653,6 +9766,11 @@ def export_noise_risk_csv(
                     for aset in ("two", "three"):
                         m = cond[aset][key]
                         rci = m.get("risk_ci", (np.nan, np.nan))
+                        dci = (
+                            cond.get("degradation_ci", {})
+                            .get(aset, {})
+                            .get(key)
+                        )
                         w.writerow(
                             {
                                 **base,
@@ -9677,6 +9795,15 @@ def export_noise_risk_csv(
                                     100.0
                                     * (m["risk"] - clean[aset][key]["risk"])
                                     / clean[aset][key]["risk"]
+                                ),
+                                "risk_vs_clean_ci_low": (
+                                    dci["lo"] if dci else np.nan
+                                ),
+                                "risk_vs_clean_ci_high": (
+                                    dci["hi"] if dci else np.nan
+                                ),
+                                "risk_vs_clean_resolved": (
+                                    int(dci["resolved"]) if dci else ""
                                 ),
                                 "third_action_gain_pct": gain,
                                 "discard_rate": m["discard_rate"],
@@ -9776,11 +9903,24 @@ def plot_noise_risk(result: dict, save_path: str | None = None):
         p = ax[1, col]
         for key, name, c, ls in METHOD_ORDER:
             b = rr[0][aset][key]["risk"]
-            p.plot(x, [100 * (r[aset][key]["risk"] - b) / b for r in rr], ls,
-                   marker="o", color=c, ms=4, label=name)
+            y = np.array([100 * (r[aset][key]["risk"] - b) / b for r in rr])
+            ci = np.array([
+                [
+                    r.get("degradation_ci", {}).get(aset, {})
+                     .get(key, {}).get("lo", np.nan),
+                    r.get("degradation_ci", {}).get(aset, {})
+                     .get(key, {}).get("hi", np.nan),
+                ]
+                for r in rr
+            ])
+            if np.isfinite(ci).all():
+                p.fill_between(x, ci[:, 0], ci[:, 1], color=c, alpha=0.13,
+                               linewidth=0)
+            p.plot(x, y, ls, marker="o", color=c, ms=4, label=name)
         p.axhline(0, color="k", lw=0.9)
         _style(p, "risk increase vs clean (%)",
-               f"({'de'[col]}) degradation -- {label}")
+               f"({'de'[col]}) degradation -- {label}  (bands: 95% CI, "
+               f"unpaired)")
 
     # (f) the price paid for panel (c)
     p = ax[1, 2]
