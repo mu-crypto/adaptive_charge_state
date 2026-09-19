@@ -724,7 +724,7 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 86 checks
+python adaptive_charge_state_master.py validate                  # 90 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]

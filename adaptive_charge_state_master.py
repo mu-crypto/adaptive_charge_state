@@ -7032,6 +7032,31 @@ def validate_all(verbose: bool = True) -> int:
         f"risk {r_in:.4f} in sample vs {r_out:.4f} out of sample",
     )
 
+    # The policy is fitted WITHOUT labels. The backward induction reads only
+    # the filter path and the payoff function -- which is the posterior's job,
+    # not the label's -- so `fit_stopping_rule` never touches `paths.labels`.
+    # That is worth pinning rather than asserting from the signature, because
+    # it is what makes the `noiserisk` "retrained on noise" arm experimentally
+    # honest: retraining needs noisy calibration PATHS, not knowledge of which
+    # charge state each of them was.
+    label_free = True
+    for relabel in (
+        np.zeros_like(cal_paths_os.labels),
+        cal_paths_os.labels[::-1].copy(),
+        np.random.default_rng(31).permutation(cal_paths_os.labels),
+    ):
+        scrambled = replace(cal_paths_os, labels=relabel)
+        coef_alt = fit_stopping_rule(scrambled, econ_a)
+        label_free &= len(coef_alt) == len(coef_os) and all(
+            np.array_equal(a, b) for a, b in zip(coef_os, coef_alt)
+        )
+    check(
+        "the learned policy is fitted without labels",
+        label_free,
+        "zeroing, reversing and permuting the calibration labels leaves "
+        "every epoch's coefficient vector bit-identical",
+    )
+
     try:
         apply_stopping_rule(os_paths, coef_os, econ_a)
         grid_guard = False
@@ -7044,15 +7069,28 @@ def validate_all(verbose: bool = True) -> int:
         "silently truncated",
     )
 
-    # Any feasible rule bounds the optimum from below, so the learned policy
-    # must not be beaten by the constant boundary it is meant to generalise --
-    # on the data it was tuned on, where both are in sample.
-    base_in = best_constant_boundary(cal_paths_os, econ_a, 0.0)
+    # The learned policy should beat the constant boundary it generalises,
+    # but only OUT OF SAMPLE. An earlier version of this check compared the
+    # two in sample and asserted dominance as if it were a bound; it is not
+    # one. Both sides are fitted, and they overfit by different amounts --
+    # `best_constant_boundary` tunes two parameters on the same 400 shots it
+    # then scores, which at that size flatters it by about 5%, while the
+    # policy's own in-sample optimism is the separate quantity measured just
+    # above. Neither number bounds the other, and the in-sample form failed
+    # on the builtin-reference layer for exactly that reason. Tuning the
+    # boundary on calibration and scoring both on test is the comparison the
+    # rest of this file makes, and it is the one that holds.
+    base_cal = best_constant_boundary(cal_paths_os, econ_a, 0.0)
+    st_b, pr_b = sprt_on_epochs(
+        te_paths_os, base_cal["L"], base_cal["offset"], 0.0
+    )
+    r_base_out = bayes_risk(st_b, pr_b, te_paths_os.labels, econ_a)
     check(
-        "the learned policy beats the tuned constant boundary it generalises",
-        r_in <= base_in["risk"] + 1e-9,
-        f"learned {r_in:.4f} vs best (L, offset) = "
-        f"({base_in['L']:.2f}, {base_in['offset']:.2f}) at {base_in['risk']:.4f}",
+        "the learned policy beats the tuned constant boundary out of sample",
+        r_out <= r_base_out + 1e-9,
+        f"learned {r_out:.4f} vs best (L, offset) = "
+        f"({base_cal['L']:.2f}, {base_cal['offset']:.2f}) at {r_base_out:.4f}, "
+        f"both scored on held-out shots",
     )
 
     # -------------------------------------------------------------------------
