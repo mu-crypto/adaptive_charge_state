@@ -5572,89 +5572,6 @@ def best_exact_boundary(
     return best
 
 
-def risk_bootstrap(
-    arms: dict,
-    labels: np.ndarray,
-    econ: Economics,
-    n_boot: int,
-    seed: int,
-) -> dict:
-    """
-    Paired percentile bootstrap over test shots for a set of already-fitted
-    rules.
-
-    `arms` maps a tag to (stop_us, preds). Every arm is resampled with the
-    SAME shot indices, so a difference between two arms is paired and its
-    interval is far tighter than either risk's own interval -- which is what
-    these comparisons need, since the methods differ by a few percent and
-    the per-arm intervals overlap heavily.
-
-    The tuned configuration is held FIXED across resamples. Calibration is a
-    separate dataset and is not resampled, so the estimand is "the risk of
-    this fitted rule on the population", not "the risk of refitting it".
-    That is the right question here: the rules are compared as deployed.
-
-    Returns, per arm, the risk interval; and per ordered pair (a, b), the
-    interval on the percentage by which b beats a, plus whether it excludes
-    zero.
-    """
-    labels = np.asarray(labels, dtype=int)
-    boots = stratified_bootstrap_indices(labels, int(n_boot), int(seed))
-    if not boots:
-        return {"risk_ci": {}, "pair_ci": {}, "n_boot": 0}
-
-    I0 = np.asarray([b[0] for b in boots])
-    I1 = np.asarray([b[1] for b in boots])
-
-    draws = {}
-    for tag, (stop_us, preds) in arms.items():
-        stop_us = np.asarray(stop_us, dtype=float)
-        preds = np.asarray(preds, dtype=int)
-        t = 0.5 * (stop_us[I0].mean(axis=1) + stop_us[I1].mean(axis=1))
-        miss = (preds[I0] == DECLARE_ZERO).mean(axis=1)
-        false = (preds[I1] == DECLARE_MINUS).mean(axis=1)
-        r = (
-            econ.cost_per_us * t
-            + 0.5 * econ.cost_miss * miss
-            + 0.5 * econ.cost_false * false
-        )
-        if econ.discard_allowed:
-            r = r + econ.cost_discard * 0.5 * (
-                (preds[I0] == DISCARD).mean(axis=1)
-                + (preds[I1] == DISCARD).mean(axis=1)
-            )
-        draws[tag] = r
-
-    risk_ci = {
-        tag: (
-            float(np.percentile(v, 2.5)),
-            float(np.percentile(v, 97.5)),
-        )
-        for tag, v in draws.items()
-    }
-
-    pair_ci = {}
-    tags = list(arms)
-    for a in tags:
-        for b in tags:
-            if a == b:
-                continue
-            with np.errstate(divide="ignore", invalid="ignore"):
-                gain = 100.0 * (draws[a] - draws[b]) / draws[a]
-            gain = gain[np.isfinite(gain)]
-            if gain.size < 20:
-                continue
-            lo = float(np.percentile(gain, 2.5))
-            hi = float(np.percentile(gain, 97.5))
-            pair_ci[f"{b}_vs_{a}"] = {
-                "lo": lo,
-                "hi": hi,
-                "resolved": bool(lo * hi > 0.0),
-            }
-
-    return {"risk_ci": risk_ci, "pair_ci": pair_ci, "n_boot": len(boots)}
-
-
 def exhaustion_times_us(paths: FilterPaths, eps: float) -> np.ndarray:
     """
     First epoch at which d <= eps, or nan if the deadline arrives first.
@@ -5928,34 +5845,6 @@ def run_optimal_stopping(
         rows[-1]["risk_reduction_pct"] = (
             100.0 * (best_boundary - rows[-1]["risk_learned"]) / best_boundary
         )
-        # Paired over the test shots. The risk panels had no uncertainty at
-        # all until this existed, while the differences being read off them
-        # are a few percent.
-        bs_r = risk_bootstrap(
-            {
-                "grid_sprt": (st_g, pr_g),
-                "exhaustion": (st_x, pr_x),
-                "exact_sprt": (st_e, pr_e),
-                "learned": (st_l, pr_l),
-            },
-            test_labels,
-            econ,
-            cfg.n_boot,
-            seed + 4417,
-        )
-        for mkey, (lo, hi) in bs_r["risk_ci"].items():
-            rows[-1][f"risk_{mkey}_ci_low"] = lo
-            rows[-1][f"risk_{mkey}_ci_high"] = hi
-        ref_key = min(
-            ("grid_sprt", "exhaustion", "exact_sprt"),
-            key=lambda k: rows[-1][f"risk_{k}"],
-        )
-        ci_r = bs_r["pair_ci"].get(f"learned_vs_{ref_key}")
-        rows[-1]["risk_reduction_ci_low"] = ci_r["lo"] if ci_r else np.nan
-        rows[-1]["risk_reduction_ci_high"] = ci_r["hi"] if ci_r else np.nan
-        rows[-1]["risk_reduction_resolved"] = (
-            int(ci_r["resolved"]) if ci_r else 0
-        )
 
     lsm_correct = np.column_stack(lsm_correct)
     lsm_time = np.column_stack(lsm_time)
@@ -6057,9 +5946,7 @@ def run_optimal_stopping(
                 f"{r['a_over_c']:9.0f}{r['risk_grid_sprt']:11.4f}"
                 f"{r['risk_exhaustion']:10.4f}{r['risk_exact_sprt']:10.4f}"
                 f"{r['risk_learned']:10.4f}"
-                f"{r['risk_reduction_pct']:7.1f}%"
-                f"{'*' if r.get('risk_reduction_resolved') else ' '}| "
-                f"{r['T_grid_sprt']:8.1f}"
+                f"{r['risk_reduction_pct']:7.1f}% | {r['T_grid_sprt']:9.1f}"
                 f"{r['T_exhaustion']:9.1f}{r['T_learned']:9.1f}"
                 f" | {r['F_grid_sprt']:8.4f}{r['F_learned']:8.4f}"
             )
@@ -7348,64 +7235,6 @@ def validate_all(verbose: bool = True) -> int:
         f"{100 * float(prev_disc.mean()):.0f}% at w = 0.08)",
     )
 
-    # The risk comparisons had no uncertainty at all until `risk_bootstrap`
-    # existed, while the differences read off them are a few percent. Pin
-    # the two properties that make it usable: the point estimate sits inside
-    # its own interval, and pairing actually buys resolution.
-    rb_lab = np.array([0] * 400 + [1] * 400)
-    rng_rb = np.random.default_rng(31337)
-    base_t = rng_rb.uniform(5.0, 25.0, 800)
-    err_a = rng_rb.random(800) < 0.12
-    # arm B is arm A with a few errors fixed -- strongly correlated, which
-    # is what pairing is supposed to exploit
-    # Only a small fraction of errors fixed, so the MARGINAL intervals still
-    # overlap -- an effect large enough to separate them unpaired would not
-    # test anything.
-    err_b = err_a & (rng_rb.random(800) > 0.08)
-    pr_a = np.where(err_a, 1 - rb_lab, rb_lab)
-    pr_b = np.where(err_b, 1 - rb_lab, rb_lab)
-    econ_rb = Economics(cost_per_us=1.0 / 500.0)
-    rb = risk_bootstrap(
-        {"a": (base_t, pr_a), "b": (base_t, pr_b)},
-        rb_lab, econ_rb, 400, 5150,
-    )
-    r_a = bayes_risk(base_t, pr_a, rb_lab, econ_rb)
-    r_b = bayes_risk(base_t, pr_b, rb_lab, econ_rb)
-    inside = all(
-        rb["risk_ci"][k][0] <= v <= rb["risk_ci"][k][1]
-        for k, v in (("a", r_a), ("b", r_b))
-    )
-    check(
-        "risk_bootstrap brackets its own point estimates",
-        inside,
-        f"a {r_a:.4f} in [{rb['risk_ci']['a'][0]:.4f}, "
-        f"{rb['risk_ci']['a'][1]:.4f}], b likewise",
-    )
-
-    # Unpaired, the two risk intervals overlap heavily; paired, the
-    # difference is resolved. That gap is the whole reason for the helper.
-    overlap = (
-        rb["risk_ci"]["a"][0] < rb["risk_ci"]["b"][1]
-        and rb["risk_ci"]["b"][0] < rb["risk_ci"]["a"][1]
-    )
-    pc = rb["pair_ci"]["b_vs_a"]
-    check(
-        "pairing resolves a difference the marginal intervals cannot",
-        overlap and pc["resolved"],
-        f"marginals [{rb['risk_ci']['a'][0]:.4f}, {rb['risk_ci']['a'][1]:.4f}] "
-        f"and [{rb['risk_ci']['b'][0]:.4f}, {rb['risk_ci']['b'][1]:.4f}] "
-        f"{'overlap' if overlap else 'DO NOT overlap'}; paired gain "
-        f"[{pc['lo']:+.1f}%, {pc['hi']:+.1f}%] "
-        f"{'excludes' if pc['resolved'] else 'includes'} zero",
-    )
-
-    check(
-        "risk_bootstrap degrades cleanly with no resamples",
-        risk_bootstrap({"a": (base_t, pr_a)}, rb_lab, econ_rb, 0, 1)["n_boot"]
-        == 0,
-        "n_boot = 0 returns empty intervals rather than raising",
-    )
-
     # A rule that stops every shot at t = 0 measured nothing, so its
     # throughput is undefined rather than astronomically good. Dividing by a
     # 1e-12 floor used to report 1e15 retained shots per ms.
@@ -7968,18 +7797,12 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
     p.legend(fontsize=8.5, loc="lower right")
 
     p = ax[0, 1]
-    for key, style, col, lw, lab in (
-        ("grid_sprt", "-o", "#1f77b4", 1.5, "epoch boundary (tuned)"),
-        ("exhaustion", "--s", "#2ca02c", 1.5, "+ exhaustion exit"),
-        ("exact_sprt", "-^", "#9467bd", 1.5, "exact grid-free boundary"),
-        ("learned", "-D", "#d62728", 2.2, "learned policy"),
-    ):
-        y = np.array([r[f"risk_{key}"] for r in rows])
-        lo = np.array([r.get(f"risk_{key}_ci_low", np.nan) for r in rows])
-        hi = np.array([r.get(f"risk_{key}_ci_high", np.nan) for r in rows])
-        if np.isfinite(lo).all():
-            p.fill_between(ac, lo, hi, color=col, alpha=0.13, linewidth=0)
-        p.plot(ac, y, style, color=col, lw=lw, ms=4, label=lab)
+    p.plot(ac, [r["risk_grid_sprt"] for r in rows], "-o", color="#1f77b4",
+           label="constant boundary (tuned)")
+    p.plot(ac, [r["risk_exhaustion"] for r in rows], "--s", color="#2ca02c",
+           label="+ exhaustion exit")
+    p.plot(ac, [r["risk_learned"] for r in rows], "-D", color="#d62728", lw=2.2,
+           label="learned policy")
     p.set_xscale("log")
     p.set_yscale("log")
     p.set_xlabel("a/c   (us of readout per avoided error)")
@@ -7991,17 +7814,8 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
 
     p = ax[1, 0]
     x = np.arange(len(ac))
-    red = np.array([r["risk_reduction_pct"] for r in rows])
-    rlo = np.array([r.get("risk_reduction_ci_low", np.nan) for r in rows])
-    rhi = np.array([r.get("risk_reduction_ci_high", np.nan) for r in rows])
-    yerr = (
-        np.vstack([np.maximum(red - rlo, 0), np.maximum(rhi - red, 0)])
-        if np.isfinite(rlo).all()
-        else None
-    )
-    p.bar(x - 0.2, red, width=0.4, color="#d62728", alpha=0.85,
-          yerr=yerr, ecolor="#5a1114", capsize=2,
-          label="learned vs best boundary (95% paired CI)")
+    p.bar(x - 0.2, [r["risk_reduction_pct"] for r in rows], width=0.4,
+          color="#d62728", alpha=0.85, label="learned vs tuned boundary")
     p.bar(
         x + 0.2,
         [
@@ -8066,17 +7880,6 @@ _OPTIMAL_CSV_COLUMNS = [
     "risk_exact_sprt",
     "risk_learned",
     "best_boundary_risk",
-    "risk_grid_sprt_ci_low",
-    "risk_grid_sprt_ci_high",
-    "risk_exhaustion_ci_low",
-    "risk_exhaustion_ci_high",
-    "risk_exact_sprt_ci_low",
-    "risk_exact_sprt_ci_high",
-    "risk_learned_ci_low",
-    "risk_learned_ci_high",
-    "risk_reduction_ci_low",
-    "risk_reduction_ci_high",
-    "risk_reduction_resolved",
     "risk_reduction_pct",
     "F_grid_sprt",
     "T_grid_sprt",
@@ -8476,23 +8279,6 @@ def run_discard_sweep(
         st_l, pr_l, _ = apply_stopping_rule(test_paths, coeffs, econ)
         m_lsm = three_action_metrics(st_l, pr_l, test_labels, econ)
 
-        # Paired over the test shots, with the tuned configuration fixed:
-        # the arms differ by a few percent and their individual intervals
-        # overlap heavily, so only the paired difference is informative.
-        bs = risk_bootstrap(
-            {
-                "sprt": (st_s, pr_s),
-                "exact": (st_x, pr_x),
-                "learned": (st_l, pr_l),
-            },
-            test_labels,
-            econ,
-            cfg.n_boot,
-            seed + 991,
-        )
-        for mkey, m in (("sprt", m_sprt), ("exact", m_exact), ("learned", m_lsm)):
-            m["risk_ci"] = bs["risk_ci"].get(mkey, (np.nan, np.nan))
-
         rows.append(
             {
                 "cost_discard": float(w),
@@ -8514,7 +8300,6 @@ def run_discard_sweep(
                     * (min(m_sprt["risk"], m_exact["risk"]) - m_lsm["risk"])
                     / min(m_sprt["risk"], m_exact["risk"])
                 ),
-                "pair_ci": bs["pair_ci"],
                 # Degenerate either because essentially everything is
                 # abandoned, or because the rule stops at t = 0 and so makes
                 # no measurement at all. Both have a low Bayes risk that
@@ -8543,26 +8328,19 @@ def run_discard_sweep(
                 if not np.isfinite(r["band_lo"])
                 else f"[{r['band_lo']:+.2f},{r['band_hi']:+.2f}]"
             )
-            flag = " (d)" if r["degenerate"] else ""
+            flag = " *" if r["degenerate"] else ""
             cells = " | ".join(
                 f"{m['risk']:8.4f}{100 * m['discard_rate']:5.0f}%"
                 f"{m['accuracy_retained']:9.4f}{m['yield_per_ms']:8.1f}{m['T']:7.1f}"
                 for m in (r["sprt"], r["exact"], r["learned"])
             )
-            ref = "exact" if r["exact"]["risk"] <= r["sprt"]["risk"] else "sprt"
-            ci = r.get("pair_ci", {}).get(f"learned_vs_{ref}")
-            star = "*" if ci and ci["resolved"] else " "
             print(
                 f"{r['cost_discard']:6.2f}{band:>15} | {cells}"
-                f" | {r['risk_reduction_pct']:6.1f}%{star}{flag}"
+                f" | {r['risk_reduction_pct']:6.1f}%{flag}"
             )
-        print(
-            f"  * = the learned policy's 95% paired CI against the better "
-            f"boundary excludes zero ({cfg.n_boot} resamples)"
-        )
         if any(r["degenerate"] for r in rows):
             print(
-                "  (d) discard rate above 99%: abandoning essentially every "
+                "  * discard rate above 99%: abandoning essentially every "
                 "shot is cheaper than reading it out at this w"
             )
         print(f"  total {time.time() - t0:.1f} s")
@@ -8607,11 +8385,7 @@ _DISCARD_CSV_COLUMNS = [
     "exact_deadline_us",
     "degenerate",
     "sprt_risk",
-    "sprt_risk_ci_low",
-    "sprt_risk_ci_high",
     "exact_risk",
-    "exact_risk_ci_low",
-    "exact_risk_ci_high",
     "sprt_discard_rate",
     "exact_discard_rate",
     "sprt_accuracy_retained",
@@ -8623,29 +8397,13 @@ _DISCARD_CSV_COLUMNS = [
     "sprt_T_us",
     "exact_T_us",
     "learned_risk",
-    "learned_risk_ci_low",
-    "learned_risk_ci_high",
     "learned_discard_rate",
     "learned_accuracy_retained",
     "learned_fidelity_all_shots",
     "learned_yield_per_ms",
     "learned_T_us",
     "risk_reduction_pct",
-    "risk_reduction_ci_low",
-    "risk_reduction_ci_high",
-    "risk_reduction_resolved",
 ]
-
-
-def _reduction_ci_cols(row: dict) -> dict:
-    """Paired interval on the learned policy's edge over the better boundary."""
-    ref = "exact" if row["exact"]["risk"] <= row["sprt"]["risk"] else "sprt"
-    ci = row.get("pair_ci", {}).get(f"learned_vs_{ref}")
-    return {
-        "risk_reduction_ci_low": ci["lo"] if ci else np.nan,
-        "risk_reduction_ci_high": ci["hi"] if ci else np.nan,
-        "risk_reduction_resolved": int(ci["resolved"]) if ci else "",
-    }
 
 
 def export_discard_csv(
@@ -8684,7 +8442,6 @@ def export_discard_csv(
                         "exact_deadline_us": row["exact_deadline_us"],
                         "degenerate": int(row["degenerate"]),
                         "risk_reduction_pct": row["risk_reduction_pct"],
-                        **_reduction_ci_cols(row),
                     }
                 )
                 for tag, key in (
@@ -8692,9 +8449,6 @@ def export_discard_csv(
                 ):
                     m = row[key]
                     out[f"{tag}_risk"] = m["risk"]
-                    rci = m.get("risk_ci", (np.nan, np.nan))
-                    out[f"{tag}_risk_ci_low"] = rci[0]
-                    out[f"{tag}_risk_ci_high"] = rci[1]
                     out[f"{tag}_discard_rate"] = m["discard_rate"]
                     out[f"{tag}_accuracy_retained"] = m["accuracy_retained"]
                     out[f"{tag}_fidelity_all_shots"] = m["fidelity_all_shots"]
@@ -8983,11 +8737,8 @@ def _method_risks(
     test_cum = _cumulative_counts(test_shots, t_us)
     out: dict = {}
 
-    arms: dict = {}
-
     def _record(tag, stop_us, preds, **extra):
         F, T = _balanced_F_T(stop_us, preds, labels)
-        arms[tag] = (np.asarray(stop_us, float), np.asarray(preds, int))
         out[tag] = {
             "risk": bayes_risk(stop_us, preds, labels, econ),
             "F": F,
@@ -9116,7 +8867,6 @@ def _method_risks(
         st, pr, _ = apply_stopping_rule(test_paths, coeffs, econ)
         _record(tag, st, pr)
 
-    out["_arms"] = arms
     return out
 
 
@@ -9265,65 +9015,6 @@ def run_noise_risk_comparison(
                     "learned_matched": fit_stopping_rule(d["cal_paths"], e),
                 },
             )
-        # Intervals. Everything is resampled with the same shot indices, so
-        # every comparison below is paired -- which matters, because the
-        # methods differ by a few percent and their individual intervals
-        # overlap heavily.
-        lab_t = np.asarray(d["test_paths"].labels, dtype=int)
-        bs_seed = seed + 991 + 7 * j
-        arms_by_set = {
-            name: by_actions[name].pop("_arms") for name, _ in ACTION_SETS
-        }
-        for name, e in ACTION_SETS:
-            bs = risk_bootstrap(
-                arms_by_set[name], lab_t, e, cfg.n_boot, bs_seed
-            )
-            # NOT `tag`: that name holds the condition label from the
-            # enclosing loop, and rebinding it here silently relabelled
-            # every condition with the last method key.
-            for mkey, (lo, hi) in bs["risk_ci"].items():
-                by_actions[name][mkey]["risk_ci"] = (lo, hi)
-            by_actions[name]["_pair_ci"] = bs["pair_ci"]
-
-        # The third action is a paired change on the SAME shots, so its gain
-        # carries its own interval rather than inheriting either arm's. Both
-        # sides are priced by econ3; a two-action rule never discards, so its
-        # risk is identical under either economics and the comparison is
-        # well posed.
-        gain_ci = {}
-        if cfg.n_boot > 0:
-            gb = stratified_bootstrap_indices(lab_t, cfg.n_boot, bs_seed)
-            J0 = np.asarray([b[0] for b in gb])
-            J1 = np.asarray([b[1] for b in gb])
-
-            def _risk_draws(stop_us, preds, e):
-                t = 0.5 * (
-                    stop_us[J0].mean(axis=1) + stop_us[J1].mean(axis=1)
-                )
-                r = (
-                    e.cost_per_us * t
-                    + 0.5 * e.cost_miss * (preds[J0] == DECLARE_ZERO).mean(axis=1)
-                    + 0.5 * e.cost_false * (preds[J1] == DECLARE_MINUS).mean(axis=1)
-                )
-                if e.discard_allowed:
-                    r = r + e.cost_discard * 0.5 * (
-                        (preds[J0] == DISCARD).mean(axis=1)
-                        + (preds[J1] == DISCARD).mean(axis=1)
-                    )
-                return r
-
-            for key, _, _, _ in METHOD_ORDER:
-                r2 = _risk_draws(*arms_by_set["two"][key], econ2)
-                r3 = _risk_draws(*arms_by_set["three"][key], econ3)
-                g = 100.0 * (r2 - r3) / r2
-                g = g[np.isfinite(g)]
-                if g.size >= 20:
-                    lo = float(np.percentile(g, 2.5))
-                    hi = float(np.percentile(g, 97.5))
-                    gain_ci[key] = {
-                        "lo": lo, "hi": hi, "resolved": bool(lo * hi > 0.0)
-                    }
-
         results.append(
             {
                 "tag": tag,
@@ -9333,7 +9024,6 @@ def run_noise_risk_comparison(
                 "methods": by_actions["two"],          # back-compat alias
                 "two": by_actions["two"],
                 "three": by_actions["three"],
-                "gain_ci": gain_ci,
             }
         )
         if cfg.verbose:
@@ -9357,31 +9047,15 @@ def run_noise_risk_comparison(
                     + "".join(f"{r[aset][key]['risk']:10.4f}" for r in results)
                 )
 
-        print(
-            f"\nwhat the THIRD ACTION buys, * = 95% CI excludes zero{hdr}"
-        )
+        print(f"\nwhat the THIRD ACTION buys (+ = the third action is better){hdr}")
         for key, name, _, _ in METHOD_ORDER:
-            cells = []
-            for r in results:
-                g = (
-                    100
-                    * (r["two"][key]["risk"] - r["three"][key]["risk"])
-                    / r["two"][key]["risk"]
+            print(
+                f"{name:<36}"
+                + "".join(
+                    f"{100 * (r['two'][key]['risk'] - r['three'][key]['risk']) / r['two'][key]['risk']:9.1f}%"
+                    for r in results
                 )
-                ci = r.get("gain_ci", {}).get(key)
-                cells.append(
-                    f"{g:8.1f}%{'*' if ci and ci['resolved'] else ' '}"
-                )
-            print(f"{name:<36}" + "".join(cells))
-        if results[0].get("gain_ci"):
-            k0 = METHOD_ORDER[0][0]
-            c0 = results[0]["gain_ci"].get(k0)
-            if c0:
-                print(
-                    f"  paired over {cfg.n_boot} resamples of the test shots; "
-                    f"e.g. {METHOD_ORDER[0][1]} on the clean condition is "
-                    f"[{c0['lo']:+.1f}%, {c0['hi']:+.1f}%]"
-                )
+            )
 
         print(f"\nshots abandoned by the three-action rule{hdr}")
         degenerate = False
@@ -9459,11 +9133,6 @@ _NOISE_RISK_CSV_COLUMNS = [
     "risk",
     "risk_vs_clean_pct",
     "third_action_gain_pct",
-    "third_action_gain_ci_low",
-    "third_action_gain_ci_high",
-    "third_action_gain_resolved",
-    "risk_ci_low",
-    "risk_ci_high",
     "discard_rate",
     "degenerate",
     "F",
@@ -9501,24 +9170,11 @@ def export_noise_risk_csv(
                         * (cond["two"][key]["risk"] - cond["three"][key]["risk"])
                         / cond["two"][key]["risk"]
                     )
-                    gci = cond.get("gain_ci", {}).get(key)
                     for aset in ("two", "three"):
                         m = cond[aset][key]
-                        rci = m.get("risk_ci", (np.nan, np.nan))
                         w.writerow(
                             {
                                 **base,
-                                "third_action_gain_ci_low": (
-                                    gci["lo"] if gci else np.nan
-                                ),
-                                "third_action_gain_ci_high": (
-                                    gci["hi"] if gci else np.nan
-                                ),
-                                "third_action_gain_resolved": (
-                                    int(gci["resolved"]) if gci else ""
-                                ),
-                                "risk_ci_low": rci[0],
-                                "risk_ci_high": rci[1],
                                 "condition": cond["tag"],
                                 "tau_c_ms": cond["tau_c_ms"],
                                 "gamma_tot_tau_c": cond["gamma_tau"],
@@ -9583,14 +9239,8 @@ def plot_noise_risk(result: dict, save_path: str | None = None):
     ):
         p = ax[0, col]
         for key, name, c, ls in METHOD_ORDER:
-            y = np.array([r[aset][key]["risk"] for r in rr])
-            ci = np.array([
-                r[aset][key].get("risk_ci", (np.nan, np.nan)) for r in rr
-            ])
-            if np.isfinite(ci).all():
-                p.fill_between(x, ci[:, 0], ci[:, 1], color=c, alpha=0.13,
-                               linewidth=0)
-            p.plot(x, y, ls, marker="o", color=c, ms=4, label=name)
+            p.plot(x, [r[aset][key]["risk"] for r in rr], ls, marker="o",
+                   color=c, ms=4, label=name)
         p.set_yscale("log")
         p.set_ylim(0.9 * lo, 1.1 * hi)
         _style(p, "Bayes risk", f"({'ab'[col]}) risk -- {label}")
@@ -9600,25 +9250,18 @@ def plot_noise_risk(result: dict, save_path: str | None = None):
     # (c) the paired comparison: what the third action is worth, per method
     p = ax[0, 2]
     for key, name, c, ls in METHOD_ORDER:
-        g = np.array([
-            100 * (r["two"][key]["risk"] - r["three"][key]["risk"])
-            / r["two"][key]["risk"]
-            for r in rr
-        ])
-        ci = np.array([
+        p.plot(
+            x,
             [
-                r.get("gain_ci", {}).get(key, {}).get("lo", np.nan),
-                r.get("gain_ci", {}).get(key, {}).get("hi", np.nan),
-            ]
-            for r in rr
-        ])
-        if np.isfinite(ci).all():
-            p.fill_between(x, ci[:, 0], ci[:, 1], color=c, alpha=0.13,
-                           linewidth=0)
-        p.plot(x, g, ls, marker="o", color=c, ms=4, label=name)
+                100 * (r["two"][key]["risk"] - r["three"][key]["risk"])
+                / r["two"][key]["risk"]
+                for r in rr
+            ],
+            ls, marker="o", color=c, ms=4, label=name,
+        )
     p.axhline(0, color="k", lw=0.9)
     _style(p, "risk reduction from the third action (%)",
-           "(c) what abandoning shots buys  (bands: 95% paired CI)")
+           "(c) what abandoning shots buys")
 
     # (d), (e) fragility under each action set -- does the extra action
     # change WHO breaks, or only the level?
