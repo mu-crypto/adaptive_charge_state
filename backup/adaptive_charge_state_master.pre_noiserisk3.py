@@ -8619,9 +8619,8 @@ METHOD_ORDER = [
     ("threshold", "fixed-time count threshold", "#444444", ":"),
     ("adaptive_count", "adaptive count SPRT", "#8c564b", "--"),
     ("fixed_count_mmpp", "fixed-count MMPP", "#9467bd", "--"),
-    ("mmpp_sprt", "adaptive MMPP, epoch boundary", "#1f77b4", "-"),
+    ("mmpp_sprt", "adaptive MMPP, constant boundary", "#1f77b4", "-"),
     ("mmpp_sprt_exh", "+ exhaustion exit", "#2ca02c", "-"),
-    ("exact_sprt", "adaptive MMPP, exact grid-free", "#17becf", "-"),
     ("learned_clean", "learned policy, trained clean", "#d62728", "-"),
     ("learned_matched", "learned policy, retrained on noise", "#ff7f0e", "--"),
 ]
@@ -8635,9 +8634,10 @@ def _balanced_F_T(
     """
     Class-balanced (fidelity, mean run time) for one rule.
 
-    A DISCARD prediction counts as wrong for both classes. Under three
-    actions that makes this the "fidelity if you were not allowed to
-    post-select" number; `three_action_metrics` is what to read instead.
+    A DISCARD prediction counts as wrong for both classes, which is the
+    right convention here: this routine is used where discard is not
+    enabled, and if it ever is, silently crediting an abstention would be
+    the wrong default.
     """
     return (
         balanced_fidelity(labels, preds),
@@ -8660,72 +8660,23 @@ def _cumulative_counts(
     return cum
 
 
-def empirical_count_llr(
-    cal_counts: np.ndarray,
-    cal_labels: np.ndarray,
-    query_counts: np.ndarray,
-    smoothing: float = 0.5,
-) -> np.ndarray:
-    """
-    log P(count | NV-) - log P(count | NV0), estimated from calibration.
-
-    A bare count threshold has no posterior, so it cannot express a
-    three-action decision: `decide` needs to know how confident the
-    statistic is, not just which side of a line it fell. Converting the
-    count to its own empirical LLR gives every rule in the comparison the
-    same interface -- map your statistic to an LLR, then let the costs place
-    the thresholds -- so the two-action and three-action columns differ in
-    the ACTION SET and nothing else.
-
-    Laplace smoothing keeps an unobserved count finite rather than +-inf,
-    which matters in the tails where a three-action rule wants to be
-    confident.
-    """
-    cal_counts = np.asarray(cal_counts, dtype=int)
-    query_counts = np.asarray(query_counts, dtype=int)
-    cal_labels = np.asarray(cal_labels, dtype=int)
-    n = int(max(cal_counts.max(initial=0), query_counts.max(initial=0))) + 1
-
-    h0 = np.bincount(cal_counts[cal_labels == 0], minlength=n).astype(float)
-    h1 = np.bincount(cal_counts[cal_labels == 1], minlength=n).astype(float)
-    h0 = h0[:n] + smoothing
-    h1 = h1[:n] + smoothing
-
-    table = np.log(h0 / h0.sum()) - np.log(h1 / h1.sum())
-    return table[np.clip(query_counts, 0, n - 1)]
-
-
-def _decide_llr(llr: np.ndarray, econ: Economics, cutoff: float) -> np.ndarray:
-    """Three-way by cost if discard is on, else a plain cutoff."""
-    if econ.discard_allowed:
-        return decide(llr, econ)
-    return (np.asarray(llr, dtype=float) < float(cutoff)).astype(int)
-
-
 def _method_risks(
     cal_shots: Sequence[np.ndarray],
     cal_paths: FilterPaths,
-    cal_packed: PaddedRecords,
     test_shots: Sequence[np.ndarray],
     test_paths: FilterPaths,
-    test_packed: PaddedRecords,
     econ: Economics,
-    deadlines_us: Sequence[float],
-    policies: dict,
+    policies: dict[str, list[np.ndarray]],
 ) -> dict:
     """
-    Every rule in this file, on one condition, under one action set.
+    Every rule in this file, on one condition, in Bayes risk.
 
-    Each parametric rule is tuned on the CALIBRATION data at this noise
-    level and scored on test, so no method is handicapped by the noise being
-    unknown to its tuner and none is scored in sample. The learned policies
-    arrive already fitted, which is what lets the caller pass both a
-    clean-trained and a matched retrain.
-
-    Called once per action set. With `econ.discard_allowed` every rule gets
-    the cost-derived band instead of a single cutoff, including the
-    count-based ones -- see `empirical_count_llr` for how a count acquires a
-    posterior to band.
+    Each parametric rule is tuned on the CALIBRATION paths at this noise
+    level and scored on the test paths, so no method is handicapped by the
+    noise being unknown to its tuner and none is scored in sample. The
+    learned policies are passed in already fitted -- see `policies` -- which
+    is what lets the same routine score both the clean-trained one (the naive
+    deployment case) and a matched retrain.
     """
     labels = np.asarray(test_paths.labels, dtype=int)
     cal_labels = np.asarray(cal_paths.labels, dtype=int)
@@ -8737,54 +8688,36 @@ def _method_risks(
     test_cum = _cumulative_counts(test_shots, t_us)
     out: dict = {}
 
-    def _record(tag, stop_us, preds, **extra):
+    def _record(tag, stop_us, preds):
         F, T = _balanced_F_T(stop_us, preds, labels)
         out[tag] = {
             "risk": bayes_risk(stop_us, preds, labels, econ),
             "F": F,
             "T": T,
-            "discard_rate": float(
-                0.5
-                * (
-                    (preds[labels == 0] == DISCARD).mean()
-                    + (preds[labels == 1] == DISCARD).mean()
-                )
-            ),
-            **extra,
         }
 
     # ---- 1. fixed-time count threshold ------------------------------------
     best = None
     for j in range(1, n_steps + 1):
-        llr_c = empirical_count_llr(cal_cum[:, j], cal_labels, cal_cum[:, j])
-        cut = (
-            0.0
-            if econ.discard_allowed
-            else optimize_scalar_cutoff(llr_c, cal_labels)[0]
-        )
-        pred_c = _decide_llr(llr_c, econ, cut)
+        n_th, _ = optimize_count_threshold(cal_cum[:, j], cal_labels)
+        pred_c = np.where(cal_cum[:, j] >= n_th, 0, 1)
         r = bayes_risk(
             np.full(cal_paths.n_paths, t_us[j]), pred_c, cal_labels, econ
         )
         if best is None or r < best[0]:
-            best = (r, j, float(cut))
-    _, j_thr, cut_thr = best
-    llr_t = empirical_count_llr(
-        cal_cum[:, j_thr], cal_labels, test_cum[:, j_thr]
-    )
+            best = (r, j, int(n_th))
+    _, j_thr, n_thr = best
     _record(
         "threshold",
         np.full(test_paths.n_paths, t_us[j_thr]),
-        _decide_llr(llr_t, econ, cut_thr),
-        t_R_us=float(t_us[j_thr]),
+        np.where(test_cum[:, j_thr] >= n_thr, 0, 1),
     )
 
     # ---- 2, 3. adaptive count, and the same stop times read with the LLR --
     # Methods 2 and 3 share their stopping rule exactly, so the pair isolates
     # the decision statistic here just as it does elsewhere in this file.
     max_n = int(np.percentile(cal_cum[:, -1], 99)) + 1
-    step = max(1, n_steps // 24)
-    deadline_ks = list(range(step, n_steps + 1, step))
+    deadline_ks = list(range(max(1, n_steps // 24), n_steps + 1, max(1, n_steps // 24)))
     best_c = best_f = None
     for n_up in range(1, max_n + 1):
         reach_c = cal_cum >= n_up
@@ -8792,77 +8725,44 @@ def _method_risks(
         for dl in deadline_ks:
             kk = np.minimum(k_c, dl)
             st = t_us[kk]
-
-            cnt_c = cal_cum[rows_c, kk]
-            lc = empirical_count_llr(cnt_c, cal_labels, cnt_c)
-            cut_c = (
-                0.0
-                if econ.discard_allowed
-                else optimize_scalar_cutoff(lc, cal_labels)[0]
+            r_c = bayes_risk(
+                st, (cal_cum[rows_c, kk] < n_up).astype(int), cal_labels, econ
             )
-            r_c = bayes_risk(st, _decide_llr(lc, econ, cut_c), cal_labels, econ)
             if best_c is None or r_c < best_c[0]:
-                best_c = (r_c, n_up, dl, float(cut_c))
-
-            lf = cal_paths.llr[rows_c, kk]
-            cut_f = (
-                0.0
-                if econ.discard_allowed
-                else optimize_scalar_cutoff(lf, cal_labels)[0]
+                best_c = (r_c, n_up, dl)
+            # the LLR read at the same instants needs its own cutoff, fitted
+            # on calibration exactly as the count threshold is
+            llr_c = cal_paths.llr[rows_c, kk]
+            cut, _ = optimize_scalar_cutoff(llr_c, cal_labels)
+            r_f = bayes_risk(
+                st, (llr_c < cut).astype(int), cal_labels, econ
             )
-            r_f = bayes_risk(st, _decide_llr(lf, econ, cut_f), cal_labels, econ)
             if best_f is None or r_f < best_f[0]:
-                best_f = (r_f, n_up, dl, float(cut_f))
+                best_f = (r_f, n_up, dl, float(cut))
 
     for tag, b in (("adaptive_count", best_c), ("fixed_count_mmpp", best_f)):
-        n_up, dl, cut = b[1], b[2], b[3]
+        n_up, dl = b[1], b[2]
         reach_t = test_cum >= n_up
         k_t = np.minimum(
             np.where(reach_t.any(axis=1), reach_t.argmax(axis=1), n_steps), dl
         )
         if tag == "adaptive_count":
-            cnt_cal = cal_cum[
-                rows_c,
-                np.minimum(
-                    np.where(
-                        (cal_cum >= n_up).any(axis=1),
-                        (cal_cum >= n_up).argmax(axis=1),
-                        n_steps,
-                    ),
-                    dl,
-                ),
-            ]
-            stat = empirical_count_llr(
-                cnt_cal, cal_labels, test_cum[rows_t, k_t]
-            )
+            preds = (test_cum[rows_t, k_t] < n_up).astype(int)
         else:
-            stat = test_paths.llr[rows_t, k_t]
-        _record(tag, t_us[k_t], _decide_llr(stat, econ, cut), n_up=int(n_up))
+            preds = (test_paths.llr[rows_t, k_t] < b[3]).astype(int)
+        _record(tag, t_us[k_t], preds)
 
-    # ---- 4, 5. adaptive MMPP SPRT on the epoch grid, without and with the
-    #            exhaustion exit ----------------------------------------------
+    # ---- 4, 5. adaptive MMPP SPRT, without and with the exhaustion exit ---
     for tag, eps in (("mmpp_sprt", 0.0), ("mmpp_sprt_exh", EXHAUSTION_EPS)):
         b = best_constant_boundary(cal_paths, econ, eps)
-        st, pr = sprt_on_epochs(test_paths, b["L"], b["offset"], eps, None, econ)
-        _record(tag, st, pr, L=b["L"], offset=b["offset"])
+        st, pr = sprt_on_epochs(
+            test_paths, b["L"], b["offset"], eps, None, econ
+        )
+        _record(tag, st, pr)
+        out[tag]["L"] = b["L"]
+        out[tag]["offset"] = b["offset"]
 
-    # ---- 6. the exact grid-free boundary ----------------------------------
-    # Carried because the epoch grid costs the boundary rule real time -- at
-    # the moderate point 18.4 us against 13.0 us -- and leaving it out once
-    # overstated the learned policy's advantage by roughly threefold.
-    bx = best_exact_boundary(
-        cal_packed, cal_labels, econ, deadlines_us, EXHAUSTION_EPS
-    )
-    st_x, pr_x = run_sprt(
-        test_packed, bx["L"], bx["offset"], bx["deadline_us"],
-        EXHAUSTION_EPS, econ,
-    )
-    _record(
-        "exact_sprt", st_x, pr_x,
-        L=bx["L"], offset=bx["offset"], deadline_us=bx["deadline_us"],
-    )
-
-    # ---- 7. the learned policies ------------------------------------------
+    # ---- 6. the learned policies ------------------------------------------
     for tag, coeffs in policies.items():
         st, pr, _ = apply_stopping_rule(test_paths, coeffs, econ)
         _record(tag, st, pr)
@@ -8878,24 +8778,13 @@ def run_noise_risk_comparison(
     kind: str = "ou",
     a_over_c: float = 500.0,
     n_epochs: int = N_EPOCHS_DEFAULT,
-    cost_discard: float = 0.15,
 ) -> dict:
     """
     Sweep the CORRELATION TIME of multiplicative rate noise, in Bayes risk.
 
-    Every rule is evaluated under BOTH action sets on identical shots:
-
-        two actions    declare NV- or declare NV0
-        three actions  the same plus abandon the shot, at `cost_discard`
-
-    so the pair isolates what the third action is worth, and whether that
-    changes under noise. Everything else -- the shots, the filter, the
-    tuning protocol -- is held fixed between the two.
-
     Every parametric rule is re-tuned on calibration data at each noise
-    level AND under each action set, so none is handicapped by the noise or
-    the action set being unknown to its tuner. The learned policy is
-    reported twice:
+    level, so none is handicapped by the noise being unknown to its tuner.
+    The learned policy is reported twice:
 
         learned_clean    coefficients fitted once on noiseless paths, the
                          naive deployment case and the least favourable
@@ -8918,14 +8807,7 @@ def run_noise_risk_comparison(
     spec = build_no_click_spectral(filter_params)
     reg = regime_summary(params)
     gamma_tot = reg["gamma_tot_khz"]
-    econ2 = Economics(cost_per_us=1.0 / float(a_over_c))
-    econ3 = Economics(
-        cost_per_us=1.0 / float(a_over_c), cost_discard=float(cost_discard)
-    )
-    econ3.validate()
-    ACTION_SETS = (("two", econ2), ("three", econ3))
-    t_floor_us = time_grid_floor_us(params, horizon_us)
-    deadlines_us = np.geomspace(4.0 * t_floor_us, horizon_us, cfg.n_deadlines)
+    econ = Economics(cost_per_us=1.0 / float(a_over_c))
 
     if cfg.verbose:
         print("\n" + "=" * 78)
@@ -8939,11 +8821,6 @@ def run_noise_risk_comparison(
             f"  sigma = {sigma}, modulator = {kind}, "
             f"a/c = {a_over_c:.0f} us, photon order "
             f"{NOISE_PHOTON_ORDER:.2f}"
-        )
-        lo3, hi3 = discard_thresholds(econ3)
-        print(
-            f"  action sets: two, and three with w = {cost_discard:g} "
-            f"(band {lo3:+.2f} to {hi3:+.2f})"
         )
         print("=" * 78)
 
@@ -8961,31 +8838,16 @@ def run_noise_risk_comparison(
         # The FILTER is always the nominal one: rate noise is exactly the
         # error a calibrated boundary cannot absorb, so handing the filter
         # the realised modulation would measure a different question.
-        return {
-            "cal_shots": cal_s,
-            "cal_paths": filter_on_grid(
-                cal_s, cal_l, filter_params, horizon_us, dt_us, spec
-            ),
-            "cal_packed": pack_records(
-                build_records(cal_s, horizon_us, filter_params, spec), spec
-            ),
-            "test_shots": te_s,
-            "test_paths": filter_on_grid(
-                te_s, te_l, filter_params, horizon_us, dt_us, spec
-            ),
-            "test_packed": pack_records(
-                build_records(te_s, horizon_us, filter_params, spec), spec
-            ),
-        }
+        return (
+            cal_s,
+            filter_on_grid(cal_s, cal_l, filter_params, horizon_us, dt_us, spec),
+            te_s,
+            filter_on_grid(te_s, te_l, filter_params, horizon_us, dt_us, spec),
+        )
 
-    # The clean-trained policy is fitted once PER ACTION SET: the third
-    # action changes the terminal payoff, so it changes the stopping rule
-    # too, and reusing the two-action coefficients would understate it.
-    clean = _paths(NOISE_OFF, seed)
-    coeffs_clean = {
-        name: fit_stopping_rule(clean["cal_paths"], e)
-        for name, e in ACTION_SETS
-    }
+    # the clean-trained policy, fitted once
+    clean_cal_s, clean_cal, clean_te_s, clean_te = _paths(NOISE_OFF, seed)
+    coeffs_clean = fit_stopping_rule(clean_cal, econ)
 
     conditions: list[tuple[str, RateNoise | None]] = [("clean", None)]
     for tau in tau_c_ms:
@@ -9003,27 +8865,22 @@ def run_noise_risk_comparison(
 
     results = []
     for j, (tag, nz) in enumerate(conditions):
-        d = clean if nz is None else _paths(nz, seed + 500 + 37 * j)
-        by_actions = {}
-        for name, e in ACTION_SETS:
-            by_actions[name] = _method_risks(
-                d["cal_shots"], d["cal_paths"], d["cal_packed"],
-                d["test_shots"], d["test_paths"], d["test_packed"],
-                e, deadlines_us,
-                {
-                    "learned_clean": coeffs_clean[name],
-                    "learned_matched": fit_stopping_rule(d["cal_paths"], e),
-                },
-            )
+        if nz is None:
+            cal_s, cal_p, te_s, te_p = clean_cal_s, clean_cal, clean_te_s, clean_te
+        else:
+            cal_s, cal_p, te_s, te_p = _paths(nz, seed + 500 + 37 * j)
+        policies = {
+            "learned_clean": coeffs_clean,
+            "learned_matched": fit_stopping_rule(cal_p, econ),
+        }
+        m = _method_risks(cal_s, cal_p, te_s, te_p, econ, policies)
         results.append(
             {
                 "tag": tag,
                 "sigma": 0.0 if nz is None else float(nz.sigma),
                 "tau_c_ms": np.nan if nz is None else float(nz.tau_c_ms),
                 "gamma_tau": 0.0 if nz is None else gamma_tot * nz.tau_c_ms,
-                "methods": by_actions["two"],          # back-compat alias
-                "two": by_actions["two"],
-                "three": by_actions["three"],
+                "methods": m,
             }
         )
         if cfg.verbose:
@@ -9036,50 +8893,22 @@ def run_noise_risk_comparison(
         hdr = f"\n{'method':<36}" + "".join(
             f"{r['tag'][:9]:>10}" for r in results
         )
-        for aset, title in (
-            ("two", "TWO actions -- Bayes risk (lower is better)"),
-            ("three", f"THREE actions, w = {cost_discard:g} -- Bayes risk"),
-        ):
-            print(f"\n{title}{hdr}")
-            for key, name, _, _ in METHOD_ORDER:
-                print(
-                    f"{name:<36}"
-                    + "".join(f"{r[aset][key]['risk']:10.4f}" for r in results)
-                )
-
-        print(f"\nwhat the THIRD ACTION buys (+ = the third action is better){hdr}")
+        print("\nBayes risk (lower is better)" + hdr)
         for key, name, _, _ in METHOD_ORDER:
             print(
                 f"{name:<36}"
-                + "".join(
-                    f"{100 * (r['two'][key]['risk'] - r['three'][key]['risk']) / r['two'][key]['risk']:9.1f}%"
-                    for r in results
-                )
+                + "".join(f"{r['methods'][key]['risk']:10.4f}" for r in results)
             )
-
-        print(f"\nshots abandoned by the three-action rule{hdr}")
+        print(f"\nrelative to the clean case (+ = worse){hdr}")
         for key, name, _, _ in METHOD_ORDER:
+            base = results[0]["methods"][key]["risk"]
             print(
                 f"{name:<36}"
                 + "".join(
-                    f"{100 * r['three'][key]['discard_rate']:9.0f}%"
+                    f"{100 * (r['methods'][key]['risk'] - base) / base:9.1f}%"
                     for r in results
                 )
             )
-
-        for aset in ("two", "three"):
-            print(
-                f"\n{aset} actions, relative to the clean case (+ = worse){hdr}"
-            )
-            for key, name, _, _ in METHOD_ORDER:
-                base = results[0][aset][key]["risk"]
-                print(
-                    f"{name:<36}"
-                    + "".join(
-                        f"{100 * (r[aset][key]['risk'] - base) / base:9.1f}%"
-                        for r in results
-                    )
-                )
         print(f"\n  total {time.time() - t0:.0f} s")
 
     return {
@@ -9100,8 +8929,6 @@ def run_noise_risk_comparison(
         "sigma": float(sigma),
         "kind": kind,
         "a_over_c": float(a_over_c),
-        "cost_discard": float(cost_discard),
-        "discard_band": discard_thresholds(econ3),
         "gamma_tot_khz": float(gamma_tot),
         "results": results,
         "module_version": MODULE_VERSION,
@@ -9117,16 +8944,12 @@ _NOISE_RISK_CSV_COLUMNS = [
     "sigma",
     "kind",
     "a_over_c",
-    "cost_discard",
     "condition",
     "tau_c_ms",
     "gamma_tot_tau_c",
     "method",
-    "action_set",
     "risk",
     "risk_vs_clean_pct",
-    "third_action_gain_pct",
-    "discard_rate",
     "F",
     "T_us",
 ]
@@ -9137,7 +8960,6 @@ def export_noise_risk_csv(
     spec: SweepSpec,
     directory: Path,
 ) -> list[Path]:
-    """One row per (condition, method, action set), with the paired gain."""
     fp = directory / "noise_risk.csv"
     with open(fp, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=_NOISE_RISK_CSV_COLUMNS)
@@ -9152,49 +8974,33 @@ def export_noise_risk_csv(
                 "sigma": res["sigma"],
                 "kind": res["kind"],
                 "a_over_c": res["a_over_c"],
-                "cost_discard": res["cost_discard"],
             }
-            clean = res["results"][0]
+            clean = res["results"][0]["methods"]
             for cond in res["results"]:
                 for key, _, _, _ in METHOD_ORDER:
-                    gain = (
-                        100.0
-                        * (cond["two"][key]["risk"] - cond["three"][key]["risk"])
-                        / cond["two"][key]["risk"]
+                    m = cond["methods"][key]
+                    w.writerow(
+                        {
+                            **base,
+                            "condition": cond["tag"],
+                            "tau_c_ms": cond["tau_c_ms"],
+                            "gamma_tot_tau_c": cond["gamma_tau"],
+                            "method": key,
+                            "risk": m["risk"],
+                            "risk_vs_clean_pct": (
+                                100.0
+                                * (m["risk"] - clean[key]["risk"])
+                                / clean[key]["risk"]
+                            ),
+                            "F": m["F"],
+                            "T_us": m["T"],
+                        }
                     )
-                    for aset in ("two", "three"):
-                        m = cond[aset][key]
-                        w.writerow(
-                            {
-                                **base,
-                                "condition": cond["tag"],
-                                "tau_c_ms": cond["tau_c_ms"],
-                                "gamma_tot_tau_c": cond["gamma_tau"],
-                                "method": key,
-                                "action_set": aset,
-                                "risk": m["risk"],
-                                "risk_vs_clean_pct": (
-                                    100.0
-                                    * (m["risk"] - clean[aset][key]["risk"])
-                                    / clean[aset][key]["risk"]
-                                ),
-                                "third_action_gain_pct": gain,
-                                "discard_rate": m["discard_rate"],
-                                "F": m["F"],
-                                "T_us": m["T"],
-                            }
-                        )
     return [fp]
 
 
 def plot_noise_risk(result: dict, save_path: str | None = None):
-    """
-    Six panels, laid out so the two action sets read against each other.
-
-    Top row is the level (risk under two actions, under three, and the gap
-    between them); bottom row is the response to noise (degradation under
-    each action set, and how much gets abandoned to achieve it).
-    """
+    """Risk, degradation, and whether the learned rule keeps its edge."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -9203,85 +9009,67 @@ def plot_noise_risk(result: dict, save_path: str | None = None):
     rr = result["results"]
     x = np.arange(len(rr))
     ticks = [r["tag"] for r in rr]
-    w = result["cost_discard"]
-    fig, ax = plt.subplots(2, 3, figsize=(19.0, 9.6))
+    fig, ax = plt.subplots(1, 3, figsize=(17.0, 5.2))
 
-    def _style(p, ylabel, title, rotate=True):
-        p.set_xticks(x)
-        p.set_xticklabels(ticks, rotation=30, ha="right", fontsize=8)
-        p.set_ylabel(ylabel, fontsize=9)
-        p.set_title(title, fontsize=10.5)
-        p.grid(alpha=0.25)
-
-    # (a), (b) the level under each action set, on a shared y scale so the
-    # panels can be compared by eye rather than only by the gap panel.
-    lo = min(
-        r[a][k]["risk"] for r in rr for a in ("two", "three")
-        for k, _, _, _ in METHOD_ORDER
+    p = ax[0]
+    for key, name, col, ls in METHOD_ORDER:
+        p.plot(x, [r["methods"][key]["risk"] for r in rr], ls, marker="o",
+               color=col, ms=4, label=name)
+    p.set_xticks(x)
+    p.set_xticklabels(ticks, rotation=30, ha="right")
+    p.set_yscale("log")
+    p.set_ylabel("Bayes risk")
+    p.set_title(
+        f"(a) risk vs correlation time  (sigma = {result['sigma']})",
+        fontsize=10.5,
     )
-    hi = max(
-        r[a][k]["risk"] for r in rr for a in ("two", "three")
-        for k, _, _, _ in METHOD_ORDER
-    )
-    for col, (aset, label) in enumerate(
-        (("two", "two actions"), ("three", f"three actions, w = {w:g}"))
-    ):
-        p = ax[0, col]
-        for key, name, c, ls in METHOD_ORDER:
-            p.plot(x, [r[aset][key]["risk"] for r in rr], ls, marker="o",
-                   color=c, ms=4, label=name)
-        p.set_yscale("log")
-        p.set_ylim(0.9 * lo, 1.1 * hi)
-        _style(p, "Bayes risk", f"({'ab'[col]}) risk -- {label}")
-        if col == 0:
-            p.legend(fontsize=7)
+    p.grid(alpha=0.25, which="both")
+    p.legend(fontsize=7.5)
 
-    # (c) the paired comparison: what the third action is worth, per method
-    p = ax[0, 2]
-    for key, name, c, ls in METHOD_ORDER:
-        p.plot(
-            x,
-            [
-                100 * (r["two"][key]["risk"] - r["three"][key]["risk"])
-                / r["two"][key]["risk"]
-                for r in rr
-            ],
-            ls, marker="o", color=c, ms=4, label=name,
-        )
-    p.axhline(0, color="k", lw=0.9)
-    _style(p, "risk reduction from the third action (%)",
-           "(c) what abandoning shots buys")
+    p = ax[1]
+    for key, name, col, ls in METHOD_ORDER:
+        b = rr[0]["methods"][key]["risk"]
+        p.plot(x, [100 * (r["methods"][key]["risk"] - b) / b for r in rr], ls,
+               marker="o", color=col, ms=4, label=name)
+    p.axhline(0, color="k", lw=0.8)
+    p.set_xticks(x)
+    p.set_xticklabels(ticks, rotation=30, ha="right")
+    p.set_ylabel("risk increase vs clean (%)")
+    p.set_title("(b) degradation -- who is fragile", fontsize=10.5)
+    p.grid(alpha=0.25)
 
-    # (d), (e) fragility under each action set -- does the extra action
-    # change WHO breaks, or only the level?
-    for col, (aset, label) in enumerate(
-        (("two", "two actions"), ("three", f"three actions, w = {w:g}"))
-    ):
-        p = ax[1, col]
-        for key, name, c, ls in METHOD_ORDER:
-            b = rr[0][aset][key]["risk"]
-            p.plot(x, [100 * (r[aset][key]["risk"] - b) / b for r in rr], ls,
-                   marker="o", color=c, ms=4, label=name)
-        p.axhline(0, color="k", lw=0.9)
-        _style(p, "risk increase vs clean (%)",
-               f"({'de'[col]}) degradation -- {label}")
+    p = ax[2]
+    adv = [
+        100
+        * (r["methods"]["mmpp_sprt"]["risk"] - r["methods"]["learned_clean"]["risk"])
+        / r["methods"]["mmpp_sprt"]["risk"]
+        for r in rr
+    ]
+    adv_m = [
+        100
+        * (r["methods"]["mmpp_sprt"]["risk"] - r["methods"]["learned_matched"]["risk"])
+        / r["methods"]["mmpp_sprt"]["risk"]
+        for r in rr
+    ]
+    p.bar(x - 0.2, adv, width=0.4, color="#d62728", alpha=0.85,
+          label="trained clean")
+    p.bar(x + 0.2, adv_m, width=0.4, color="#ff7f0e", alpha=0.85,
+          label="retrained on noise")
+    p.axhline(0, color="k", lw=0.8)
+    p.set_xticks(x)
+    p.set_xticklabels(ticks, rotation=30, ha="right")
+    p.set_ylabel("learned advantage over constant boundary (%)")
+    p.set_title("(c) does the new scheme keep its edge", fontsize=10.5)
+    p.grid(alpha=0.25, axis="y")
+    p.legend(fontsize=8)
 
-    # (f) the price paid for panel (c)
-    p = ax[1, 2]
-    for key, name, c, ls in METHOD_ORDER:
-        p.plot(x, [100 * r["three"][key]["discard_rate"] for r in rr], ls,
-               marker="o", color=c, ms=4, label=name)
-    _style(p, "shots abandoned (%)", "(f) the price of (c)")
-
-    band = result.get("discard_band", (np.nan, np.nan))
     fig.suptitle(
-        f"Two actions against three, under correlated rate noise  |  "
+        f"Correlated rate noise, all methods on identical shots  |  "
         f"{result['label']}  |  sigma = {result['sigma']}, "
-        f"{result['kind']} modulator, a/c = {result['a_over_c']:.0f} us, "
-        f"w = {w:g} (band {band[0]:+.2f} to {band[1]:+.2f})",
+        f"{result['kind']} modulator, a/c = {result['a_over_c']:.0f} us",
         fontsize=11.5,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
@@ -9308,7 +9096,6 @@ def cmd_noiserisk(args: argparse.Namespace) -> int:
             kind=args.noise_kind_only,
             a_over_c=args.a_over_c,
             n_epochs=args.n_epochs,
-            cost_discard=args.cost_discard,
         )
         res["point_index"] = i
         results.append(res)
@@ -9511,14 +9298,6 @@ def build_parser() -> argparse.ArgumentParser:
              "which sets the per-run noise for the ordinary sweeps)",
     )
     sp.add_argument("--a-over-c", type=float, default=500.0)
-    sp.add_argument(
-        "--cost-discard", type=float, default=0.15,
-        help=(
-            "cost of abandoning a shot, for the three-action column. Must "
-            "lie in (0, a b / (a + b)) = (0, 0.5) at the default costs, or "
-            "the band is empty and the third action never fires"
-        ),
-    )
     sp.add_argument("--no-plot", action="store_true")
     sp.set_defaults(func=cmd_noiserisk)
 
