@@ -485,6 +485,62 @@ readout.
 
 Caveat: this is one operating point (5.437 µW, η = 1, 637 µs horizon).
 
+## Correlated rate noise, priced in one currency
+
+The four `noise_*` sweeps above report the matched-fidelity speedup, which
+compares two methods at a time and cannot price a rule that stops earlier at
+lower accuracy. `noiserisk` puts all six into the **Bayes risk** instead and
+sweeps the *correlation time* — the axis Spethmann et al. identify as the
+failure mode for HMM readout — rather than the amplitude. At σ = 0.3, a/c =
+500 µs, OU modulator, everything re-tuned on calibration at each noise level.
+
+**This refines the "insensitive to rate noise" result rather than
+contradicting it.** In the speedup currency both numerator and denominator
+move together and the ratio stays flat. In the risk currency you can see they
+are not moving together at all:
+
+| method (moderate point) | risk increase vs clean, range over τ_c |
+|---|---|
+| fixed-time count threshold | **−5.0% to +0.6%** — immune |
+| adaptive count SPRT | +3.2% to +8.5% |
+| fixed-count MMPP | +2.3% to +6.9% |
+| + exhaustion exit | +3.9% to +10.2% |
+| adaptive MMPP, constant boundary | +7.1% to **+16.1%** |
+| learned optimal stopping | +9.0% to +15.4% |
+
+**Fragility tracks how much of the photon arrival *pattern* a rule uses.** The
+fixed-time count threshold integrates the rate fluctuation away over its
+window and recalibrates its threshold, so it loses nothing. Everything that
+reads arrival times pays, and the two fully adaptive rules pay most. That is
+the honest counterpoint the speedup currency hides, because there the
+threshold is the denominator.
+
+**The damage peaks where the theory says it should.** Across τ_c the
+degradation is largest at Γ_tot·τ_c ≈ 1–2 (τ_c = 0.1–0.25 ms against
+1/Γ_tot = 106 µs) and smaller at both ends — fast noise averages out within a
+dwell, slow noise is quasi-static and a recalibrated boundary absorbs it.
+
+**The ranking never changes.** Relative fragility does not overturn the
+ordering: the learned policy degrades most in percentage terms but from a
+better starting point, and stays best at 13 of 18 (point, τ_c) conditions —
+including all six at the moderate point, where it runs 0.099–0.102 against
+the constant boundary's 0.116–0.126. The five exceptions are all at the
+sparse point, where every method is within 0.005 of every other and the whole
+comparison is noise.
+
+**Sparsity sets the exposure.** At the sparse point (2.74 photons per bright
+dwell) nothing happens to anybody — 0.2% to 2.6% across all methods and all
+correlation times. There is barely any timing information to corrupt. At high
+flux the spread is 1–10%, at the moderate point 0–16%.
+
+**Retraining on the noise buys nothing.** The learned policy is reported
+twice, fitted on clean paths (the naive deployment case) and refitted on
+matched noisy calibration paths. They agree to within fitting noise at every
+sample size tested, from 400 to 3200 calibration shots per state (0.0994 vs
+0.0992 at 3200). So the degradation above is damage from the noise itself,
+not from training on the wrong distribution — a distinction a single
+clean-trained row would have conflated.
+
 ## Bootstrap intervals
 
 | band | median 95% CI width on the adaptive-MMPP speedup |
@@ -525,6 +581,9 @@ results/demo/ideal/optimal/
 results/demo/ideal/discard/
     discard_*.png                       the four-panel three-action figure
     discard_sweep.csv                   risk, retention, accuracy and yield vs w
+results/demo/ideal/noiserisk/
+    noiserisk_*.png                     risk, degradation and the learned edge
+    noise_risk.csv                      every method at every correlation time
 ```
 
 Detector directories: `ideal`, `det_nonpar_dt50ns_ap0.01_tau100ns`
@@ -567,12 +626,13 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 83 checks
+python adaptive_charge_state_master.py validate                  # 84 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py optimal demo --out results
 python adaptive_charge_state_master.py discard demo --out results
+python adaptive_charge_state_master.py noiserisk demo --out results
 python results/analysis.py
 ```
 

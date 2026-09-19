@@ -90,6 +90,25 @@ merit — abstain on everything and it goes to 1. So `three_action_metrics`
 reports the Bayes risk as primary, accuracy only alongside the discard rate
 that bought it, and retained shots per millisecond as the throughput number.
 
+## Correlated rate noise in one currency
+
+`noiserisk` compares all six rules in Bayes risk while sweeping the noise
+*correlation time*, which the `noise_*` sweeps cannot do — they report the
+matched-fidelity speedup, a two-method ratio in which both sides move
+together.
+
+```bash
+python adaptive_charge_state_master.py noiserisk demo
+python adaptive_charge_state_master.py noiserisk demo --sigma 0.2 --noise-kind-only telegraph
+```
+
+Every rule is re-tuned on calibration at each noise level, and the learned
+policy is reported twice — trained clean and retrained on matched noise — so
+damage from the noise is separated from damage from training on the wrong
+distribution. Result: the fixed-time threshold is immune, everything that
+reads arrival times pays, the damage peaks at Γ_tot·τ_c ≈ 1, and the ranking
+never changes.
+
 ## Experiments
 
 | key | what it sweeps |
@@ -118,7 +137,7 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 83 numerical checks
+python adaptive_charge_state_master.py validate          # 84 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
@@ -126,6 +145,7 @@ python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
 python adaptive_charge_state_master.py optimal demo      # the Bayes-optimal rule
 python adaptive_charge_state_master.py discard demo      # add the abandon action
+python adaptive_charge_state_master.py noiserisk demo    # all six under rate noise
 python results/analysis.py                              # cross-experiment tables
 ```
 
@@ -186,6 +206,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 83/83 on both.
+active, every saved result records it, and `validate` passes 84/84 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.
