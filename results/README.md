@@ -186,11 +186,18 @@ currency at the time because `run_sprt` took no economics. It can now, and
 against the best of the three boundary variants the advantage largely
 evaporates:
 
-| point | learned vs *best* boundary | wins |
-|---|---|---|
-| high flux | median **+0.4%**, range [−3.8%, +4.5%] | 14 of 24 a/c |
-| moderate | median **−1.2%**, range [−5.4%, +9.5%] | 9 of 24 a/c |
-| sparse | median **−0.0%**, range [−0.9%, +56.1%] | 12 of 24 a/c |
+| point | learned vs *best* boundary | resolved wins | resolved losses | ties |
+|---|---|---|---|---|
+| high flux | median **+0.4%**, range [−3.8%, +4.5%] | 5 | 5 | 14 |
+| moderate | median **−1.2%**, range [−5.4%, +9.5%] | 7 | 9 | 8 |
+| sparse | median **−0.0%**, range [−0.9%, +56.1%] | 8 | 5 | 11 |
+
+Each row is 24 values of a/c, paired-bootstrapped over 7200 test shots per
+state. The wins and losses are close to balanced at every point, and a
+third to a half of the settings cannot be called at all — which is what a
+wash looks like when you put an interval on it. An earlier version of this
+table counted only point-estimate wins (14, 9 and 12 of 24) and so made
+the comparison look more decided in both directions than it is.
 
 At the moderate point the learned policy is *behind* the exact boundary at
 most values of a/c. Where it leads is a narrow band around a/c ≈ 200–1300
@@ -256,6 +263,16 @@ across a tuning sweep it changes *which* boundary is cheapest — a wider,
 more accurate one becomes affordable once indecisive shots stop paying the
 full deadline — so accuracy moves too. Median risk reduction is +0.8% at the
 moderate point, +0.1% at high flux, 0.0% at sparse.
+
+Those medians are small enough to deserve an interval, and they get one.
+Across all **72** (point, a/c) settings the exit's risk change is **never
+negative** — 31 are exactly zero and the other 41 are positive, of which
+**36 are resolved** by the paired bootstrap. So "free" is not a rounding
+artifact: at no economics tested does taking the exit cost anything, and
+where it gains, the gain is almost always larger than shot noise. The
+gains are concentrated at the two denser points (resolved at 15 and 14 of
+24); at the sparse point most shots deadline before exhausting, so there
+is nothing to collect.
 
 ## The third action: abandoning a shot
 
@@ -568,47 +585,92 @@ contradicting it.** In the speedup currency both numerator and denominator
 move together and the ratio stays flat. In the risk currency you can see they
 are not moving together at all:
 
-| method (moderate point) | risk increase vs clean, range over τ_c |
-|---|---|
-| fixed-time count threshold | **−5.0% to +0.6%** — immune |
-| adaptive count SPRT | +3.2% to +8.5% |
-| fixed-count MMPP | +2.3% to +6.9% |
-| + exhaustion exit | +3.9% to +10.2% |
-| adaptive MMPP, constant boundary | +7.1% to **+16.1%** |
-| learned optimal stopping | +9.0% to +15.4% |
+| method (moderate point) | risk increase vs clean, range over τ_c | resolved |
+|---|---|---|
+| fixed-time count threshold | **−5.0% to +1.4%** — immune | 0 of 5 positive |
+| fixed-count MMPP | +2.3% to +6.9% | 1 of 5 |
+| adaptive count SPRT | +3.5% to +8.5% | 4 of 5 |
+| + exhaustion exit | +3.9% to +10.2% | 4 of 5 |
+| adaptive MMPP, exact grid-free | +3.7% to +11.8% | 4 of 5 |
+| adaptive MMPP, constant boundary | +7.1% to **+16.1%** | **5 of 5** |
+| learned optimal stopping | +9.0% to +15.4% | **5 of 5** |
 
-**Fragility tracks how much of the photon arrival *pattern* a rule uses.** The
-fixed-time count threshold integrates the rate fluctuation away over its
-window and recalibrates its threshold, so it loses nothing. Everything that
-reads arrival times pays, and the two fully adaptive rules pay most. That is
-the honest counterpoint the speedup currency hides, because there the
-threshold is the denominator.
+The "resolved" column is the number of the five noisy conditions whose 95%
+interval excludes zero. These intervals are the **unpaired** kind — clean
+and noisy are separate simulations, so nothing cancels and they are several
+times wider than the rule-vs-rule intervals elsewhere in this file. That
+makes the column a strong statement where it is full: the two fully
+adaptive rules are damaged at every correlation time tested, measured
+against the weakest available yardstick.
+
+**Fragility tracks how much of the photon arrival *pattern* a rule uses.**
+The fixed-time count threshold integrates the rate fluctuation away over
+its window and recalibrates its threshold, so it loses nothing — and this
+is now a statement with teeth rather than a small point estimate: **not one
+of its five degradations is resolvedly positive**, and its single resolved
+cell is an *improvement* (−5.0%). Everything that reads arrival times pays,
+and the two fully adaptive rules pay at every τ_c. That is the honest
+counterpoint the speedup currency hides, because there the threshold is the
+denominator.
+
+The ordering of the column is also the ordering of the claim, which is the
+part that would have been easy to fool oneself about: fixed-count MMPP and
+the fixed-time threshold — the two rules whose *stopping* ignores the
+arrival pattern — are the two with almost nothing resolved, while the two
+whose stopping is driven by it are resolved everywhere.
 
 **The damage peaks where the theory says it should.** Across τ_c the
 degradation is largest at Γ_tot·τ_c ≈ 1–2 (τ_c = 0.1–0.25 ms against
 1/Γ_tot = 106 µs) and smaller at both ends — fast noise averages out within a
 dwell, slow noise is quasi-static and a recalibrated boundary absorbs it.
 
-**The ranking never changes.** Relative fragility does not overturn the
-ordering: the learned policy degrades most in percentage terms but from a
-better starting point, and stays best at 13 of 18 (point, τ_c) conditions —
-including all six at the moderate point, where it runs 0.099–0.102 against
-the constant boundary's 0.116–0.126. The five exceptions are all at the
-sparse point, where every method is within 0.005 of every other and the whole
-comparison is noise.
+**The ranking never changes — and, corrected, was never resolved to begin
+with.** Relative fragility does not overturn the ordering: the learned
+policy degrades most in percentage terms but from a better starting point.
+On point estimates a learned policy is cheapest at 11 of the 18 (point,
+τ_c) conditions (7 clean-trained, 4 retrained) and the exact grid-free
+boundary at 6. An earlier version of this paragraph read that tally as the
+finding and quoted "13 of 18". Paired against the exact boundary, the
+learned policy's lead is resolved in only **3 of 18** conditions (+4.7%
+moderate/clean, +2.3% moderate/τ_c = 1 ms, +2.5% high flux/τ_c = 0.25 ms)
+— and it is resolvedly *behind* in **none**. That is the accurate
+statement: never worse, better in a sixth of conditions, indistinguishable
+in the rest. It is the same wash the two-action optimal-stopping section
+reports, and it survives the noise.
 
 **Sparsity sets the exposure.** At the sparse point (2.74 photons per bright
 dwell) nothing happens to anybody — 0.2% to 2.6% across all methods and all
 correlation times. There is barely any timing information to corrupt. At high
 flux the spread is 1–10%, at the moderate point 0–16%.
 
-**Retraining on the noise buys nothing.** The learned policy is reported
-twice, fitted on clean paths (the naive deployment case) and refitted on
-matched noisy calibration paths. They agree to within fitting noise at every
-sample size tested, from 400 to 3200 calibration shots per state (0.0994 vs
-0.0992 at 3200). So the degradation above is damage from the noise itself,
-not from training on the wrong distribution — a distinction a single
-clean-trained row would have conflated.
+**Retraining on the noise buys nothing, and paired it is slightly
+negative.** The learned policy is reported twice, fitted on clean paths
+(the naive deployment case) and refitted on matched noisy calibration
+paths. Across the 30 non-clean (point, τ_c, action set) comparisons the
+**median gain from retraining is +0.00%**. Paired, 14 are resolved: 5 where
+retraining helps and 9 where it hurts. The largest effects either way are
++2.2% (high flux, τ_c = 1 ms, two actions) and −3.9% (moderate,
+τ_c = 0.05 ms, two actions), and the two largest are both losses.
+
+That is a slightly stronger statement than "no difference", and the sign
+is the interesting part. A matched retrain sees the right distribution but
+through a noisier calibration set, so the regression pays a variance cost
+for a bias it cannot much reduce. At these calibration sizes the variance
+cost wins. The practical reading is the reassuring one: **you do not need
+to characterise your noise to train the policy**, and attempting to may
+cost you a couple of percent.
+
+So the degradation above is damage from the noise itself, not from training
+on the wrong distribution — a distinction a single clean-trained row would
+have conflated.
+
+This also connects to a structural fact `validate` pins separately: the
+policy fit is **label-free**. `fit_stopping_rule` reads the filter path and
+the payoff function and never touches the labels — zeroing, reversing or
+permuting them leaves every epoch's coefficient vector bit-identical. So
+"retraining on noise" is experimentally cheap in the way that matters: it
+needs noisy calibration *paths*, not knowledge of which charge state each
+of them was in. The finding above is that you need not bother anyway.
 
 ### Two actions against three, under noise
 
@@ -630,6 +692,15 @@ At the moderate point, clean condition, sorted by risk:
 | fixed-time count threshold | 0.1243 | 0.0864 | **+30.5%** | 13% |
 | + exhaustion exit | 0.1052 | 0.1002 | +4.7% | 3% |
 | epoch-grid boundary | 0.1085 | 0.1024 | +5.7% | 10% |
+
+Every gain in that column is resolved. Over the full grid — 8 rules × 6
+conditions × 3 points = **144** cells — the paired 95% interval excludes
+zero in **143**, the sole exception being the exhaustion exit at the
+moderate point, τ_c = 0.02 ms (+1.0%). This is the one comparison in the
+file where the effects are far larger than the uncertainty, which is why
+it reads so
+cleanly: the third action is worth tens of percent, while the stopping-rule
+differences it is set against are worth low single digits.
 
 **The third action and adaptive stopping are substitutes, not complements.**
 The gain is largest for the rules with no other way to handle an ambiguous
