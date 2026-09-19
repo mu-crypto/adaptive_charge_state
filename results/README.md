@@ -52,6 +52,9 @@ and locates the minimum.
 | LLR boundary | MMPP LLR | 4 adaptive MMPP SPRT |
 | learned, on (LLR, information gap) | MMPP LLR | 5 optimal stopping |
 
+Method 5 optionally gains a **third action** — abandon the shot — which turns
+the single decision threshold into two and an inconclusive band. See below.
+
 Methods 2 and 3 stop at identical instants — `validate` asserts exact
 equality of their per-shot stop times — so 2 → 3 is a clean read on the
 **decision statistic** with stopping held fixed, and 3 → 4 a clean read on
@@ -234,6 +237,78 @@ across a tuning sweep it changes *which* boundary is cheapest — a wider,
 more accurate one becomes affordable once indecisive shots stop paying the
 full deadline — so accuracy moves too. Median risk reduction is +1.3% at the
 moderate point, +0.3% at high flux, 0.0% at sparse.
+
+## The third action: abandoning a shot
+
+Adding a finite `cost_discard` (w) gives the decision three options instead
+of two. The terminal payoff becomes a max of three linear functions of the
+posterior, so by Remark 4.3 of Ludkovski–Sezer each stopping region is still
+convex, and the decision becomes **two** thresholds with an inconclusive band
+between them:
+
+```
+declare NV0   below   llr = logit(w/a)
+discard       between
+declare NV-   above   llr = logit(1 - w/b)
+```
+
+This is the post-selection experiments already do by hand — except the band
+edges follow from the costs rather than being tuned. Discard is only ever the
+cheapest action when `w < ab/(a+b)`, which at a = b = 1 is **0.5, not 1**; at
+or above that one of the two declarations is cheaper at every posterior and
+the band is empty. `w = inf` reproduces the two-action problem bit-identically,
+which `validate` asserts.
+
+**Balanced fidelity stops being a valid figure of merit here.** Abstain on
+everything and accuracy among retained shots goes to 1. So the Bayes risk,
+which prices the discard explicitly, is primary; accuracy is only ever quoted
+next to the discard rate that bought it; and `yield_per_ms` — retained shots
+per millisecond of readout — is the throughput number, which discarding
+cannot game because the numerator falls with the denominator.
+
+At a/c = 500 µs, 7200 test shots per state, ideal detector:
+
+| point | w | band | discard | accuracy retained | yield/ms | risk |
+|---|---|---|---|---|---|---|
+| high flux | ∞ | two actions | 0% | 0.8906 | 182.3 | 0.1204 |
+| high flux | 0.25 | [−1.10, +1.10] | 14% | 0.9251 | 132.2 | 0.1122 |
+| high flux | 0.15 | [−1.73, +1.73] | **18%** | **0.9316** | 131.0 | 0.0959 |
+| high flux | 0.08 | [−2.44, +2.44] | 70% | 0.9837 | 100.1 | 0.0670 |
+| moderate | ∞ | two actions | 0% | 0.9439 | 69.9 | 0.0847 |
+| moderate | 0.15 | [−1.73, +1.73] | **11%** | **0.9644** | 61.3 | 0.0773 |
+| moderate | 0.08 | [−2.44, +2.44] | 17% | 0.9700 | 57.4 | 0.0675 |
+| sparse | ∞ | two actions | 0% | 0.7735 | 21.9 | 0.3180 |
+| sparse | 0.25 | [−1.10, +1.10] | 93% | 0.9533 | 10.7 | 0.2489 |
+
+(learned policy; the full table with the constant-boundary rule alongside is
+in `results/demo/ideal/discard/discard_sweep.csv`)
+
+**The trade is good where information is plentiful and brutal where it is
+not.** At the moderate point, throwing away 11% of shots buys +0.021 in
+fidelity and costs 12% of throughput. At high flux, 18% buys +0.041. At the
+sparse point nothing happens until w = 0.25 and then it jumps straight to 93%
+discard for +0.18 — there is so little information per shot that the only way
+to be confident is to keep almost nothing. Post-selection is a way to spend
+surplus information, so it pays where there is surplus.
+
+### Two structural results
+
+**Abandoning every shot at t = 0 is always feasible and costs exactly w, so
+no optimal rule can exceed w.** That is the sharpest available check on the
+whole formulation, and it separates the two rules cleanly: the learned policy
+respects it at every discard cost tested, while the tuned constant boundary
+**violates it** at w = 0.04 and 0.02 (risk 0.0424 and 0.0232 against w = 0.04
+and 0.02 at the moderate point). It has no way to express "abandon
+immediately" — it cannot stop before its boundary is crossed. With only two
+actions the boundary rule was merely suboptimal; with three it is
+*inadmissible* at small w, beaten by doing nothing.
+
+**The degenerate solution is real and is flagged, not hidden.** Below
+w ≈ 0.04 the optimal policy is to discard everything: risk w exactly, yield
+zero. That is a correct answer to the question as posed — if a microsecond is
+that expensive relative to an error, do not read out at all — but reporting
+it as a low risk without the zero yield beside it would be meaningless. Rows
+with discard above 99% carry a `degenerate` flag in the CSV.
 
 ## How to read the speedup numbers
 
@@ -435,6 +510,9 @@ results/demo/ideal/optimal/
     optimal_*.png                       the four-panel optimal-stopping figure
     optimal_stopping_risk.csv           Bayes risk against a/c
     optimal_stopping_speedup.csv        matched-fidelity speedups, with CIs
+results/demo/ideal/discard/
+    discard_*.png                       the four-panel three-action figure
+    discard_sweep.csv                   risk, retention, accuracy and yield vs w
 ```
 
 Detector directories: `ideal`, `det_nonpar_dt50ns_ap0.01_tau100ns`
@@ -477,11 +555,12 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 70 checks
+python adaptive_charge_state_master.py validate                  # 78 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py optimal demo --out results
+python adaptive_charge_state_master.py discard demo --out results
 python results/analysis.py
 ```
 

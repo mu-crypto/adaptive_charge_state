@@ -68,6 +68,28 @@ Answer, at the three demo points: the tuned SPRT is within a few percent of
 the optimum over most of the frontier and loses only in the top ~2% of the
 fidelity range. See `results/README.md`.
 
+## A third action: abandoning the shot
+
+A finite `cost_discard` adds a third terminal action, so the decision becomes
+two thresholds with an inconclusive band between them instead of one
+threshold. The band edges follow from the costs — this is the post-selection
+experiments already do by hand, priced rather than tuned.
+
+```bash
+python adaptive_charge_state_master.py discard demo
+python adaptive_charge_state_master.py discard demo --a-over-c 2000
+```
+
+`cost_discard = inf` is the default and reproduces the two-action problem
+bit-identically. Discard is only ever the cheapest action when
+`w < ab/(a+b)`, which at a = b = 1 is 0.5, not 1; above that the band is
+empty. `Economics.validate()` rejects degenerate costs on both sides.
+
+Once shots can be thrown away, balanced fidelity is no longer a figure of
+merit — abstain on everything and it goes to 1. So `three_action_metrics`
+reports the Bayes risk as primary, accuracy only alongside the discard rate
+that bought it, and retained shots per millisecond as the throughput number.
+
 ## Experiments
 
 | key | what it sweeps |
@@ -96,13 +118,14 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 70 numerical checks
+python adaptive_charge_state_master.py validate          # 78 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
 python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
 python adaptive_charge_state_master.py optimal demo      # the Bayes-optimal rule
+python adaptive_charge_state_master.py discard demo      # add the abandon action
 python results/analysis.py                              # cross-experiment tables
 ```
 
@@ -163,6 +186,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 70/70 on both.
+active, every saved result records it, and `validate` passes 78/78 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.
