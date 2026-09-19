@@ -1827,6 +1827,7 @@ class PaddedRecords:
     llr_post: np.ndarray      # (n, M)
     alpha: np.ndarray         # (n, M, 2)
     beta: np.ndarray          # (n, M, 2)
+    hilbert: np.ndarray       # (n, M) remaining information, see hilbert_gap
     n_int: np.ndarray         # (n,)
     n_clicks: np.ndarray      # (n,)
     t_max_ms: float
@@ -1835,6 +1836,37 @@ class PaddedRecords:
     @property
     def n_shots(self) -> int:
         return int(self.t_start.shape[0])
+
+
+def hilbert_gap(H: np.ndarray) -> float:
+    """
+    Remaining initial-state information at one interval start.
+
+    The Hilbert projective distance between the two hypothesis columns:
+
+        d = |log(u/(1-u)) - log(v/(1-v))|
+
+    with u, v the filtered probability of being bright NOW given that the
+    shot started bright / started dark. For the 2x2 case this is exactly the
+    `gap` the epoch filter tracks, computed from the columns rather than from
+    their logits.
+
+    It is the monotone measure, and the plain difference u - v is NOT: the
+    no-click propagator exp((Q - Lambda) dt) is strictly positive, so
+    Birkhoff makes it a strict contraction in this metric, while the click
+    update multiplies by the diagonal Lambda and (Dx)_i/(Dy)_i = x_i/y_i, an
+    exact isometry. Information about the INITIAL state is therefore
+    destroyed only by waiting, never by observing a photon.
+
+    A column that has collapsed onto one state carries maximal information,
+    not zero, so a non-finite ratio maps to +inf rather than 0.
+    """
+    num = np.maximum(H[:, 0], 1e-300)
+    den = np.maximum(H[:, 1], 1e-300)
+    ratio = num / den
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = float(np.log(ratio.max()) - np.log(ratio.min()))
+    return d if np.isfinite(d) else np.inf
 
 
 def pack_records(
@@ -1851,6 +1883,9 @@ def pack_records(
     llr_post = np.full((n, M), -np.inf)
     alpha = np.zeros((n, M, 2))
     beta = np.zeros((n, M, 2))
+    # Padded columns are +inf, not 0: a padded interval must never look like
+    # an exhausted one. They are also masked out by `valid` in run_sprt.
+    hilbert = np.full((n, M), np.inf)
     n_int = np.zeros(n, dtype=int)
     n_clicks = np.zeros(n, dtype=int)
 
@@ -1869,6 +1904,7 @@ def pack_records(
             a, b = _interval_llr_coefficients(r.H_start[j], spec)
             alpha[i, j] = a
             beta[i, j] = b
+            hilbert[i, j] = hilbert_gap(r.H_start[j])
 
     return PaddedRecords(
         t_start=t_start,
@@ -1878,6 +1914,7 @@ def pack_records(
         llr_post=llr_post,
         alpha=alpha,
         beta=beta,
+        hilbert=hilbert,
         n_int=n_int,
         n_clicks=n_clicks,
         t_max_ms=float(records[0].t_max_ms),
@@ -1897,6 +1934,7 @@ def run_sprt(
     boundary_half_width: float,
     offset: float,
     deadline_us: float,
+    exhaustion_eps: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Vectorized truncated SPRT over all shots at once.
@@ -2007,6 +2045,38 @@ def run_sprt(
         1,
         np.where(upper_first, 0, np.where(llr_at_cap >= b, 0, 1)),
     ).astype(int)
+
+    # ---- third exit: the initial-state information is exhausted -----------
+    # Once the Hilbert gap closes the two hypothesis columns coincide, the
+    # LLR is frozen, and no further observation can change the decision.
+    # Stopping there is FREE: unlike the boundary this is not a speed for
+    # accuracy trade but a proof that nothing more is coming, and the
+    # decision taken is bit-identical to the one the deadline would give.
+    #
+    # A shot that has not crossed a boundary by the exhaustion time never
+    # will, so this only ever overrides the truncation branch -- which is
+    # why the prediction below is the deadline rule applied to the frozen
+    # LLR, and why `earlier` can be asserted rather than hoped for.
+    #
+    # Evaluated at interval STARTS only, which is conservative: the true
+    # crossing lies inside the preceding interval, so this reports a
+    # slightly later stop than optimal and never an earlier one.
+    #
+    # Defaults to off, so every result produced before this existed is
+    # reproduced exactly.
+    if exhaustion_eps > 0.0:
+        exhausted = valid & (packed.hilbert <= exhaustion_eps)
+        k_E = _first_true(exhausted)
+        hit_E = k_E < M
+        kE = np.where(hit_E, k_E, 0)
+        t_exh = packed.t_start[rows, kE]
+
+        earlier = hit_E & (t_exh < stop_ms)
+        llr_frozen = packed.llr_start[rows, kE]
+        stop_ms = np.where(earlier, t_exh, stop_ms)
+        preds = np.where(
+            earlier, np.where(llr_frozen >= b, 0, 1), preds
+        ).astype(int)
 
     return stop_ms * 1000.0, preds
 
@@ -5514,7 +5584,14 @@ def run_optimal_stopping(
     params = point.params
     detector = cfg.detector
     noise = cfg.noise
-    seed = cfg.seed + 90_001 + 13 * int(point.sweep_value != 0)
+    # Same per-point seeding as `run_operating_point`, offset so the two
+    # commands do not reuse each other's shots. The old expression here,
+    # 13 * int(sweep_value != 0), took only two values across an entire
+    # sweep, so every point with a non-zero sweep value shared an RNG
+    # stream -- which for the noise sweeps, where the points differ only in
+    # the modulator, meant near-duplicate data rather than either clean
+    # common random numbers or independent draws.
+    seed = int(cfg.seed) + 90_001 + int(point.seed_offset)
 
     horizon_us = (
         float(point.horizon_us)
@@ -5547,10 +5624,10 @@ def run_optimal_stopping(
         cfg.n_test, horizon_us / 1000.0, params, seed + 7717, detector, noise
     )
 
+    # Only the TEST records are packed: calibration is done on the epoch
+    # filter paths and on raw counts, so packing the calibration records too
+    # was building an unused array of every interval for every shot.
     spec = build_no_click_spectral(filter_params)
-    cal_packed = pack_records(
-        build_records(cal_shots, horizon_us, filter_params, spec), spec
-    )
     test_packed = pack_records(
         build_records(test_shots, horizon_us, filter_params, spec), spec
     )
@@ -6957,6 +7034,96 @@ def validate_all(verbose: bool = True) -> int:
         f"stop before its boundary is crossed",
     )
 
+    # The exhaustion exit exists twice: on the epoch grid (sprt_on_epochs)
+    # and in the exact grid-free engine (run_sprt). They must agree about
+    # what "exhausted" means, and the exact one must be free in the same
+    # sense -- otherwise the main sweeps and the `optimal` command would be
+    # measuring two different rules under one name.
+    ex_params = shields_2015_params(BASE_POWER_UW)
+    ex_shots, ex_labels = simulate_balanced_dataset(200, 0.250, ex_params, 17)
+    ex_spec = build_no_click_spectral(ex_params)
+    ex_packed = pack_records(
+        build_records(ex_shots, 250.0, ex_params, ex_spec), ex_spec
+    )
+    ex_paths = filter_on_grid(
+        ex_shots, ex_labels, ex_params, 250.0, 250.0 / 128, ex_spec
+    )
+
+    # hilbert_gap works on the hypothesis columns, the epoch filter on their
+    # logits. Same quantity, two routes -- checked on columns with moderate
+    # u and v, NOT at t = 0, where the two hypotheses are trivially perfectly
+    # distinguishable, the true gap is +inf, and the two implementations
+    # merely disagree about which floor stands in for it.
+    rng_h = np.random.default_rng(606)
+    uv = rng_h.uniform(0.02, 0.98, (400, 2))
+    worst_gap = 0.0
+    for u_, v_ in uv:
+        H_ = np.array([[u_, v_], [1.0 - u_, 1.0 - v_]])
+        direct = abs(
+            (np.log(u_) - np.log1p(-u_)) - (np.log(v_) - np.log1p(-v_))
+        )
+        worst_gap = max(worst_gap, abs(hilbert_gap(H_) - direct))
+    check(
+        "the Hilbert gap equals |logit(u) - logit(v)|",
+        worst_gap < 1e-12,
+        f"max difference {worst_gap:.1e} over 400 random hypothesis columns",
+    )
+
+    # And the structural property the exit relies on, on the exact engine's
+    # own interval grid rather than the epoch grid.
+    worst_rise = -np.inf
+    for i in range(ex_packed.n_shots):
+        k_ = int(ex_packed.n_int[i])
+        if k_ > 1:
+            worst_rise = max(
+                worst_rise, float(np.diff(ex_packed.hilbert[i, :k_]).max())
+            )
+    check(
+        "the Hilbert gap never rises across an interval boundary",
+        worst_rise <= 1e-9,
+        f"max rise {worst_rise:.1e} across every click in "
+        f"{ex_packed.n_shots} shots -- a photon is an isometry in this "
+        f"metric, so only waiting destroys information",
+    )
+
+    same_x, never_x, saved_x = True, True, []
+    for L, off in ((0.5, 0.0), (2.0, 0.0), (4.0, 0.3), (8.0, -0.5)):
+        t0x, p0x = run_sprt(ex_packed, L, off, 250.0, 0.0)
+        t1x, p1x = run_sprt(ex_packed, L, off, 250.0, EXHAUSTION_EPS)
+        same_x &= bool((p0x == p1x).all())
+        never_x &= bool((t1x <= t0x + 1e-9).all())
+        saved_x.append(float(t0x.mean() - t1x.mean()))
+    check(
+        "the exact engine's exhaustion exit is free too",
+        same_x and never_x,
+        f"identical predictions at every fixed (L, offset, deadline); mean "
+        f"time saved {min(saved_x):.1f}-{max(saved_x):.1f} us",
+    )
+    check(
+        "exhaustion_eps = 0 leaves the exact engine bit-identical",
+        bool(
+            (run_sprt(ex_packed, 2.0, 0.0, 250.0)[0]
+             == run_sprt(ex_packed, 2.0, 0.0, 250.0, 0.0)[0]).all()
+        ),
+        "the exit is opt-in, so every result produced before it existed is "
+        "reproduced exactly",
+    )
+
+    # A rule that stops every shot at t = 0 measured nothing, so its
+    # throughput is undefined rather than astronomically good. Dividing by a
+    # 1e-12 floor used to report 1e15 retained shots per ms.
+    y0 = three_action_metrics(
+        np.zeros(4),
+        decide(np.zeros(4), Economics(cost_per_us=1.0 / 500.0)),
+        np.array([0, 0, 1, 1]),
+        Economics(cost_per_us=1.0 / 500.0),
+    )
+    check(
+        "zero-duration rules report an undefined throughput, not a huge one",
+        not np.isfinite(y0["yield_per_ms"]) and y0["T"] == 0.0,
+        f"yield_per_ms = {y0['yield_per_ms']} at T = 0",
+    )
+
     # An enabled-but-trivial detector must not perturb the physics.
     det_trivial = DetectorModel(
         enabled=True, dead_time_ns=0.0, afterpulse_probability=0.0
@@ -7850,7 +8017,17 @@ def three_action_metrics(
             )
         ),
         "T": T,
-        "yield_per_ms": float(1000.0 * (1.0 - disc) / max(T, 1e-12)),
+        # Retained shots per millisecond. A rule that stops every shot at
+        # t = 0 has T = 0, and dividing by a 1e-12 floor reported 1e15 --
+        # a number that is not large, it is undefined, and it destroys any
+        # plot it lands in. Nothing was measured, so the rate is inf if
+        # anything was kept and 0 if not; `degenerate` flags the row either
+        # way.
+        "yield_per_ms": (
+            float(1000.0 * (1.0 - disc) / T)
+            if T > 0.0
+            else (np.inf if disc < 1.0 else 0.0)
+        ),
     }
 
 
@@ -7883,7 +8060,7 @@ def run_discard_sweep(
     `degenerate` flags any row whose discard rate exceeds 99%.
     """
     params = point.params
-    seed = cfg.seed + 51_501
+    seed = int(cfg.seed) + 51_501 + int(point.seed_offset)
     horizon_us = (
         float(point.horizon_us)
         if point.horizon_us is not None
@@ -7953,8 +8130,15 @@ def run_discard_sweep(
                 "risk_reduction_pct": (
                     100.0 * (m_sprt["risk"] - m_lsm["risk"]) / m_sprt["risk"]
                 ),
+                # Degenerate either because essentially everything is
+                # abandoned, or because the rule stops at t = 0 and so makes
+                # no measurement at all. Both have a low Bayes risk that
+                # means nothing on its own.
                 "degenerate": bool(
-                    m_sprt["discard_rate"] > 0.99 or m_lsm["discard_rate"] > 0.99
+                    m_sprt["discard_rate"] > 0.99
+                    or m_lsm["discard_rate"] > 0.99
+                    or m_sprt["T"] <= 0.0
+                    or m_lsm["T"] <= 0.0
                 ),
             }
         )
