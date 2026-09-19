@@ -5956,6 +5956,17 @@ def run_optimal_stopping(
         rows[-1]["risk_reduction_resolved"] = (
             int(ci_r["resolved"]) if ci_r else 0
         )
+        # The exhaustion exit is plotted next to the learned policy in panel
+        # (c), so it needs its own interval -- bars with error bars beside
+        # bars without read as "measured" beside "exact", which is backwards
+        # here: the exit's gain is the smaller of the two and the one more
+        # easily swamped.
+        ci_e = bs_r["pair_ci"].get("exhaustion_vs_grid_sprt")
+        rows[-1]["exhaustion_gain_ci_low"] = ci_e["lo"] if ci_e else np.nan
+        rows[-1]["exhaustion_gain_ci_high"] = ci_e["hi"] if ci_e else np.nan
+        rows[-1]["exhaustion_gain_resolved"] = (
+            int(ci_e["resolved"]) if ci_e else 0
+        )
 
     lsm_correct = np.column_stack(lsm_correct)
     lsm_time = np.column_stack(lsm_time)
@@ -8040,14 +8051,24 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
     p.bar(x - 0.2, red, width=0.4, color="#d62728", alpha=0.85,
           yerr=yerr, ecolor="#5a1114", capsize=2,
           label="learned vs best boundary (95% paired CI)")
-    p.bar(
-        x + 0.2,
+    exh = np.array(
         [
             100.0 * (r["risk_grid_sprt"] - r["risk_exhaustion"])
             / r["risk_grid_sprt"]
             for r in rows
-        ],
-        width=0.4, color="#2ca02c", alpha=0.85, label="exhaustion exit alone",
+        ]
+    )
+    elo = np.array([r.get("exhaustion_gain_ci_low", np.nan) for r in rows])
+    ehi = np.array([r.get("exhaustion_gain_ci_high", np.nan) for r in rows])
+    eerr = (
+        np.vstack([np.maximum(exh - elo, 0), np.maximum(ehi - exh, 0)])
+        if np.isfinite(elo).all()
+        else None
+    )
+    p.bar(
+        x + 0.2, exh, width=0.4, color="#2ca02c", alpha=0.85,
+        yerr=eerr, ecolor="#14501a", capsize=2,
+        label="exhaustion exit alone (95% paired CI)",
     )
     p.set_xticks(x)
     p.set_xticklabels([f"{v:g}" for v in ac], rotation=60, fontsize=7)
@@ -8116,6 +8137,9 @@ _OPTIMAL_CSV_COLUMNS = [
     "risk_reduction_ci_high",
     "risk_reduction_resolved",
     "risk_reduction_pct",
+    "exhaustion_gain_ci_low",
+    "exhaustion_gain_ci_high",
+    "exhaustion_gain_resolved",
     "F_grid_sprt",
     "T_grid_sprt",
     "F_exhaustion",
