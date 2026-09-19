@@ -9058,13 +9058,20 @@ def run_noise_risk_comparison(
             )
 
         print(f"\nshots abandoned by the three-action rule{hdr}")
+        degenerate = False
         for key, name, _, _ in METHOD_ORDER:
+            cells = []
+            for r in results:
+                d = r["three"][key]["discard_rate"]
+                degenerate |= d > 0.90
+                cells.append(f"{100 * d:8.0f}%{'*' if d > 0.90 else ' '}")
+            print(f"{name:<36}" + "".join(cells))
+        if degenerate:
             print(
-                f"{name:<36}"
-                + "".join(
-                    f"{100 * r['three'][key]['discard_rate']:9.0f}%"
-                    for r in results
-                )
+                f"  * above 90% abandoned: at w = {cost_discard:g} it is "
+                f"cheaper to throw the shot away than to read it, so the "
+                f"'gain' in the table above is just w beating the readout "
+                f"and says nothing about the rule"
             )
 
         for aset in ("two", "three"):
@@ -9127,6 +9134,7 @@ _NOISE_RISK_CSV_COLUMNS = [
     "risk_vs_clean_pct",
     "third_action_gain_pct",
     "discard_rate",
+    "degenerate",
     "F",
     "T_us",
 ]
@@ -9180,6 +9188,9 @@ def export_noise_risk_csv(
                                 ),
                                 "third_action_gain_pct": gain,
                                 "discard_rate": m["discard_rate"],
+                                "degenerate": int(
+                                    cond["three"][key]["discard_rate"] > 0.90
+                                ),
                                 "F": m["F"],
                                 "T_us": m["T"],
                             }

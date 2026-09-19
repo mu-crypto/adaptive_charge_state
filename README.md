@@ -109,6 +109,14 @@ distribution. Result: the fixed-time threshold is immune, everything that
 reads arrival times pays, the damage peaks at Γ_tot·τ_c ≈ 1, and the ranking
 never changes.
 
+It also scores every rule under **both action sets** — two, and three with
+`--cost-discard` — on identical shots, and plots them against each other.
+The third action buys most for the rules that have no other way to handle an
+ambiguous shot (+31% for the fixed-time threshold) and least for those that
+already wait for confidence (+5% for the exhaustion exit), which inverts the
+ranking: with post-selection the two *simplest* event-time rules become the
+best two.
+
 ## Experiments
 
 | key | what it sweeps |

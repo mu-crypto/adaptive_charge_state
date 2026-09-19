@@ -585,6 +585,57 @@ sample size tested, from 400 to 3200 calibration shots per state (0.0994 vs
 not from training on the wrong distribution — a distinction a single
 clean-trained row would have conflated.
 
+### Two actions against three, under noise
+
+`noiserisk` scores every rule twice per condition on identical shots — two
+actions, and three at w = 0.15 (band ±1.73) — with the shots, the nominal
+filter and the tuning protocol all held fixed, and every rule re-tuned under
+each action set. So the pair isolates the action set and nothing else. Count
+rules get a posterior to band via `empirical_count_llr`, since a bare
+threshold has none.
+
+At the moderate point, clean condition, sorted by risk:
+
+| rule | two actions | three actions | third action buys | abandoned |
+|---|---|---|---|---|
+| fixed-count MMPP | 0.1038 | **0.0781** | +24.8% | 13% |
+| adaptive count SPRT | 0.1012 | **0.0790** | +21.9% | 12% |
+| exact grid-free boundary | 0.0930 | 0.0796 | +14.3% | 8% |
+| learned optimal stopping | **0.0886** | 0.0809 | +8.6% | 10% |
+| fixed-time count threshold | 0.1243 | 0.0864 | **+30.5%** | 13% |
+| + exhaustion exit | 0.1052 | 0.1002 | +4.7% | 3% |
+| epoch-grid boundary | 0.1085 | 0.1024 | +5.7% | 10% |
+
+**The third action and adaptive stopping are substitutes, not complements.**
+The gain is largest for the rules with no other way to handle an ambiguous
+shot — the fixed-time threshold (+31%), the fixed-count rules (+22 to +25%) —
+and smallest for the rules that already handle ambiguity by waiting: the
+exhaustion exit (+5%) and the epoch boundary (+6%). A boundary rule keeps
+going until it is confident; a discard band reaches confidence by throwing
+the hard cases away instead. Doing both is solving the same problem twice.
+
+**So the ranking inverts.** Under two actions the sophisticated rules win and
+the learned policy leads at 0.0886. Under three the two *simplest* event-time
+rules — fixed-count MMPP and the plain adaptive count — are the best two, and
+the learned policy drops to fourth. That is not a yield artifact: every rule
+in that table abandons 3–13% of shots, a narrow range.
+
+It also compresses the field. Best-to-worst spread goes from 40% of the best
+risk under two actions to 31% under three, and the order scrambles. If you
+can post-select, most of the value of a clever stopping rule evaporates.
+
+**Noise changes none of this.** The gains above are quoted on the clean
+condition; across all five correlation times they move by only a few points
+(threshold +17 to +31%, fixed-count MMPP +19 to +25%, exhaustion exit +1 to
++5%). The ordering by how much each rule gains is the same at every τ_c.
+
+**The sparse point is degenerate and is flagged, not reported.** At 2.74
+photons per bright dwell the readout cannot reach a risk below w = 0.15, so
+the optimal three-action rule abandons 93–100% of shots and the "54% gain" is
+just w beating the readout. Rows above 90% abandoned carry a `degenerate`
+flag in the CSV and a footnote in the printout. Reading that as a win for
+the third action would be reading the cost constant, not the physics.
+
 ## Bootstrap intervals
 
 | band | median 95% CI width on the adaptive-MMPP speedup |
@@ -626,8 +677,11 @@ results/demo/ideal/discard/
     discard_*.png                       the four-panel three-action figure
     discard_sweep.csv                   risk, retention, accuracy and yield vs w
 results/demo/ideal/noiserisk/
-    noiserisk_*.png                     risk, degradation and the learned edge
-    noise_risk.csv                      every method at every correlation time
+    noiserisk_*.png                     6 panels: risk and degradation under
+                                        each action set, the gap between them,
+                                        and the discard rate that paid for it
+    noise_risk.csv                      one row per (condition, method,
+                                        action set), with the paired gain
 ```
 
 Detector directories: `ideal`, `det_nonpar_dt50ns_ap0.01_tau100ns`
