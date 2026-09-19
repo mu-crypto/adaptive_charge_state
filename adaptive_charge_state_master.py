@@ -7045,10 +7045,6 @@ def validate_all(verbose: bool = True) -> int:
     ex_packed = pack_records(
         build_records(ex_shots, 250.0, ex_params, ex_spec), ex_spec
     )
-    ex_paths = filter_on_grid(
-        ex_shots, ex_labels, ex_params, 250.0, 250.0 / 128, ex_spec
-    )
-
     # hilbert_gap works on the hypothesis columns, the epoch filter on their
     # logits. Same quantity, two routes -- checked on columns with moderate
     # u and v, NOT at t = 0, where the two hypotheses are trivially perfectly
@@ -7122,6 +7118,18 @@ def validate_all(verbose: bool = True) -> int:
         "zero-duration rules report an undefined throughput, not a huge one",
         not np.isfinite(y0["yield_per_ms"]) and y0["T"] == 0.0,
         f"yield_per_ms = {y0['yield_per_ms']} at T = 0",
+    )
+
+    # The noise-risk comparison counts photons on the epoch grid with its own
+    # helper, so it has to agree with the one the rest of the file uses.
+    nc_shots, _ = simulate_balanced_dataset(120, 0.250, os_params, 55)
+    nc_t = np.linspace(0.0, 250.0, 33)
+    nc_a = _cumulative_counts(nc_shots, nc_t)
+    nc_b = total_counts_at_times(nc_shots, nc_t / 1000.0)
+    check(
+        "the epoch counter agrees with total_counts_at_times",
+        bool(np.array_equal(nc_a, nc_b)),
+        f"identical over {nc_a.shape[0]} shots x {nc_a.shape[1]} epochs",
     )
 
     # An enabled-but-trivial detector must not perturb the physics.
@@ -8400,6 +8408,527 @@ def cmd_discard(args: argparse.Namespace) -> int:
     return 0
 
 
+
+# =============================================================================
+# 10d. Correlated rate noise, every method in one currency
+# =============================================================================
+#
+# The four `noise_*` sweeps already vary rate noise, but they report the
+# matched-fidelity speedup, which only compares two methods at a time and
+# cannot price a method that stops earlier at lower accuracy. This section
+# puts all six rules into the Bayes risk instead, so "which method degrades"
+# has a single answer.
+#
+# Correlation time, not amplitude, is the axis Spethmann et al. identify as
+# the failure mode for HMM readout: the filter assumes white noise and
+# degrades once the noise develops a correlation time comparable to the
+# dynamics. The photon-counting analogue is rate noise, since a Poisson
+# stream has no additive sensor noise to correlate. Three regimes are
+# expected:
+#
+#     Gamma_tot tau_c << 1   modulation averages out within a dwell
+#     Gamma_tot tau_c ~  1   a rate dip mimics a charge switch -- the danger
+#     Gamma_tot tau_c >> 1   quasi-static, i.e. a per-shot rate error, which
+#                            a calibrated boundary is already known to absorb
+
+NOISE_RISK_TAUS_MS = (0.02, 0.05, 0.1, 0.25, 1.0)
+
+METHOD_ORDER = [
+    ("threshold", "fixed-time count threshold", "#444444", ":"),
+    ("adaptive_count", "adaptive count SPRT", "#8c564b", "--"),
+    ("fixed_count_mmpp", "fixed-count MMPP", "#9467bd", "--"),
+    ("mmpp_sprt", "adaptive MMPP, constant boundary", "#1f77b4", "-"),
+    ("mmpp_sprt_exh", "+ exhaustion exit", "#2ca02c", "-"),
+    ("learned_clean", "learned policy, trained clean", "#d62728", "-"),
+    ("learned_matched", "learned policy, retrained on noise", "#ff7f0e", "--"),
+]
+
+
+def _balanced_F_T(
+    stop_us: np.ndarray,
+    preds: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[float, float]:
+    """
+    Class-balanced (fidelity, mean run time) for one rule.
+
+    A DISCARD prediction counts as wrong for both classes, which is the
+    right convention here: this routine is used where discard is not
+    enabled, and if it ever is, silently crediting an abstention would be
+    the wrong default.
+    """
+    return (
+        balanced_fidelity(labels, preds),
+        balanced_mean_time(labels, stop_us),
+    )
+
+
+def _cumulative_counts(
+    shots: Sequence[np.ndarray],
+    t_us: np.ndarray,
+) -> np.ndarray:
+    """Photons observed strictly before each epoch."""
+    edges = np.asarray(t_us, dtype=float) / 1000.0
+    cum = np.zeros((len(shots), edges.size), dtype=int)
+    for i, ts in enumerate(shots):
+        ts = np.asarray(ts, dtype=float)
+        ts = ts[(ts >= 0.0) & (ts < edges[-1])]
+        if ts.size:
+            cum[i] = np.searchsorted(np.sort(ts), edges, side="left")
+    return cum
+
+
+def _method_risks(
+    cal_shots: Sequence[np.ndarray],
+    cal_paths: FilterPaths,
+    test_shots: Sequence[np.ndarray],
+    test_paths: FilterPaths,
+    econ: Economics,
+    policies: dict[str, list[np.ndarray]],
+) -> dict:
+    """
+    Every rule in this file, on one condition, in Bayes risk.
+
+    Each parametric rule is tuned on the CALIBRATION paths at this noise
+    level and scored on the test paths, so no method is handicapped by the
+    noise being unknown to its tuner and none is scored in sample. The
+    learned policies are passed in already fitted -- see `policies` -- which
+    is what lets the same routine score both the clean-trained one (the naive
+    deployment case) and a matched retrain.
+    """
+    labels = np.asarray(test_paths.labels, dtype=int)
+    cal_labels = np.asarray(cal_paths.labels, dtype=int)
+    t_us = test_paths.t_us
+    n_steps = t_us.size - 1
+    rows_c = np.arange(cal_paths.n_paths)
+    rows_t = np.arange(test_paths.n_paths)
+    cal_cum = _cumulative_counts(cal_shots, t_us)
+    test_cum = _cumulative_counts(test_shots, t_us)
+    out: dict = {}
+
+    def _record(tag, stop_us, preds):
+        F, T = _balanced_F_T(stop_us, preds, labels)
+        out[tag] = {
+            "risk": bayes_risk(stop_us, preds, labels, econ),
+            "F": F,
+            "T": T,
+        }
+
+    # ---- 1. fixed-time count threshold ------------------------------------
+    best = None
+    for j in range(1, n_steps + 1):
+        n_th, _ = optimize_count_threshold(cal_cum[:, j], cal_labels)
+        pred_c = np.where(cal_cum[:, j] >= n_th, 0, 1)
+        r = bayes_risk(
+            np.full(cal_paths.n_paths, t_us[j]), pred_c, cal_labels, econ
+        )
+        if best is None or r < best[0]:
+            best = (r, j, int(n_th))
+    _, j_thr, n_thr = best
+    _record(
+        "threshold",
+        np.full(test_paths.n_paths, t_us[j_thr]),
+        np.where(test_cum[:, j_thr] >= n_thr, 0, 1),
+    )
+
+    # ---- 2, 3. adaptive count, and the same stop times read with the LLR --
+    # Methods 2 and 3 share their stopping rule exactly, so the pair isolates
+    # the decision statistic here just as it does elsewhere in this file.
+    max_n = int(np.percentile(cal_cum[:, -1], 99)) + 1
+    deadline_ks = list(range(max(1, n_steps // 24), n_steps + 1, max(1, n_steps // 24)))
+    best_c = best_f = None
+    for n_up in range(1, max_n + 1):
+        reach_c = cal_cum >= n_up
+        k_c = np.where(reach_c.any(axis=1), reach_c.argmax(axis=1), n_steps)
+        for dl in deadline_ks:
+            kk = np.minimum(k_c, dl)
+            st = t_us[kk]
+            r_c = bayes_risk(
+                st, (cal_cum[rows_c, kk] < n_up).astype(int), cal_labels, econ
+            )
+            if best_c is None or r_c < best_c[0]:
+                best_c = (r_c, n_up, dl)
+            # the LLR read at the same instants needs its own cutoff, fitted
+            # on calibration exactly as the count threshold is
+            llr_c = cal_paths.llr[rows_c, kk]
+            cut, _ = optimize_scalar_cutoff(llr_c, cal_labels)
+            r_f = bayes_risk(
+                st, (llr_c < cut).astype(int), cal_labels, econ
+            )
+            if best_f is None or r_f < best_f[0]:
+                best_f = (r_f, n_up, dl, float(cut))
+
+    for tag, b in (("adaptive_count", best_c), ("fixed_count_mmpp", best_f)):
+        n_up, dl = b[1], b[2]
+        reach_t = test_cum >= n_up
+        k_t = np.minimum(
+            np.where(reach_t.any(axis=1), reach_t.argmax(axis=1), n_steps), dl
+        )
+        if tag == "adaptive_count":
+            preds = (test_cum[rows_t, k_t] < n_up).astype(int)
+        else:
+            preds = (test_paths.llr[rows_t, k_t] < b[3]).astype(int)
+        _record(tag, t_us[k_t], preds)
+
+    # ---- 4, 5. adaptive MMPP SPRT, without and with the exhaustion exit ---
+    for tag, eps in (("mmpp_sprt", 0.0), ("mmpp_sprt_exh", EXHAUSTION_EPS)):
+        b = best_constant_boundary(cal_paths, econ, eps)
+        st, pr = sprt_on_epochs(
+            test_paths, b["L"], b["offset"], eps, None, econ
+        )
+        _record(tag, st, pr)
+        out[tag]["L"] = b["L"]
+        out[tag]["offset"] = b["offset"]
+
+    # ---- 6. the learned policies ------------------------------------------
+    for tag, coeffs in policies.items():
+        st, pr, _ = apply_stopping_rule(test_paths, coeffs, econ)
+        _record(tag, st, pr)
+
+    return out
+
+
+def run_noise_risk_comparison(
+    point: OperatingPoint,
+    cfg: RunConfig,
+    sigma: float = 0.3,
+    tau_c_ms: Sequence[float] = NOISE_RISK_TAUS_MS,
+    kind: str = "ou",
+    a_over_c: float = 500.0,
+    n_epochs: int = N_EPOCHS_DEFAULT,
+) -> dict:
+    """
+    Sweep the CORRELATION TIME of multiplicative rate noise, in Bayes risk.
+
+    Every parametric rule is re-tuned on calibration data at each noise
+    level, so none is handicapped by the noise being unknown to its tuner.
+    The learned policy is reported twice:
+
+        learned_clean    coefficients fitted once on noiseless paths, the
+                         naive deployment case and the least favourable
+        learned_matched  refitted on calibration paths at this noise level
+
+    The pair separates two things a single number conflates -- damage done
+    by the noise itself, and damage done by training on the wrong
+    distribution. Without it a degradation in the clean-trained policy could
+    be read as either.
+    """
+    params = point.params
+    seed = int(cfg.seed) + 73_001 + int(point.seed_offset)
+    horizon_us = (
+        float(point.horizon_us)
+        if point.horizon_us is not None
+        else choose_horizon_us(params)
+    )
+    dt_us = horizon_us / float(n_epochs)
+    filter_params = _filter_params_for(params, cfg.detector, NOISE_OFF)
+    spec = build_no_click_spectral(filter_params)
+    reg = regime_summary(params)
+    gamma_tot = reg["gamma_tot_khz"]
+    econ = Economics(cost_per_us=1.0 / float(a_over_c))
+
+    if cfg.verbose:
+        print("\n" + "=" * 78)
+        print(f"{point.label}  |  horizon = {horizon_us:.1f} us")
+        print(
+            f"  Gamma_tot = {gamma_tot:.2f} kHz (1/Gamma = "
+            f"{1000.0 / gamma_tot:.0f} us), bright photon gap "
+            f"{1000.0 / params.lambda_minus_khz:.1f} us"
+        )
+        print(
+            f"  sigma = {sigma}, modulator = {kind}, "
+            f"a/c = {a_over_c:.0f} us, photon order "
+            f"{NOISE_PHOTON_ORDER:.2f}"
+        )
+        print("=" * 78)
+
+    t0 = time.time()
+
+    def _paths(noise, tag_seed):
+        cal_s, cal_l = simulate_balanced_dataset(
+            cfg.n_cal, horizon_us / 1000.0, params, tag_seed,
+            cfg.detector, noise,
+        )
+        te_s, te_l = simulate_balanced_dataset(
+            cfg.n_test, horizon_us / 1000.0, params, tag_seed + 7717,
+            cfg.detector, noise,
+        )
+        # The FILTER is always the nominal one: rate noise is exactly the
+        # error a calibrated boundary cannot absorb, so handing the filter
+        # the realised modulation would measure a different question.
+        return (
+            cal_s,
+            filter_on_grid(cal_s, cal_l, filter_params, horizon_us, dt_us, spec),
+            te_s,
+            filter_on_grid(te_s, te_l, filter_params, horizon_us, dt_us, spec),
+        )
+
+    # the clean-trained policy, fitted once
+    clean_cal_s, clean_cal, clean_te_s, clean_te = _paths(NOISE_OFF, seed)
+    coeffs_clean = fit_stopping_rule(clean_cal, econ)
+
+    conditions: list[tuple[str, RateNoise | None]] = [("clean", None)]
+    for tau in tau_c_ms:
+        conditions.append(
+            (
+                f"tau_c={tau:g}ms",
+                RateNoise(
+                    sigma=float(sigma),
+                    tau_c_ms=float(tau),
+                    kind=kind,
+                    photon_order=NOISE_PHOTON_ORDER,
+                ),
+            )
+        )
+
+    results = []
+    for j, (tag, nz) in enumerate(conditions):
+        if nz is None:
+            cal_s, cal_p, te_s, te_p = clean_cal_s, clean_cal, clean_te_s, clean_te
+        else:
+            cal_s, cal_p, te_s, te_p = _paths(nz, seed + 500 + 37 * j)
+        policies = {
+            "learned_clean": coeffs_clean,
+            "learned_matched": fit_stopping_rule(cal_p, econ),
+        }
+        m = _method_risks(cal_s, cal_p, te_s, te_p, econ, policies)
+        results.append(
+            {
+                "tag": tag,
+                "sigma": 0.0 if nz is None else float(nz.sigma),
+                "tau_c_ms": np.nan if nz is None else float(nz.tau_c_ms),
+                "gamma_tau": 0.0 if nz is None else gamma_tot * nz.tau_c_ms,
+                "methods": m,
+            }
+        )
+        if cfg.verbose:
+            print(
+                f"  {tag:<14} Gamma_tot*tau_c = "
+                f"{results[-1]['gamma_tau']:6.2f}   ({time.time() - t0:.0f}s)"
+            )
+
+    if cfg.verbose:
+        hdr = f"\n{'method':<36}" + "".join(
+            f"{r['tag'][:9]:>10}" for r in results
+        )
+        print("\nBayes risk (lower is better)" + hdr)
+        for key, name, _, _ in METHOD_ORDER:
+            print(
+                f"{name:<36}"
+                + "".join(f"{r['methods'][key]['risk']:10.4f}" for r in results)
+            )
+        print(f"\nrelative to the clean case (+ = worse){hdr}")
+        for key, name, _, _ in METHOD_ORDER:
+            base = results[0]["methods"][key]["risk"]
+            print(
+                f"{name:<36}"
+                + "".join(
+                    f"{100 * (r['methods'][key]['risk'] - base) / base:9.1f}%"
+                    for r in results
+                )
+            )
+        print(f"\n  total {time.time() - t0:.0f} s")
+
+    return {
+        "name": point.name,
+        "label": point.label,
+        "params": params,
+        "detector": cfg.detector,
+        "noise": NOISE_OFF,
+        "physics_layer": PHYSICS_LAYER,
+        "efficiency_model": cfg.efficiency_model,
+        "sweep_value": point.sweep_value,
+        "power_uw": point.power_uw,
+        "detection_efficiency": point.detection_efficiency,
+        "regime": reg,
+        "horizon_us": horizon_us,
+        "n_epochs": int(n_epochs),
+        "epoch_dt_us": dt_us,
+        "sigma": float(sigma),
+        "kind": kind,
+        "a_over_c": float(a_over_c),
+        "gamma_tot_khz": float(gamma_tot),
+        "results": results,
+        "module_version": MODULE_VERSION,
+    }
+
+
+_NOISE_RISK_CSV_COLUMNS = [
+    "experiment",
+    "detector",
+    "physics_layer",
+    "point_index",
+    "point",
+    "sigma",
+    "kind",
+    "a_over_c",
+    "condition",
+    "tau_c_ms",
+    "gamma_tot_tau_c",
+    "method",
+    "risk",
+    "risk_vs_clean_pct",
+    "F",
+    "T_us",
+]
+
+
+def export_noise_risk_csv(
+    results: list[dict],
+    spec: SweepSpec,
+    directory: Path,
+) -> list[Path]:
+    fp = directory / "noise_risk.csv"
+    with open(fp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_NOISE_RISK_CSV_COLUMNS)
+        w.writeheader()
+        for res in results:
+            base = {
+                "experiment": spec.key,
+                "detector": res["detector"].tag(),
+                "physics_layer": res.get("physics_layer", PHYSICS_LAYER),
+                "point_index": res.get("point_index"),
+                "point": res["name"],
+                "sigma": res["sigma"],
+                "kind": res["kind"],
+                "a_over_c": res["a_over_c"],
+            }
+            clean = res["results"][0]["methods"]
+            for cond in res["results"]:
+                for key, _, _, _ in METHOD_ORDER:
+                    m = cond["methods"][key]
+                    w.writerow(
+                        {
+                            **base,
+                            "condition": cond["tag"],
+                            "tau_c_ms": cond["tau_c_ms"],
+                            "gamma_tot_tau_c": cond["gamma_tau"],
+                            "method": key,
+                            "risk": m["risk"],
+                            "risk_vs_clean_pct": (
+                                100.0
+                                * (m["risk"] - clean[key]["risk"])
+                                / clean[key]["risk"]
+                            ),
+                            "F": m["F"],
+                            "T_us": m["T"],
+                        }
+                    )
+    return [fp]
+
+
+def plot_noise_risk(result: dict, save_path: str | None = None):
+    """Risk, degradation, and whether the learned rule keeps its edge."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rr = result["results"]
+    x = np.arange(len(rr))
+    ticks = [r["tag"] for r in rr]
+    fig, ax = plt.subplots(1, 3, figsize=(17.0, 5.2))
+
+    p = ax[0]
+    for key, name, col, ls in METHOD_ORDER:
+        p.plot(x, [r["methods"][key]["risk"] for r in rr], ls, marker="o",
+               color=col, ms=4, label=name)
+    p.set_xticks(x)
+    p.set_xticklabels(ticks, rotation=30, ha="right")
+    p.set_yscale("log")
+    p.set_ylabel("Bayes risk")
+    p.set_title(
+        f"(a) risk vs correlation time  (sigma = {result['sigma']})",
+        fontsize=10.5,
+    )
+    p.grid(alpha=0.25, which="both")
+    p.legend(fontsize=7.5)
+
+    p = ax[1]
+    for key, name, col, ls in METHOD_ORDER:
+        b = rr[0]["methods"][key]["risk"]
+        p.plot(x, [100 * (r["methods"][key]["risk"] - b) / b for r in rr], ls,
+               marker="o", color=col, ms=4, label=name)
+    p.axhline(0, color="k", lw=0.8)
+    p.set_xticks(x)
+    p.set_xticklabels(ticks, rotation=30, ha="right")
+    p.set_ylabel("risk increase vs clean (%)")
+    p.set_title("(b) degradation -- who is fragile", fontsize=10.5)
+    p.grid(alpha=0.25)
+
+    p = ax[2]
+    adv = [
+        100
+        * (r["methods"]["mmpp_sprt"]["risk"] - r["methods"]["learned_clean"]["risk"])
+        / r["methods"]["mmpp_sprt"]["risk"]
+        for r in rr
+    ]
+    adv_m = [
+        100
+        * (r["methods"]["mmpp_sprt"]["risk"] - r["methods"]["learned_matched"]["risk"])
+        / r["methods"]["mmpp_sprt"]["risk"]
+        for r in rr
+    ]
+    p.bar(x - 0.2, adv, width=0.4, color="#d62728", alpha=0.85,
+          label="trained clean")
+    p.bar(x + 0.2, adv_m, width=0.4, color="#ff7f0e", alpha=0.85,
+          label="retrained on noise")
+    p.axhline(0, color="k", lw=0.8)
+    p.set_xticks(x)
+    p.set_xticklabels(ticks, rotation=30, ha="right")
+    p.set_ylabel("learned advantage over constant boundary (%)")
+    p.set_title("(c) does the new scheme keep its edge", fontsize=10.5)
+    p.grid(alpha=0.25, axis="y")
+    p.legend(fontsize=8)
+
+    fig.suptitle(
+        f"Correlated rate noise, all methods on identical shots  |  "
+        f"{result['label']}  |  sigma = {result['sigma']}, "
+        f"{result['kind']} modulator, a/c = {result['a_over_c']:.0f} us",
+        fontsize=11.5,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    return fig
+
+
+def cmd_noiserisk(args: argparse.Namespace) -> int:
+    spec = _resolve_spec(args.experiment)
+    cfg = config_from_args(args, spec)
+    points = spec.build_points(cfg)
+    wanted = _selected_indices(args.point, len(points))
+
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    ) / "noiserisk"
+    directory.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for i in wanted:
+        res = run_noise_risk_comparison(
+            points[i],
+            cfg,
+            sigma=args.sigma,
+            kind=args.noise_kind_only,
+            a_over_c=args.a_over_c,
+            n_epochs=args.n_epochs,
+        )
+        res["point_index"] = i
+        results.append(res)
+        with open(directory / f"noiserisk_{i:02d}_{points[i].name}.pkl", "wb") as f:
+            pickle.dump(_to_plain(res), f)
+        if not args.no_plot:
+            plot_noise_risk(
+                res, str(directory / f"noiserisk_{i:02d}_{points[i].name}.png")
+            )
+
+    for fp in export_noise_risk_csv(results, spec, directory):
+        print(f"\nwrote {fp}")
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     return 1 if validate_all() else 0
 
@@ -8567,6 +9096,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--no-plot", action="store_true")
     sp.set_defaults(func=cmd_discard)
+
+    sp = sub.add_parser(
+        "noiserisk",
+        help="all six methods under correlated rate noise, in Bayes risk",
+    )
+    add_common(sp)
+    sp.add_argument("--point", default="all")
+    sp.add_argument("--quick", action="store_true", help="small fast smoke run")
+    sp.add_argument("--seed", type=int, default=None)
+    sp.add_argument("--n-cal", type=int, default=None)
+    sp.add_argument("--n-test", type=int, default=None)
+    sp.add_argument("--n-boot", type=int, default=None)
+    sp.add_argument("--n-epochs", type=int, default=N_EPOCHS_DEFAULT)
+    sp.add_argument("--sigma", type=float, default=0.3)
+    sp.add_argument(
+        "--noise-kind-only", default="ou", choices=["ou", "telegraph"],
+        help="modulator for this comparison (distinct from --noise-kind, "
+             "which sets the per-run noise for the ordinary sweeps)",
+    )
+    sp.add_argument("--a-over-c", type=float, default=500.0)
+    sp.add_argument("--no-plot", action="store_true")
+    sp.set_defaults(func=cmd_noiserisk)
 
     sp = sub.add_parser("validate", help="run the numerical validation suite")
     sp.set_defaults(func=cmd_validate)
