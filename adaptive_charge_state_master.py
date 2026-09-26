@@ -8895,8 +8895,13 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
     )
     p.plot(
         [r["T_learned"] for r in rows], [r["F_learned"] for r in rows],
-        "-D", color="#d62728", ms=6, lw=2.2, label="learned optimal stopping",
+        "-D", color="#d62728", ms=6, lw=2.2, label="learned stopping policy",
     )
+    if "T_optimal" in rows[0]:
+        p.plot(
+            [r["T_optimal"] for r in rows], [r["F_optimal"] for r in rows],
+            "-o", color="k", ms=4, lw=1.6, label="L&S optimum (exact DP)",
+        )
     p.set_xscale("log")
     p.set_xlabel("mean run time per shot (us)")
     p.set_ylabel("balanced initial-state fidelity")
@@ -8949,6 +8954,16 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
             p.bar(x + (j - 1) * 0.27, g, width=0.27, color=col, alpha=0.85,
                   yerr=err, ecolor="#333333", capsize=2, label=lab)
         p.set_ylabel("risk above the L&S optimum (%, 95% paired CI)")
+        # At the smallest a/c the optimum stops at t = 0 and the SPRTs cannot,
+        # so their bars run to +100-600%; clip so the rest stays readable.
+        cap = 25.0
+        p.set_ylim(-5.0, cap)
+        for j, key in enumerate(("exact_sprt", "learned", "exhaustion")):
+            for i, r in enumerate(rows):
+                if r[f"gap_{key}_pct"] > cap:
+                    p.annotate(f"{r[f'gap_{key}_pct']:.0f}%",
+                               (x[i] + (j - 1) * 0.27, cap), fontsize=6,
+                               rotation=90, ha="center", va="top")
     else:
         red = np.array([r["risk_reduction_pct"] for r in rows])
         rlo = np.array([r.get("risk_reduction_ci_low", np.nan) for r in rows])
