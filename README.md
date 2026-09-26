@@ -125,9 +125,9 @@ It also scores every rule under **both action sets** — two, and three with
 `--cost-discard` — on identical shots, and plots them against each other.
 The third action buys most for the rules that have no other way to handle an
 ambiguous shot (+31% for the fixed-time threshold) and least for those that
-already wait for confidence (+5% for the exhaustion exit), which inverts the
-ranking: with post-selection the two *simplest* event-time rules become the
-best two.
+already wait for confidence (+13% for the learned policy), which compresses
+the field: with post-selection the best-to-worst spread falls from 40% to
+11%, and the simplest event-time rules come within 1–2% of the best.
 
 ## Experiments
 

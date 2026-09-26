@@ -630,10 +630,13 @@ are not moving together at all:
 | fixed-time count threshold | **−5.0% to +1.4%** — immune | 0 of 5 positive |
 | fixed-count MMPP | +2.3% to +6.9% | 1 of 5 |
 | adaptive count SPRT | +3.5% to +8.5% | 4 of 5 |
-| + exhaustion exit | +3.9% to +10.2% | 4 of 5 |
-| adaptive MMPP, exact grid-free | +3.7% to +11.8% | 4 of 5 |
-| adaptive MMPP, constant boundary | +7.1% to **+16.1%** | **5 of 5** |
-| learned optimal stopping | +9.0% to +15.4% | **5 of 5** |
+| adaptive MMPP, exact grid-free | +4.5% to +11.2% | 4 of 5 |
+| adaptive MMPP, epoch boundary (± exit) | +8.0% to +12.9% | **5 of 5** |
+| learned stopping policy | +7.1% to **+14.0%** | **5 of 5** |
+
+(The exhaustion-exit row now duplicates the epoch boundary: with a deadline
+axis of its own the epoch rule deadlines before it exhausts, so the exit
+almost never fires.)
 
 The "resolved" column is the number of the five noisy conditions whose 95%
 interval excludes zero. These intervals are the **unpaired** kind — clean
@@ -664,41 +667,42 @@ degradation is largest at Γ_tot·τ_c ≈ 1–2 (τ_c = 0.1–0.25 ms against
 1/Γ_tot = 106 µs) and smaller at both ends — fast noise averages out within a
 dwell, slow noise is quasi-static and a recalibrated boundary absorbs it.
 
-**The ranking never changes — and, corrected, was never resolved to begin
-with.** Relative fragility does not overturn the ordering: the learned
-policy degrades most in percentage terms but from a better starting point.
-On point estimates a learned policy is cheapest at 11 of the 18 (point,
-τ_c) conditions (7 clean-trained, 4 retrained) and the exact grid-free
-boundary at 6. An earlier version of this paragraph read that tally as the
-finding and quoted "13 of 18". Paired against the exact boundary, the
-learned policy's lead is resolved in only **3 of 18** conditions (+4.7%
-moderate/clean, +2.3% moderate/τ_c = 1 ms, +2.5% high flux/τ_c = 0.25 ms)
-— and it is resolvedly *behind* in **none**. That is the accurate
-statement: never worse, better in a sixth of conditions, indistinguishable
-in the rest. It is the same wash the two-action optimal-stopping section
-reports, and it survives the noise.
+**The ranking never changes.** Relative fragility does not overturn the
+ordering: the learned policy degrades most in percentage terms but from a
+better starting point. On point estimates a learned policy is cheapest at
+12 of the 18 (point, τ_c) conditions under two actions (9 clean-trained, 3
+retrained), the exact boundary at 4, the epoch boundary at 2. Paired
+against the exact boundary, the learned policy's lead is resolved in **7 of
+18** and it is resolvedly *behind* in **none** — never worse, better in over
+a third of conditions, and at the moderate point the cheapest rule at all
+six. (With the policy's old non-Bayes decision and missing payoff feature
+this was 3 of 18 and read as a wash; the exact-optimum section explains
+both fixes.)
 
 **Sparsity sets the exposure.** At the sparse point (2.74 photons per bright
-dwell) nothing happens to anybody — 0.2% to 2.6% across all methods and all
+dwell) nothing happens to anybody — 0.3% to 2.8% across all methods and all
 correlation times. There is barely any timing information to corrupt. At high
-flux the spread is 1–10%, at the moderate point 0–16%.
+flux the spread is 0–10%, at the moderate point −5% to +15%.
 
-**Retraining on the noise buys nothing, and paired it is slightly
-negative.** The learned policy is reported twice, fitted on clean paths
-(the naive deployment case) and refitted on matched noisy calibration
-paths. Across the 30 non-clean (point, τ_c, action set) comparisons the
-**median gain from retraining is +0.00%**. Paired, 14 are resolved: 5 where
-retraining helps and 9 where it hurts. The largest effects either way are
-+2.2% (high flux, τ_c = 1 ms, two actions) and −3.9% (moderate,
-τ_c = 0.05 ms, two actions), and the two largest are both losses.
+**Retraining on the noise buys nothing, and paired it only ever hurts.**
+The learned policy is reported twice, fitted on clean paths (the naive
+deployment case) and refitted on matched noisy calibration paths. Across the
+30 non-clean (point, τ_c, action set) comparisons the **median gain from
+retraining is −0.03%**. Paired, 7 are resolved, and **all 7 are losses**,
+the largest −3.3% (moderate, τ_c = 0.05 ms, two actions); the largest point
+estimate in its favour is +1.3%, unresolved.
 
 That is a slightly stronger statement than "no difference", and the sign
 is the interesting part. A matched retrain sees the right distribution but
 through a noisier calibration set, so the regression pays a variance cost
 for a bias it cannot much reduce. At these calibration sizes the variance
-cost wins. The practical reading is the reassuring one: **you do not need
-to characterise your noise to train the policy**, and attempting to may
-cost you a couple of percent.
+cost wins. There is also a structural reason it cannot help much: the fit
+is label-free, so its target is the payoff the *nominal* filter believes it
+will get. Under mismatch that belief is what is wrong, and retraining on
+noisy paths regresses onto the same misspecified belief. (A label-based
+target would not share that blind spot; it is untested here.) The practical
+reading is still the reassuring one: **you do not need to characterise your
+noise to train the policy**, and attempting to may cost you a few percent.
 
 So the degradation above is damage from the noise itself, not from training
 on the wrong distribution — a distinction a single clean-trained row would
@@ -725,18 +729,16 @@ At the moderate point, clean condition, sorted by risk:
 
 | rule | two actions | three actions | third action buys | abandoned |
 |---|---|---|---|---|
-| fixed-count MMPP | 0.1038 | **0.0781** | +24.8% | 13% |
-| adaptive count SPRT | 0.1012 | **0.0790** | +21.9% | 12% |
-| exact grid-free boundary | 0.0930 | 0.0796 | +14.3% | 8% |
-| learned optimal stopping | **0.0886** | 0.0809 | +8.6% | 10% |
+| learned stopping policy | **0.0890** | **0.0776** | +12.9% | 7% |
+| fixed-count MMPP | 0.1038 | 0.0781 | +24.8% | 13% |
+| adaptive count SPRT | 0.1012 | 0.0790 | +21.9% | 12% |
+| exact grid-free boundary | 0.0932 | 0.0796 | +14.6% | 8% |
+| epoch-grid boundary (± exit) | 0.0946 | 0.0800 | +15.5% | 7% |
 | fixed-time count threshold | 0.1243 | 0.0864 | **+30.5%** | 13% |
-| + exhaustion exit | 0.1052 | 0.1002 | +4.7% | 3% |
-| epoch-grid boundary | 0.1085 | 0.1024 | +5.7% | 10% |
 
 Every gain in that column is resolved. Over the full grid — 8 rules × 6
 conditions × 3 points = **144** cells — the paired 95% interval excludes
-zero in **143**, the sole exception being the exhaustion exit at the
-moderate point, τ_c = 0.02 ms (+1.0%). This is the one comparison in the
+zero in **all 144**. This is the one comparison in the
 file where the effects are far larger than the uncertainty, which is why
 it reads so
 cleanly: the third action is worth tens of percent, while the stopping-rule
@@ -746,28 +748,34 @@ differences it is set against are worth low single digits.
 The gain is largest for the rules with no other way to handle an ambiguous
 shot — the fixed-time threshold (+31%), the fixed-count rules (+22 to +25%) —
 and smallest for the rules that already handle ambiguity by waiting: the
-exhaustion exit (+5%) and the epoch boundary (+6%). A boundary rule keeps
+learned policy (+13%) and the boundary rules (+15 to +16%). A boundary rule keeps
 going until it is confident; a discard band reaches confidence by throwing
 the hard cases away instead. Doing both is solving the same problem twice.
 
-**So the ranking inverts.** Under two actions the sophisticated rules win and
-the learned policy leads at 0.0886. Under three the two *simplest* event-time
-rules — fixed-count MMPP and the plain adaptive count — are the best two, and
-the learned policy drops to fourth. That is not a yield artifact: every rule
-in that table abandons 3–13% of shots, a narrow range.
+**Corrected: the ranking does not invert.** An earlier version of this
+section found that under three actions "the two simplest event-time rules
+become the best two, and the learned policy drops to fourth". That came from
+the learned policy's old basis, which could not represent the flat discard
+branch of the payoff any more than the exhausted face. With H(l) in the
+basis the learned policy leads under both action sets — at 13 of the 18
+three-action conditions, the rest going to fixed-count MMPP (4) and the
+retrained policy (1) — and beats the exact boundary, resolved, in **all 18**.
 
-It also compresses the field. Best-to-worst spread goes from 40% of the best
-risk under two actions to 31% under three, and the order scrambles. If you
-can post-select, most of the value of a clever stopping rule evaporates.
+What survives is the compression. Best-to-worst spread goes from 40% of the
+best risk under two actions to **11%** under three: if you can post-select,
+most of the value of a clever stopping rule evaporates, and the simplest
+event-time rules come within 1–2% of the best. That is not a yield
+artifact: every rule in that table abandons 7–13% of shots.
 
 **Noise changes none of this.** The gains above are quoted on the clean
 condition; across all five correlation times they move by only a few points
-(threshold +17 to +31%, fixed-count MMPP +19 to +25%, exhaustion exit +1 to
-+5%). The ordering by how much each rule gains is the same at every τ_c.
+(threshold +17 to +31%, fixed-count MMPP +19 to +25%, epoch boundary +12 to
++16%, learned policy +11 to +13%). The ordering by how much each rule gains
+is the same at every τ_c.
 
 **The sparse point is degenerate and is flagged, not reported.** At 2.74
 photons per bright dwell the readout cannot reach a risk below w = 0.15, so
-the optimal three-action rule abandons 93–100% of shots and the "54% gain" is
+the three-action rules abandon 75–100% of shots and the large "gain" is
 just w beating the readout. Rows above 90% abandoned carry a `degenerate`
 flag in the CSV and a footnote in the printout. Reading that as a win for
 the third action would be reading the cost constant, not the physics.
@@ -885,8 +893,15 @@ custom classes, so a bare `pickle.load` with no imports works.
 - **Test-set frontier.** Every method's configuration is optimized on the test
   set, which is symmetric between them and matches published figures where
   t_R and the count threshold are both tuned, but it is not an out-of-sample
-  number. The one exception is the learned policy, which is fitted on
-  calibration paths and applied to test — in-sample would flatter it by 23%.
+  number. The exceptions are the learned policy, which is fitted on
+  calibration paths and applied to test — in-sample would flatter it by 23%
+  — and the exact DP optimum, which is computed from the model and never
+  sees data at all.
+- **"Optimal" means optimal for the model.** The DP optimum is exact for the
+  MMPP the filter assumes. Under the detector and rate-noise experiments that
+  model is misspecified, the posterior is no longer the true one, and no rule
+  here — the DP included — carries an optimality guarantee there. The DP is
+  also two-action only, so the discard sweep has no optimum column.
 - **The fixed-count MMPP cutoff is fitted, the count rule's is not.** Method 3
   calibrates a real-valued LLR cutoff while method 2's decision has no free
   parameter beyond `n_up`. At η = 0.02 that extra freedom costs it slightly
@@ -896,7 +911,7 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 90 checks
+python adaptive_charge_state_master.py validate                  # 97 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]
@@ -907,4 +922,5 @@ python results/analysis.py
 ```
 
 The readout matrix takes about 50 minutes at 3-way parallelism, the SNR and
-noise experiments a further 20, and `optimal demo` about 10.
+noise experiments a further 20, and `optimal demo` about 70 with the exact
+DP at every a/c (about 10 with `--no-dp`).
