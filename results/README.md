@@ -42,7 +42,7 @@ two saturation powers are nearly equal (53 vs 53.2 µW) the ratio is bounded
 below by 2, bottoming out at 2.03 near 0.8 µW. `validate` asserts the bound
 and locates the minimum.
 
-## The five methods
+## The six methods
 
 | stopping rule | decision statistic | method |
 |---|---|---|
@@ -50,7 +50,8 @@ and locates the minimum.
 | fixed count (n-th photon) | count — one bit | 2 adaptive count SPRT |
 | fixed count (n-th photon) | MMPP LLR | 3 fixed-count MMPP |
 | LLR boundary | MMPP LLR | 4 adaptive MMPP SPRT |
-| learned, on (LLR, information gap) | MMPP LLR | 5 optimal stopping |
+| learned, on (LLR, information gap) | MMPP LLR | 5 learned stopping policy |
+| optimal, on the full posterior | MMPP LLR | 6 Ludkovski–Sezer optimum (exact DP) |
 
 Method 5 optionally gains a **third action** — abandon the shot — which turns
 the single decision threshold into two and an inconclusive band. See below.
@@ -58,9 +59,11 @@ the single decision threshold into two and an inconclusive band. See below.
 Methods 2 and 3 stop at identical instants — `validate` asserts exact
 equality of their per-shot stop times — so 2 → 3 is a clean read on the
 **decision statistic** with stopping held fixed, and 3 → 4 a clean read on
-the **stopping rule** with the statistic held fixed. Method 5 is the
-Ludkovski–Sezer Bayes-optimal rule, and exists to answer "how much is left on
-the table", which methods 1–4 cannot answer among themselves.
+the **stopping rule** with the statistic held fixed. Method 6 is the
+Ludkovski–Sezer Bayes-optimal rule itself, computed exactly, and exists to
+answer "how much is left on the table", which methods 1–5 cannot answer among
+themselves. Method 5 is a regression approximation of it; an earlier version
+of this file presented method 5 as the optimum, which it is not.
 
 ## Headline: the speed comes from the stopping rule, the accuracy from the statistic
 
@@ -166,78 +169,126 @@ of any axis here. At SNR = 0.5 no target in the grid is reachable, because
 the ceiling sits below the grid's own floor — the regime the sweep was added
 to reach.
 
-## The optimal-stopping bound: the tuned SPRT is close to it
+## How far every rule is from the optimum
 
-Method 5 solves the Bayes problem
+Method 6 solves the Ludkovski–Sezer (2012) Bayes problem
 
 ```
 minimise   c E[tau] + a P(say NV0 | was NV-) + b P(say NV- | was NV0)
 ```
 
-by Longstaff–Schwartz regression Monte Carlo over (LLR, information gap),
-with a/c swept from 2 to 2×10⁵ µs. Unlike "time to reach F*", this objective
-requires naming what a microsecond is worth — which is the point: a/c is the
-knob that traces the frontier.
+exactly: backward induction on the paper's full posterior for the augmented
+chain (initial state, current state) — the initial-state LLR l and the two
+hypothesis columns u, v — plus time-to-go. It is the optimum in the paper's
+sense (their Cor. 4.1, stop the first time V(T − t, Π_t) = H(Π_t)), up to a
+decision step of 0.1–2.2 µs.
 
-**Corrected.** An earlier version of this table compared the learned policy
-only against the **epoch-restricted** boundary and reported +3% to +22% "in
-the real regime". The exact grid-free SPRT could not be scored in this
-currency at the time because `run_sprt` took no economics. It can now, and
-against the best of the three boundary variants the advantage largely
-evaporates:
+**How it is checked.** `validate` reproduces the paper's own published
+example (§6.2: rates 1 and 5, costs 2, T = 2) from the 3-D solver with
+switching → 0 — R\* = 0.68144 against the exact 0.681312, continuation
+region [0.2261, 0.7033] against [0.2253, 0.7050] (the paper prints [0.230,
+0.705] at its stated 10⁻⁴ tolerance). It also simulates the DP's policy on
+fresh shots, which must score its own R\*. In the full run below it does, at
+all 58 non-trivial (point, a/c) settings, to within ±0.7%.
 
-| point | learned vs *best* boundary | resolved wins | resolved losses | ties |
+The table is Bayes risk above the optimum, paired on 7200 test shots per
+state with 400 resamples. "Resolved above" counts the a/c values whose 95%
+interval lies entirely above zero.
+
+| point | rule | median gap | range | resolved above / of |
 |---|---|---|---|---|
-| high flux | median **+0.4%**, range [−3.8%, +4.5%] | 5 | 5 | 14 |
-| moderate | median **−1.2%**, range [−5.4%, +9.5%] | 7 | 9 | 8 |
-| sparse | median **−0.0%**, range [−0.9%, +56.1%] | 8 | 5 | 11 |
+| high flux | exact grid-free SPRT | +2.2% | [−0.4, +8.8] | 12 / 22 |
+| | learned policy | **+0.5%** | [−0.7, +3.9] | 10 / 22 |
+| | epoch SPRT (+ exit) | +2.7% | [+0.7, +6.2] | 13 / 22 |
+| moderate | exact grid-free SPRT | +4.0% | [−0.6, +7.6] | 17 / 20 |
+| | learned policy | **+1.2%** | [+0.8, +4.6] | 9 / 20 |
+| | epoch SPRT (+ exit) | +4.5% | [+1.6, +12.2] | 16 / 20 |
+| sparse | exact grid-free SPRT | +0.3% | [−1.1, +3.8] | 3 / 16 |
+| | learned policy | **+0.2%** | [−0.4, +0.6] | 5 / 16 |
+| | epoch SPRT (+ exit) | +0.4% | [−0.4, +2.0] | 7 / 16 |
 
-Each row is 24 values of a/c, paired-bootstrapped over 7200 test shots per
-state. The wins and losses are close to balanced at every point, and a
-third to a half of the settings cannot be called at all — which is what a
-wash looks like when you put an interval on it. An earlier version of this
-table counted only point-estimate wins (14, 9 and 12 of 24) and so made
-the comparison look more decided in both directions than it is.
+(Only a/c values where the optimum does not stop at t = 0 are counted — see
+below for that corner.)
 
-At the moderate point the learned policy is *behind* the exact boundary at
-most values of a/c. Where it leads is a narrow band around a/c ≈ 200–1300
-(+0.5% to +5.0%) and the degenerate a/c < 10 corner, where it can abandon at
-t = 0 and the boundary cannot. The epoch grid, not the policy, was most of
-the earlier number. Two honest caveats sit at the edges. Below a/c = 15
-the "win" is only that the policy may stop at epoch 0 while the boundary rule
-must wait one epoch. Above a/c ≈ 10⁴ the policy **loses**: it plateaus at
-F ≈ 0.943 and T ≈ 26 µs while the exact boundary keeps buying accuracy with
-time, reaching 0.9456 at 34 µs. At near-free time the value differences the
-regression must resolve become tiny against the payoff scale, and it stops
-too early. That is a limitation of regression Monte Carlo at extreme
-economics, not of the formulation.
+**The answer is now a measurement.** The tuned SPRT is a few percent from
+optimal — median +4.0% at the moderate point, up to +7.6% — and the learned
+policy is closer: at the moderate point it is not distinguishable from the
+optimum anywhere above a/c = 1340, and it is within 0.6% at every a/c at the
+sparse point. The handful of "negative" gaps (the SPRT at −0.3 to −0.6% at
+low a/c) are the DP's own resolution: its policy is Bermudan at the DP step
+and its value carries ~0.15% of discretisation, so a continuous-time rule
+can edge it by that much.
 
-On the fidelity-vs-time currency, against the **exact grid-free** SPRT — the
-stronger incumbent, since methods 3–5 are restricted to a 128-epoch grid:
+**Why the SPRT misses.** Its boundary is constant. The optimal continuation
+interval, along the paths the moderate point actually visits, shrinks from
+(−4.3, +2.7) in l in the first 2 µs to (−2.9, +0.4) by 15–40 µs and
+(−1.5, +0.1) by 40–100 µs, as the remaining information d drains away —
+L&S Remark 4.2's shrinking regions, driven here by d as much as by the
+deadline. A constant band plus a hard deadline cannot follow that.
+
+**The corner where the optimum does nothing.** Below a/c ≈ 2/Δλ (9 µs at
+the moderate point, 91 µs at the sparse one) the optimum stops at t = 0 and
+guesses, at risk exactly 0.5 — L&S Remark 6.1's non-triviality condition,
+matched to within the a/c grid. The learned policy reproduces this
+exactly. The SPRTs cannot stop before their boundary is crossed, and pay
++1 to +128% for it there.
+
+### Correction: what used to be called "the optimum" was two approximations
+
+Every earlier version of this section compared the rules against method 5,
+the regression policy, as if it were the optimum, and concluded "the tuned
+SPRT is within a few percent of the Bayes optimum … there is no large
+unclaimed gain". That comparison could not support the claim: a feasible
+approximation that loses to the SPRT cannot bound how far the SPRT is from
+the optimum. An audit against the paper, followed by the exact DP, found:
+
+- **The learned policy was not deciding the way it was fitted.** The
+  `optimal` command replaced the Bayes decision l ≥ 0 (L&S eq. 2.5) with a
+  balanced-fidelity cutoff re-fitted on calibration — values from −1.26 to
+  +2.76 where the optimum is 0. Rescoring the committed policies with the
+  Bayes rule lowered their risk 2.9–4.9% at every a/c ≥ 1340 at the moderate
+  point, and it alone explained the "plateau at F ≈ 0.943 above a/c ≈ 10⁴"
+  that this file used to blame on "a limitation of regression Monte Carlo".
+- **Its basis could not represent "no information left".** Without the
+  payoff H(l) as a regressor, the fitted continuation value sat above H on
+  30–45% of the l range at late epochs, so it kept waiting exactly where
+  every rule must stop. Added, along with a proven stop at
+  d ≤ d\* = 4c / (max(a,b)(λ_max + Δλ/4)) — below which no remaining
+  information can pay for itself.
+- **Its state is a projection.** (l, d) is not a sufficient statistic; the
+  drift, jump and click rate at fixed (l, d) depend on the level of u and v.
+  This one turned out cheap: the DP measured the loss from dropping it at
+  under 0.25%.
+- **The baselines were handicapped the other way.** The epoch SPRTs were
+  tuned with one decision rule and scored with another, with no deadline
+  axis, which put them +19–29% above the optimum at a/c = 500; they now sit
+  at +2–12%. The exact SPRT detected exhaustion only at the next click and
+  missed 22.6% of exhausted shots.
+
+With all of that fixed, the ordering reverses: the learned policy, not the
+SPRT, is the rule closest to optimal. The broad conclusion survives in a
+sharper form — **a tuned constant boundary leaves a few percent on the
+table, and a well-specified approximation of the optimum recovers most of
+it** — and it now rests on a computed optimum rather than on a rule that was
+being called one.
+
+On the fidelity-vs-time currency (moderate point, exact grid-free SPRT as the
+incumbent):
 
 | F* | t_thr | t_exact SPRT | t_learned | sp_exact | sp_learned |
 |---|---|---|---|---|---|
-| 0.88 | 8.70 | 6.31 | 6.67 | 1.38× | 1.30× |
-| 0.89 | 9.79 | 7.04 | 7.28 | 1.39× | 1.35× |
-| 0.90 | 12.21 | 8.03 | 7.95 | 1.52× | 1.54× |
-| 0.91 | 16.47 | 10.68 | 8.68 | 1.54× | **1.90×** |
-| 0.92 | 17.96 | 12.24 | 9.76 | 1.47× | **1.84×** |
-| 0.93 | 20.11 | 12.28 | 11.22 | 1.64× | **1.79×** |
+| 0.88 | 8.70 | 6.31 | 6.63 | 1.38× | 1.31× |
+| 0.89 | 9.79 | 7.04 | 7.18 | 1.39× | 1.36× |
+| 0.90 | 12.21 | 8.03 | 7.86 | 1.52× | 1.55× |
+| 0.91 | 16.47 | 10.68 | 8.67 | 1.54× | **1.90×** |
+| 0.92 | 17.96 | 12.24 | 9.86 | 1.47× | **1.82×** |
+| 0.93 | 20.11 | 12.28 | 11.59 | 1.64× | **1.73×** |
 
-**The conclusion is a negative one, and it is the useful kind.** The tuned
-SPRT is within a few percent of the Bayes optimum over most of the frontier,
-and loses only in the top ~3% of the fidelity range, where the learned policy
-is 9–23% faster. In the Bayes-risk currency, against the best boundary
-variant, the median advantage is **+0.4%, −1.2% and −0.0%** at the three
-points — i.e. nothing. There is no large unclaimed gain sitting in a smarter
-stopping rule; the SPRT with a calibrated asymmetric boundary is close to all
-there is, and the earlier double-digit figures were measuring the epoch grid.
-
-| point | ph/dwell | thr ceiling | exact MMPP | learned | median risk reduction |
-|---|---|---|---|---|---|
-| high flux | 9.93 | 0.8807 | 0.8962 | 0.8960 | +0.4% |
-| moderate | 27.43 | 0.9397 | 0.9461 | 0.9432 | −1.2% |
-| sparse | 2.74 | 0.7941 | 0.7991 | 0.7983 | −0.0% |
+| point | ph/dwell | thr ceiling | exact MMPP | learned |
+|---|---|---|---|---|
+| high flux | 9.93 | 0.8807 | 0.8962 | 0.8969 |
+| moderate | 27.43 | 0.9397 | 0.9461 | 0.9455 |
+| sparse | 2.74 | 0.7941 | 0.7991 | 0.7989 |
 
 ### The information-exhaustion exit is free, and worth taking
 
@@ -258,21 +309,18 @@ at 49 µs of 100 µs. Only the sparse point (19%, 669 µs of 800 µs) mostly
 deadlines first.
 
 Two things the exit does *not* do, worth separating because it is easy to
-conflate them. It does not change any decision at fixed configuration. But
-across a tuning sweep it changes *which* boundary is cheapest — a wider,
-more accurate one becomes affordable once indecisive shots stop paying the
-full deadline — so accuracy moves too. Median risk reduction is +0.8% at the
-moderate point, +0.1% at high flux, 0.0% at sparse.
+conflate them. It does not change any decision at fixed configuration. And
+once the epoch SPRT is tuned with a deadline of its own, it barely changes
+the risk either: across all **72** (point, a/c) settings the change is
+**never negative**, 44 are exactly zero, and the largest gain is 0.26%. The
+larger gains reported before this came from an epoch SPRT with no deadline
+axis, for which the exit was standing in for the missing truncation.
 
-Those medians are small enough to deserve an interval, and they get one.
-Across all **72** (point, a/c) settings the exit's risk change is **never
-negative** — 31 are exactly zero and the other 41 are positive, of which
-**36 are resolved** by the paired bootstrap. So "free" is not a rounding
-artifact: at no economics tested does taking the exit cost anything, and
-where it gains, the gain is almost always larger than shot noise. The
-gains are concentrated at the two denser points (resolved at 15 and 14 of
-24); at the sparse point most shots deadline before exhausting, so there
-is nothing to collect.
+The exit is also far weaker than the optimum's own rule. Stopping is optimal
+once d ≤ d\* (above), which at the moderate point, a/c = 500, paths reach at a
+median of 55 µs against 131 µs for d ≤ 10⁻⁹. And the exact engine now finds
+the exhaustion time in closed form between clicks; it used to wait for the
+next click, and missed 22.6% of exhausted shots before the deadline.
 
 ## The third action: abandoning a shot
 
