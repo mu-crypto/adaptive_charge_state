@@ -17,7 +17,8 @@ Always, on identical shots:
 2. **adaptive count SPRT** — stop at the n-th photon, decide on whether you got there
 3. **fixed-count MMPP** — same stopping rule as 2, decide with the calibrated MMPP LLR
 4. **adaptive MMPP SPRT** — stop when the LLR crosses a calibrated boundary
-5. **learned optimal stopping** — the Bayes-optimal rule, via `optimal`
+5. **learned stopping policy** — a regression approximation of the optimum, via `optimal`
+6. **the Ludkovski–Sezer optimum** — the Bayes-optimal rule itself, by exact dynamic programming, via `optimal`
 
 The design is a 2×2 of stopping rule against decision statistic, plus the
 optimum the 2×2 is measured against:
@@ -29,7 +30,8 @@ optimum the 2×2 is measured against:
 | fixed count | count (one bit) | 2 adaptive count SPRT |
 | fixed count | MMPP LLR | 3 fixed-count MMPP |
 | LLR boundary | MMPP LLR | 4 adaptive MMPP SPRT |
-| learned, on (LLR, information gap) | MMPP LLR | 5 optimal stopping |
+| learned, on (LLR, information gap) | MMPP LLR | 5 learned policy |
+| optimal, on the full posterior (LLR, u, v) | MMPP LLR | 6 exact DP optimum |
 
 Methods 2 and 3 share their stopping rule *exactly* — identical per-shot stop
 times, hence identical mean run time, which `validate` asserts — so 2 → 3
@@ -43,30 +45,40 @@ calibrated cutoff, plus a paired exact McNemar test.
 ## Optimal stopping
 
 Methods 1–4 are rules that were written down and then tuned; none is claimed
-optimal. Method 5 computes the one that is — the Ludkovski–Sezer Bayes
-problem on the augmented chain, solved by Longstaff–Schwartz regression Monte
-Carlo over the initial-state LLR and the information gap
-`d = logit(u) − logit(v)`.
+optimal. Method 6 is the one that is: the Ludkovski–Sezer (2012) Bayes
+problem on the augmented chain (initial state, current state), solved by
+backward induction on the full posterior — the initial-state LLR and the two
+hypothesis columns u, v — plus time-to-go. Method 5 approximates the same
+problem by Longstaff–Schwartz regression on (LLR, information gap) at 128
+epochs; it is feasible, so its risk bounds the optimum from above, but it is
+not the optimum.
 
 ```bash
 python adaptive_charge_state_master.py optimal demo
-python adaptive_charge_state_master.py optimal power --point 2 --n-epochs 256
+python adaptive_charge_state_master.py optimal demo --no-dp   # skip the DP
 ```
 
+The DP is checked in `validate` against the paper's own published example
+(§6.2: R\* = 0.6813, continuation region [0.225, 0.705]) and by simulating its
+policy on fresh shots, which must score its own R\*. It costs ~40 s per
+(point, a/c) and skips itself where it would need more than 5000 time steps
+(the long-horizon end of the `power` sweep).
+
 It reports two currencies: Bayes risk against `a/c` (microseconds of readout
-per avoided error), which is what the policy actually optimises, and time to
-reach a target fidelity with the same paired bootstrap as the other methods.
+per avoided error), which is what the optimum minimises, and time to reach a
+target fidelity with the same paired bootstrap as the other methods. Every
+rule's gap to the optimum carries a paired 95% interval.
 
 It also measures the **information-exhaustion exit** separately. A photon
 translates both hypotheses equally in log-odds, so `d` is unchanged at every
 click and shrinks only while waiting; once it closes the LLR is frozen. At
 fixed boundary the exit therefore gives bit-identical decisions at
-never-longer run times — one comparison per epoch to implement, up to 130 µs
-a shot saved. `validate` asserts all three facts.
+never-longer run times. The optimum stops earlier still: once
+`d <= d* = 4c / (max(a,b)(λ_max + Δλ/4))` no remaining information can pay
+for itself, which is proven and pinned in `validate`, and the learned policy
+enforces it.
 
-Answer, at the three demo points: the tuned SPRT is within a few percent of
-the optimum over most of the frontier and loses only in the top ~3% of the
-fidelity range. See `results/README.md`.
+See `results/README.md` for how far each rule sits from the optimum.
 
 ## A third action: abandoning the shot
 
@@ -145,13 +157,13 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 90 numerical checks
+python adaptive_charge_state_master.py validate          # 97 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py plot contrast     # figures + summary
 python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
-python adaptive_charge_state_master.py optimal demo      # the Bayes-optimal rule
+python adaptive_charge_state_master.py optimal demo      # every rule vs the exact optimum
 python adaptive_charge_state_master.py discard demo      # add the abandon action
 python adaptive_charge_state_master.py noiserisk demo    # all six under rate noise
 python results/analysis.py                              # cross-experiment tables
@@ -214,6 +226,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 90/90 on both.
+active, every saved result records it, and `validate` passes 97/97 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.

@@ -4995,9 +4995,14 @@ def run_parameter_robustness(
 #
 # Everything above compares stopping rules that were WRITTEN DOWN -- a fixed
 # window, the n-th photon, an SPRT boundary -- and then tuned. None of them is
-# claimed to be optimal. This section computes the rule that is, so the
-# existing methods can be measured against the ceiling rather than only
-# against each other.
+# claimed to be optimal. This section APPROXIMATES the rule that is, by
+# regression Monte Carlo; section 10e computes it exactly by dynamic
+# programming, and that exact rule is the ceiling every method, this one
+# included, is measured against. An earlier version presented this section's
+# regression policy as the optimum itself. It is a feasible Bermudan
+# approximation on a 13-function basis in (l, d) -- which drops one of the
+# three posterior coordinates -- and at the moderate point it sits 2-5% above
+# the true optimum.
 #
 # The problem, following Ludkovski & Sezer (Stochastic Models 28(2), 2012)
 # applied to the augmented chain (M_0, M_t), is
@@ -6353,7 +6358,7 @@ def run_optimal_stopping(
     with_dp: bool = True,
 ) -> dict:
     """
-    Five stopping rules on identical shots, in both currencies.
+    Six stopping rules on identical shots, in both currencies.
 
     The rules, all sharing one exact event-time filter:
 
@@ -6361,7 +6366,8 @@ def run_optimal_stopping(
         2. adaptive MMPP SPRT, exact           the best rule elsewhere here
         3. the same, restricted to the epochs  grid-matched control for 5
         4. rule 3 plus the exhaustion exit     free, decisions unchanged
-        5. learned policy (regression MC)      the Ludkovski-Sezer optimum
+        5. learned policy (regression MC)      an approximation of rule 6
+        6. exact DP (with_dp)                  the Ludkovski-Sezer optimum
 
     Rules 3-5 act only at epochs, so 3 -> 5 isolates the stopping rule with
     the filter, the action times and the shots all held fixed. Rule 2 is
