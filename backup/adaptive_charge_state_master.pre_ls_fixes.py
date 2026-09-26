@@ -1460,14 +1460,7 @@ def build_no_click_spectral(params: MMPPParams) -> NoClickSpectral:
         elif abs(c) > 0.0:
             V = np.array([[mu1 - d, mu2 - d], [c, c]], dtype=float)
         else:
-            # No switching: A is diagonal and its eigenvectors are the axes,
-            # but they must be ORDERED so that column 0 carries mu1, the
-            # larger (less negative) eigenvalue. V = I would pair mu1 =
-            # -lambda_0 with the NV- coordinate, whose eigenvalue is really
-            # -lambda_minus -- that flipped the sign of the no-click LLR slope
-            # (+Dlam instead of -Dlam) and made every decision a coin flip.
-            # validate() accepts zero switching, so this was reachable.
-            V = np.eye(2) if a >= d else np.array([[0.0, 1.0], [1.0, 0.0]])
+            V = np.eye(2)
 
         det_V = V[0, 0] * V[1, 1] - V[0, 1] * V[1, 0]
 
@@ -1835,7 +1828,6 @@ class PaddedRecords:
     alpha: np.ndarray         # (n, M, 2)
     beta: np.ndarray          # (n, M, 2)
     hilbert: np.ndarray       # (n, M) remaining information, see hilbert_gap
-    h_coef: np.ndarray        # (n, M, 2, 2) V^-1 H_start: columns in eigen coords
     n_int: np.ndarray         # (n,)
     n_clicks: np.ndarray      # (n,)
     t_max_ms: float
@@ -1894,12 +1886,6 @@ def pack_records(
     # Padded columns are +inf, not 0: a padded interval must never look like
     # an exhausted one. They are also masked out by `valid` in run_sprt.
     hilbert = np.full((n, M), np.inf)
-    # Hypothesis columns in eigen-coordinates, so the gap can be evaluated at
-    # ANY time inside a no-click interval, not only at its start. Padding is
-    # the identity, which has an infinite gap.
-    h_coef = np.zeros((n, M, 2, 2))
-    h_coef[:, :, 0, 0] = 1.0
-    h_coef[:, :, 1, 1] = 1.0
     n_int = np.zeros(n, dtype=int)
     n_clicks = np.zeros(n, dtype=int)
 
@@ -1919,7 +1905,6 @@ def pack_records(
             alpha[i, j] = a
             beta[i, j] = b
             hilbert[i, j] = hilbert_gap(r.H_start[j])
-            h_coef[i, j] = spec.V_inv @ r.H_start[j]
 
     return PaddedRecords(
         t_start=t_start,
@@ -1930,7 +1915,6 @@ def pack_records(
         alpha=alpha,
         beta=beta,
         hilbert=hilbert,
-        h_coef=h_coef,
         n_int=n_int,
         n_clicks=n_clicks,
         t_max_ms=float(records[0].t_max_ms),
@@ -1945,26 +1929,6 @@ def _first_true(mask: np.ndarray) -> np.ndarray:
     return np.where(any_true, idx, mask.shape[1])
 
 
-def _gap_in_interval(
-    h_coef: np.ndarray, x: np.ndarray, spec: NoClickSpectral
-) -> np.ndarray:
-    """
-    Hilbert gap d of the hypothesis columns after a no-click stretch.
-
-    Inside an interval each column is proportional to V diag(1, x) V^-1 h,
-    x = exp(-2 delta dt), so with c = V^-1 h precomputed the gap is a
-    rational function of x. d is monotone in dt (the no-click flow is a
-    Birkhoff contraction), which is what makes bisection on it valid.
-    """
-    V = spec.V
-    c0, c1 = h_coef[..., 0, :], h_coef[..., 1, :]      # (..., 2): per column
-    top = V[0, 0] * c0 + V[0, 1] * c1 * x[..., None]
-    bot = V[1, 0] * c0 + V[1, 1] * c1 * x[..., None]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.log(np.maximum(top, 1e-300)) - np.log(np.maximum(bot, 1e-300))
-    return np.abs(r[..., 0] - r[..., 1])
-
-
 def run_sprt(
     packed: PaddedRecords,
     boundary_half_width: float,
@@ -1972,13 +1936,9 @@ def run_sprt(
     deadline_us: float,
     exhaustion_eps: float = 0.0,
     econ: Economics | None = None,
-    return_llr: bool = False,
-):
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Vectorized truncated SPRT over all shots at once.
-
-    Returns (stop_us, preds), plus the exact LLR at each stop (post-click at
-    an upper crossing) when return_llr is set.
 
     Boundaries U = offset + L (decide NV-) and D = offset - L (decide NV0).
     Exact: the upper boundary is tested only at clicks, the lower boundary only
@@ -1986,11 +1946,11 @@ def run_sprt(
     Matches the scalar `first_passage` to machine precision.
 
     `econ` only changes the TERMINAL DECISION, never where the rule stops.
-    With it the decision is `decide`, the Bayes rule of L&S (2.5): with a
-    finite cost_discard a shot stopping inside the inconclusive band is
-    abandoned, and with two actions l >= log(b/a) declares NV-. Passing
-    econ=None decides by the sign of the stopping LLR relative to `offset`,
-    which is what the fidelity-vs-time frontier uses.
+    With a finite cost_discard it is taken by `decide`, so a shot stopping
+    inside the inconclusive band is abandoned rather than forced into a near
+    coin flip; otherwise the decision is the sign of the stopping LLR
+    relative to `offset`, which is what every result before this existed
+    used. Passing econ=None reproduces that exactly.
     """
     L = float(boundary_half_width)
     b = float(offset)
@@ -2115,64 +2075,29 @@ def run_sprt(
     # why the prediction below is the deadline rule applied to the frozen
     # LLR, and why `earlier` can be asserted rather than hoped for.
     #
-    # Evaluated at the exact time the gap crosses eps, which lies inside a
-    # no-click interval: clicks leave the gap unchanged, so it can only cross
-    # while waiting. This used to be tested at interval STARTS only, i.e. at
-    # the next click -- and at the moderate point the dark-state click
-    # spacing is ~112 us, so 22.6% of exhausted shots were never caught
-    # before the deadline. L&S Lemma 3.1 puts every between-arrival stop at a
-    # deterministic time after the last arrival; this is that time.
+    # Evaluated at interval STARTS only, which is conservative: the true
+    # crossing lies inside the preceding interval, so this reports a
+    # slightly later stop than optimal and never an earlier one.
     #
     # Defaults to off, so every result produced before this existed is
     # reproduced exactly.
-    if exhaustion_eps > 0.0 and not spec.degenerate:
-        dur = np.where(valid, eff_end - packed.t_start, 0.0)
-        x_end = np.exp(-2.0 * spec.delta * dur)
-        gap_end = np.where(valid, _gap_in_interval(packed.h_coef, x_end, spec), np.inf)
-        k_E = _first_true(valid & (gap_end <= exhaustion_eps))
+    if exhaustion_eps > 0.0:
+        exhausted = valid & (packed.hilbert <= exhaustion_eps)
+        k_E = _first_true(exhausted)
         hit_E = k_E < M
         kE = np.where(hit_E, k_E, 0)
-        h_E = packed.h_coef[rows, kE]
-        at_start = packed.hilbert[rows, kE] <= exhaustion_eps
-        lo = np.zeros(n)
-        hi = np.where(hit_E, dur[rows, kE], 0.0)
-        for _ in range(60):
-            mid = 0.5 * (lo + hi)
-            g = _gap_in_interval(h_E, np.exp(-2.0 * spec.delta * mid), spec)
-            done = g <= exhaustion_eps
-            hi = np.where(done, mid, hi)
-            lo = np.where(done, lo, mid)
-        dt_E = np.where(at_start, 0.0, hi)
-        x_E = np.exp(-2.0 * spec.delta * dt_E)
-        t_exh = packed.t_start[rows, kE] + dt_E
-        with np.errstate(divide="ignore", invalid="ignore"):
-            llr_exh = (
-                packed.llr_start[rows, kE]
-                + np.log(packed.alpha[rows, kE, 0] + packed.beta[rows, kE, 0] * x_E)
-                - np.log(packed.alpha[rows, kE, 1] + packed.beta[rows, kE, 1] * x_E)
-            )
+        t_exh = packed.t_start[rows, kE]
 
         earlier = hit_E & (t_exh < stop_ms)
         stop_ms = np.where(earlier, t_exh, stop_ms)
-        llr_stop = np.where(earlier, llr_exh, llr_stop)
+        llr_stop = np.where(earlier, packed.llr_start[rows, kE], llr_stop)
 
-    # The terminal decision. With `econ` it is the Bayes rule of L&S (2.5),
-    # argmax_k H_k -- for two actions l >= log(b/a), NOT the boundary centre.
-    # The two agree on every boundary stop (D < 0 < U always), and differ
-    # only for shots stopped by the deadline or the exhaustion exit with l
-    # between 0 and the offset, where the Bayes rule is the better call by
-    # construction. Tuning (best_exact_boundary) and scoring both pass econ,
-    # so the rule is selected under the decision it is scored with.
-    # econ=None keeps the boundary-centre decision the fidelity-vs-time
-    # frontier has always used.
     preds = (
         decide(llr_stop, econ)
-        if econ is not None
+        if econ is not None and econ.discard_allowed
         else (llr_stop < b).astype(int)
     )
 
-    if return_llr:
-        return stop_ms * 1000.0, preds, llr_stop
     return stop_ms * 1000.0, preds
 
 
@@ -5379,40 +5304,7 @@ def bayes_risk(
     return float(risk)
 
 
-def information_cost_gap(params: MMPPParams, econ: Economics) -> float:
-    """
-    d*: once the information gap d falls to this, stopping is optimal.
-
-    This is a PROVEN member of the Ludkovski-Sezer stopping region, not a
-    tuned threshold. Along the filter, a click moves l by at most d (the
-    jump log[(lam0 + Dlam u)/(lam0 + Dlam v)] has slope <= 1 in logit u) and
-    the no-click drift -Dlam (u - v) is at most Dlam d / 4 in size; d never
-    increases. So from a state with gap d, any continuation moves l by at
-    most d (N + Dlam tau / 4), with E[N] <= lam_max E[tau]. The payoff H is
-    Lipschitz in l with constant max(a, b)/4 -- also with the discard branch,
-    which is flat. Hence
-
-        V - H <= E[tau] [ max(a,b)/4 * d * (lam_max + Dlam/4) - c ]
-
-    which is <= 0 whenever d <= d* = 4c / (max(a, b) (lam_max + Dlam/4)).
-    There V = H, so the optimal rule stops (L&S Cor 4.1).
-
-    d* sits far above the EXHAUSTION_EPS = 1e-9 exit: at the moderate point
-    it runs from ~0.7 at a/c = 2 us to 7e-5 at a/c = 2e5 us (0.028 at 500),
-    and at a/c = 500 paths reach it at a median of 55 us against 131 us for
-    1e-9. The learned policy used to run
-    past both in up to 9% of shots, paying for information that could no
-    longer change the decision.
-    """
-    lam_max = max(params.lambda_minus_khz, params.lambda_zero_khz) / 1000.0
-    dlam = abs(params.lambda_minus_khz - params.lambda_zero_khz) / 1000.0
-    worst = max(econ.cost_miss, econ.cost_false)
-    return float(4.0 * econ.cost_per_us / (worst * (lam_max + 0.25 * dlam)))
-
-
-def _optimal_features(
-    llr: np.ndarray, gap: np.ndarray, econ: Economics
-) -> np.ndarray:
+def _optimal_features(llr: np.ndarray, gap: np.ndarray) -> np.ndarray:
     """
     Basis for the continuation value.
 
@@ -5420,39 +5312,20 @@ def _optimal_features(
     exp(-d) saturates at 1 when information is exhausted, which is the
     absorbing face where continuation is worthless, so it gives the
     regression a direct handle on that boundary.
-
-    The payoff H(l) itself is in the basis, alone and multiplied by exp(-d)
-    and by d. Without it the basis collapsed at d -> 0 to span{1, l, l^2,
-    |l|}, which cannot represent the exact continuation value there, H(l) -
-    c dt: a kink plus sigmoid tails. The fitted continuation then sat ABOVE
-    H on 30-45% of the l range at late epochs, so the policy kept going
-    exactly where L&S says every rule must stop, and at high a/c held 2-5%
-    of shots to the deadline after their information was gone. Adding H
-    removed that entirely and cut risk 3.7% [+1.1, +6.5] at a/c = 5000
-    (independent seed, paired), tying at a/c = 500.
-
-    d is clipped at 50 in every column. It is ~700 at epoch 0 (clipped
-    logits) and unbounded without switching, which made gap^2 blow up the
-    column scale by five orders of magnitude.
     """
-    g = np.clip(gap, 0.0, 50.0)
-    e = np.exp(-g)
-    H = terminal_reward(llr, econ)
+    e = np.exp(-np.clip(gap, 0.0, 50.0))
     return np.column_stack(
         [
             np.ones_like(llr),
             llr,
             llr * llr,
             np.abs(llr),
-            g,
-            g * g,
+            gap,
+            gap * gap,
             e,
             llr * e,
             llr * llr * e,
-            np.abs(llr) * g,
-            H,
-            H * e,
-            H * g,
+            np.abs(llr) * gap,
         ]
     )
 
@@ -5467,33 +5340,26 @@ def fit_stopping_rule(
 
     At each step the realised pathwise value is carried forward and the
     regression is used only to DECIDE, which is the Longstaff-Schwartz
-    convention and is what keeps the resulting policy feasible. Its risk,
-    scored out of sample, is therefore an UPPER bound on the optimal Bayes
-    risk -- an approximation to the Ludkovski-Sezer rule, not the rule. For
-    the rule itself see `solve_optimal_dp`.
-
-    Every state with d <= information_cost_gap(...) is forced to stop, both
-    here and in `apply_stopping_rule`: V = H there, so this is part of the
-    L&S stopping region and not an approximation.
+    convention and is what keeps the resulting policy feasible -- hence a
+    lower bound on the value rather than an optimistic estimate of it.
 
     Returns one coefficient vector per epoch at which the policy may act,
     so `apply_stopping_rule` indexes it directly by epoch.
     """
     n_steps = paths.llr.shape[1] - 1
     step_cost = econ.cost_per_us * paths.dt_us
-    d_star = information_cost_gap(paths.params, econ)
 
     value = terminal_reward(paths.llr[:, -1], econ)
     coeffs: list[np.ndarray] = []
 
     for k in range(n_steps - 1, -1, -1):
-        X = _optimal_features(paths.llr[:, k], paths.gap[:, k], econ)
+        X = _optimal_features(paths.llr[:, k], paths.gap[:, k])
         target = value - step_cost              # value of waiting one epoch
         A = X.T @ X + ridge * np.eye(X.shape[1])
         beta = np.linalg.solve(A, X.T @ target)
         cont = X @ beta
         stop_now = terminal_reward(paths.llr[:, k], econ)
-        take = (stop_now >= cont) | (paths.gap[:, k] <= d_star)
+        take = stop_now >= cont
         value = np.where(take, stop_now, target)
         coeffs.append(beta)
 
@@ -5515,18 +5381,13 @@ def apply_stopping_rule(
     so in-sample it reports a value no feasible policy attains. Measured
     here, in-sample flatters the policy by about 23%.
 
-    The terminal decision is the Bayes rule d in argmax_k H_k(Pi_tau), L&S
-    (2.5) -- the same decision the policy was FITTED against, through
-    terminal_reward. `decision_llr` can override the two-action cutoff, but
-    nothing in this file should: with the exact filter the Bayes cutoff is
-    optimal for ANY stopping time, and a fitted one only adds calibration
-    noise. The `optimal` command used to pass a balanced-fidelity cutoff
-    fitted on calibration (committed values -1.26 to +2.76 where the optimum
-    is 0); scoring the same policies with the Bayes decision lowered their
-    risk 2.9-4.9% at every a/c >= 1340 on the moderate point, and it alone
-    explained the "F ~ 0.943 plateau" once blamed on regression Monte Carlo.
-    The override survives only for model-mismatch experiments, where the
-    nominal posterior is wrong and the Bayes cutoff need not be optimal.
+    `decision_llr` overrides the theoretical threshold log(b/a) with a cutoff
+    fitted on calibration data, which is how every other decision rule in
+    this file is treated -- the count threshold, the fixed-time MMPP cutoff
+    and the SPRT's offset are all calibrated rather than assumed. Leaving
+    this one at its theoretical value while the rules it is compared against
+    get a fitted one is the same unfairness the SPRT's free offset was
+    introduced to remove.
 
     Returns (stop_us, preds, llr_at_stop); the third is what a cutoff is
     calibrated on.
@@ -5539,17 +5400,14 @@ def apply_stopping_rule(
         )
     stopped = np.zeros(n, dtype=bool)
     stop_k = np.full(n, n_steps, dtype=int)
-    d_star = information_cost_gap(paths.params, econ)
 
     for k in range(n_steps):
         live = ~stopped
         if not np.any(live):
             break
-        X = _optimal_features(paths.llr[live, k], paths.gap[live, k], econ)
+        X = _optimal_features(paths.llr[live, k], paths.gap[live, k])
         cont = X @ coeffs[k]
-        take = (terminal_reward(paths.llr[live, k], econ) >= cont) | (
-            paths.gap[live, k] <= d_star
-        )
+        take = terminal_reward(paths.llr[live, k], econ) >= cont
         idx = np.nonzero(live)[0][take]
         stop_k[idx] = k
         stopped[idx] = True
@@ -5633,43 +5491,35 @@ def best_constant_boundary(
     exhaustion_eps: float = 0.0,
     widths: Sequence[float] | None = None,
     offsets: Sequence[float] = (-1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0),
-    deadlines_us: Sequence[float] | None = None,
 ) -> dict:
     """
-    Cheapest (L, offset[, deadline]) for the truncated SPRT on the epochs.
+    Cheapest (L, offset) for the truncated SPRT under these economics.
 
     Tune this on CALIBRATION paths and score the winner on test paths. The
     uploaded version tuned it on the test paths while the learned policy was
     fitted out-of-sample, which handicapped the learned policy -- a
     conservative error, but an error: the two rules have to be selected and
     scored the same way for the difference between them to mean anything.
-
-    `deadlines_us` adds the truncation axis the exact rule already has; None
-    keeps the horizon as the only deadline. Score the winner with the same
-    `econ` (i.e. the Bayes decision) it was tuned under.
     """
     if widths is None:
         widths = np.geomspace(0.1, 12.0, 24)
-    dls = [None] if deadlines_us is None else [float(x) for x in deadlines_us]
     best = None
-    for dl in dls:
-        for L in widths:
-            for off in offsets:
-                if abs(off) >= L:
-                    continue
-                st, pr = sprt_on_epochs(
-                    paths, float(L), float(off), exhaustion_eps, dl, econ
-                )
-                r = bayes_risk(st, pr, paths.labels, econ)
-                if best is None or r < best["risk"]:
-                    best = {
-                        "risk": r,
-                        "L": float(L),
-                        "offset": float(off),
-                        "deadline_us": dl,
-                        "stop_us": st,
-                        "preds": pr,
-                    }
+    for L in widths:
+        for off in offsets:
+            if abs(off) >= L:
+                continue
+            st, pr = sprt_on_epochs(
+                paths, float(L), float(off), exhaustion_eps, None, econ
+            )
+            r = bayes_risk(st, pr, paths.labels, econ)
+            if best is None or r < best["risk"]:
+                best = {
+                    "risk": r,
+                    "L": float(L),
+                    "offset": float(off),
+                    "stop_us": st,
+                    "preds": pr,
+                }
     if best is None:
         raise ValueError("no (L, offset) pair satisfied |offset| < L")
     return best
@@ -5892,465 +5742,11 @@ EXHAUSTION_EPS = 1e-9
 N_EPOCHS_DEFAULT = 128
 
 
-# =============================================================================
-# 10e. The Ludkovski-Sezer optimum itself, by dynamic programming
-# =============================================================================
-#
-# Everything above approximates the optimal rule: the SPRTs restrict it to a
-# constant boundary, the learned policy to a 13-function regression on a
-# 128-epoch grid. This section computes it. It is what "optimal" means in
-# every table here, and the yardstick the other rules are measured against.
-#
-# The state is L&S's posterior on the augmented chain (M_0, M_t), which in
-# the coordinates used throughout is (l, y, z) plus time-to-go s:
-#
-#     between clicks   dy/dt = -G_-0 (1 + e^y) + G_0- (1 + e^-y) - Dlam
-#                      (the same ODE for z)
-#                      dl/dt = -Dlam (sigmoid y - sigmoid z)
-#     at a click       y, z += kappa = log(lambda_- / lambda_0)
-#                      l += log[(lam0 + Dlam u)/(lam0 + Dlam v)]
-#     click intensity  p (lam0 + Dlam u) + (1 - p)(lam0 + Dlam v)
-#
-# and the cost-to-go satisfies W(s, x) = min{ g(l), c dt + E[W(s - dt, X)] }
-# with g = min(a p, b (1 - p)) -- the discrete-time form of L&S (3.1).
-#
-# Why a grid and not their J0 iteration: (3.5)-(3.8) iterate over the number
-# of arrivals, and at 228 kHz a single shot can hold dozens inside the
-# continuation region. Stepping time instead needs at most one click per
-# step, so the cost is linear in the horizon rather than in the click count.
-#
-# Scheme (validated in 3-D before it was ported here): the click-free part of
-# each step is the exact no-click flow (matrix exponential); a click is
-# placed at the step midpoint with probability 1 - exp(-dt lambda), plus an
-# explicit two-click term, so the error per step is O(dt^3). Interpolation is
-# cubic splines along y and z and 4-point Lagrange along l. The l grid is
-# centred on the payoff kink log(b/a), so the kink sits on a node.
-#
-# Validation, recorded at the moderate point, a/c = 500:
-#   * dynamics agree with the repo's exact filter to 1e-12;
-#   * R* moves by <= 1.3e-4 (0.15%) across 4 y/z resolutions, 2 in l,
-#     3 time steps, 2 interpolation schemes, and wider edges;
-#   * with switching -> 0 it collapses onto the classical 1-D problem, where
-#     a constant SPRT is optimal (7 digits), and reproduces L&S section 6.2
-#     -- `validate` pins that;
-#   * its policy, simulated on 74,000 fresh shots per state through the
-#     repo's filter, scores R* to +0.03% +- 0.30%.
-# The policy is Bermudan at the DP step (0.25 us at the moderate point);
-# the dt sequence bounds that at ~0.15% against continuous time.
-
-
-class _LSFlow:
-    """L&S dynamics in (l, y, z), rates in 1/us."""
-
-    def __init__(self, params: MMPPParams):
-        from scipy.optimize import brentq
-
-        self.g10 = params.gamma_minus_to_zero_khz / 1000.0
-        self.g01 = params.gamma_zero_to_minus_khz / 1000.0
-        self.lm = params.lambda_minus_khz / 1000.0
-        self.l0 = params.lambda_zero_khz / 1000.0
-        if not self.lm > self.l0 > 0.0:
-            raise ValueError("solve_optimal_dp needs lambda_minus > lambda_zero > 0")
-        self.dlam = self.lm - self.l0
-        self.kappa = float(np.log(self.lm / self.l0))
-        Q = np.array([[-self.g10, self.g01], [self.g10, -self.g01]])
-        self.A = Q - np.diag([self.lm, self.l0])
-        f = lambda y: (
-            -self.g10 * (1.0 + np.exp(y)) + self.g01 * (1.0 + np.exp(-y)) - self.dlam
-        )
-        # No-click fixed point of the logit flow: the floor of the y grid.
-        self.ystar = float(brentq(f, -60.0, 60.0)) if self.g01 > 0.0 else -40.0
-
-    def flow_logit(self, y: np.ndarray, t: float):
-        """Exact no-click flow of logit y for t us, and its log survival."""
-        from scipy.linalg import expm
-
-        E = expm(self.A * float(t))
-        y = np.asarray(y, dtype=float)
-        ls, lc = -np.logaddexp(0.0, -y), -np.logaddexp(0.0, y)
-        with np.errstate(divide="ignore"):
-            h0 = np.logaddexp(np.log(E[0, 0]) + ls, np.log(max(E[0, 1], 1e-300)) + lc)
-            h1 = np.logaddexp(np.log(max(E[1, 0], 1e-300)) + ls, np.log(E[1, 1]) + lc)
-        return h0 - h1, np.logaddexp(h0, h1)
-
-    def jump_dl(self, y, z):
-        u, v = _sigmoid(y), _sigmoid(z)
-        return np.log(self.l0 + self.dlam * u) - np.log(self.l0 + self.dlam * v)
-
-    def intensity(self, l, y, z):
-        p = _sigmoid(l)
-        return p * (self.l0 + self.dlam * _sigmoid(y)) + (1.0 - p) * (
-            self.l0 + self.dlam * _sigmoid(z)
-        )
-
-
-def _sigmoid(x):
-    return 0.5 * (1.0 + np.tanh(0.5 * np.asarray(x, dtype=float)))
-
-
-def _spline_matrix(nodes, targets, bc):
-    from scipy.interpolate import CubicSpline
-
-    t = np.clip(targets, nodes[0], nodes[-1])
-    return CubicSpline(nodes, np.eye(nodes.size), bc_type=bc, axis=0)(t)
-
-
-def _lagrange4(alpha):
-    a = alpha
-    return np.stack(
-        [
-            -a * (a - 1) * (a - 2) / 6.0,
-            (a + 1) * (a - 1) * (a - 2) / 2.0,
-            -(a + 1) * a * (a - 2) / 2.0,
-            (a + 1) * a * (a - 1) / 6.0,
-        ]
-    )
-
-
-def _dp_grid(lo, hi, h, fine_lo, fine_hi):
-    """Spacing h inside [fine_lo, fine_hi], 2h outside."""
-    core = np.arange(fine_lo, fine_hi + 1e-9, h)
-    left = np.arange(fine_lo - 2 * h, lo - 1e-9, -2 * h)[::-1]
-    right = np.arange(core[-1] + 2 * h, hi + 1e-9, 2 * h)
-    g = np.concatenate([left, core, right])
-    # Close each end on the bound itself. SNAP the last node when it is
-    # within h/2 of the bound instead of appending a second one: two nearly
-    # coincident nodes make the spline operator ill-conditioned (row sums
-    # ~40, spectral radius > 1), and backward induction then amplifies it
-    # geometrically -- which is how the switching -> 0 limit, whose y floor
-    # lands 0.002 short of a node, first diverged to -1e31.
-    if g[0] > lo + 1e-9:
-        if g[0] - lo < 0.5 * h:
-            g[0] = lo
-        else:
-            g = np.concatenate([[lo], g])
-    if g[-1] < hi - 1e-9:
-        if hi - g[-1] < 0.5 * h:
-            g[-1] = hi
-        else:
-            g = np.concatenate([g, [hi]])
-    return g
-
-
-@dataclass
-class OptimalDP:
-    """
-    Solved L&S problem: the optimal risk and the optimal stopping rule.
-
-    l_lo, l_hi[n] give, per (y, z) node, the continuation interval in l at
-    time-to-go n * decision_dt; the rule continues iff l_lo < l < l_hi.
-    The continuation set in l IS an interval at fixed (s, y, z) -- L&S
-    Remark 4.3 via the affine embedding of l into the simplex -- and
-    `non_interval_columns` counts grid columns where the numerics disagree.
-    """
-
-    params: MMPPParams
-    econ: Economics
-    horizon_us: float
-    dt_us: float
-    decision_dt_us: float
-    y: np.ndarray
-    z: np.ndarray
-    l_center: float
-    risk: float                  # R*: optimal Bayes risk at the prior
-    l_lo: np.ndarray             # (n_decisions + 1, ny, nz)
-    l_hi: np.ndarray
-    max_continuation_abs_l: float
-    non_interval_columns: int
-    l_inner: float
-    runtime_s: float
-
-    def continuation_at_prior(self) -> tuple[float, float]:
-        """Continuation interval in l at t = 0 (grid corner u = 1, v = 0)."""
-        return float(self.l_lo[-1, -1, 0]), float(self.l_hi[-1, -1, 0])
-
-
-def optimal_dp_step_us(
-    params: MMPPParams, horizon_us: float, decide_every: int = 1
-) -> float:
-    """Default DP step: largest dt with dt * lambda_max <= 0.05 dividing T."""
-    lam = max(params.lambda_minus_khz, params.lambda_zero_khz) / 1000.0
-    n = max(int(np.ceil(float(horizon_us) * lam / 0.05)), 100)
-    n = int(np.ceil(n / decide_every)) * decide_every
-    return float(horizon_us) / n
-
-
-def solve_optimal_dp(
-    params: MMPPParams,
-    horizon_us: float,
-    econ: Economics,
-    dt_us: float | None = None,
-    h: float = 0.5,
-    dl: float = 0.1,
-    l_inner: float | None = None,
-    y_max: float = 14.0,
-    z_min: float = -14.0,
-    decide_every: int = 1,
-    verbose: bool = False,
-) -> OptimalDP:
-    """
-    The Ludkovski-Sezer optimal stopping rule and risk, by backward induction.
-
-    Two actions only; the discard branch would make the stopping slice in l
-    up to two intervals and is not implemented here.
-
-    dt_us defaults to the largest step with dt * lambda_max <= 0.05 that
-    divides the horizon (0.25 us at the moderate point). The default grid
-    (h = 0.5, dl = 0.1) lands within ~1e-4 of the finest grid tried (0.15%),
-    in ~30 s. l_inner (where stopping is forced) is widened automatically
-    until the continuation region stays at least 1.5 inside it.
-
-    decide_every > 1 restricts stopping to every k-th step: the optimal rule
-    AMONG rules acting only on a coarser grid, which is how the cost of an
-    epoch grid is measured exactly rather than by regression.
-    """
-    import time as _time
-
-    if econ.discard_allowed:
-        raise NotImplementedError("solve_optimal_dp is two-action only")
-    params.validate()
-    fl = _LSFlow(params)
-    T = float(horizon_us)
-    if dt_us is None:
-        dt_us = optimal_dp_step_us(params, T, decide_every)
-    n_steps = int(round(T / dt_us))
-    if abs(n_steps * dt_us - T) > 1e-9 * T or n_steps % decide_every:
-        raise ValueError("dt_us must divide the horizon (and decide_every the steps)")
-    a, b, c = econ.cost_miss, econ.cost_false, econ.cost_per_us
-    l_c = float(np.log(b / a))                      # payoff kink
-    if l_inner is None:
-        l_inner = 6.5 + max(0.0, np.log10(max(1.0 / c, 1.0) / 500.0)) * 1.5
-
-    y = _dp_grid(fl.ystar - 0.8, y_max, h, fl.ystar - 0.8, 6.0)
-    z = _dp_grid(z_min, y_max, h, max(z_min, -9.0), 6.0)
-    ny, nz = y.size, z.size
-
-    while True:
-        t0 = _time.time()
-        ghost = fl.kappa + 4 * dl + fl.dlam * dt_us
-        n_half = int(np.ceil((l_inner + ghost) / dl))
-        l = l_c + np.arange(-n_half, n_half + 1) * dl
-        k0, nl = n_half, l.size
-
-        def lshift(delta):
-            q = delta / dl
-            s0 = np.floor(q).astype(np.int64)
-            w = _lagrange4(q - s0)
-            k = np.arange(nl)
-            base = (np.arange(ny)[:, None] * nz + np.arange(nz)[None, :]) * nl
-            idx = [
-                (base[:, :, None]
-                 + np.clip(k[None, None, :] + s0[:, :, None] + o, 0, nl - 1)).ravel()
-                for o in (-1, 0, 1, 2)
-            ]
-            return idx, [wj[:, :, None] for wj in w]
-
-        yh, sy = fl.flow_logit(y, dt_us / 2)
-        zh, sz = fl.flow_logit(z, dt_us / 2)
-        Fy = _spline_matrix(y, yh, ("natural", "clamped"))
-        Fz = _spline_matrix(z, zh, ("clamped", "clamped"))
-        f_idx, f_w = lshift(sy[:, None] - sz[None, :])
-        Jy = _spline_matrix(y, y + fl.kappa, ("natural", "clamped"))
-        Jz = _spline_matrix(z, z + fl.kappa, ("clamped", "clamped"))
-        dj = fl.jump_dl(y[:, None], z[None, :])
-        j_idx, j_w = lshift(dj)
-        lam = fl.intensity(l[None, None, :], y[:, None, None], z[None, :, None])
-        lamJ = fl.intensity(
-            l[None, None, :] + dj[:, :, None],
-            (y + fl.kappa)[:, None, None],
-            (z + fl.kappa)[None, :, None],
-        )
-        P0 = np.exp(-dt_us * lam)
-        P2 = 0.5 * dt_us * dt_us * lam * lamJ
-        P1 = 1.0 - P0 - P2
-        if P1.min() < 0.0:
-            raise ValueError("dt_us too large for the two-click expansion")
-        p = _sigmoid(l)
-        G = np.broadcast_to(np.minimum(a * p, b * (1.0 - p)), (ny, nz, nl)).copy()
-        forced = np.abs(l - l_c) > l_inner + 1e-12
-        reachable = z[None, :] <= y[:, None] + 1e-9
-
-        def apply(X, My, Mz, idx, w):
-            X1 = (My @ X.reshape(ny, nz * nl)).reshape(ny, nz, nl)
-            Xf = np.matmul(Mz[None, :, :], X1).ravel()
-            out = w[0] * Xf[idx[0]].reshape(ny, nz, nl)
-            for j in range(1, 4):
-                out += w[j] * Xf[idx[j]].reshape(ny, nz, nl)
-            return out
-
-        n_dec = n_steps // decide_every
-        l_lo = np.zeros((n_dec + 1, ny, nz), np.float32)
-        l_hi = np.zeros_like(l_lo)
-        l_lo[0] = l_hi[0] = l_c
-        max_cont, bad = 0.0, 0
-        W = G.copy()
-        cdt = c * dt_us
-        for n in range(1, n_steps + 1):
-            H = apply(W, Fy, Fz, f_idx, f_w)
-            K = apply(H, Jy, Jz, j_idx, j_w)
-            K2 = apply(K, Jy, Jz, j_idx, j_w)
-            C = cdt + apply(P0 * H + P1 * K + P2 * K2, Fy, Fz, f_idx, f_w)
-            if n % decide_every == 0:
-                C[:, :, forced] = G[:, :, forced] + 1.0
-                W = np.minimum(G, C)
-                D = C - G
-                cont = D < 0.0
-                up = ~cont[:, :, k0:]
-                kh = np.argmax(up, axis=2) + k0
-                dn = ~cont[:, :, : k0 + 1][:, :, ::-1]
-                kl = k0 - np.argmax(dn, axis=2)
-                tk = lambda arr, kk: np.take_along_axis(arr, kk[:, :, None], 2)[..., 0]
-                Dh1, Dh0 = tk(D, kh), tk(D, np.maximum(kh - 1, 0))
-                Dl1, Dl0 = tk(D, kl), tk(D, np.minimum(kl + 1, nl - 1))
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    hi_ = np.where(kh == k0, l_c,
-                                   l[kh - 1] + dl * (-Dh0) / np.maximum(Dh1 - Dh0, 1e-300))
-                    lo_ = np.where(kl == k0, l_c,
-                                   l[np.minimum(kl + 1, nl - 1)]
-                                   - dl * (-Dl0) / np.maximum(Dl1 - Dl0, 1e-300))
-                m = n // decide_every
-                l_lo[m], l_hi[m] = lo_, hi_
-                nchg = np.abs(np.diff(cont.astype(np.int8), axis=2)).sum(axis=2)
-                bad = max(bad, int(((nchg > 2) & reachable).sum()))
-                if cont.any():
-                    max_cont = max(max_cont, float(
-                        np.abs(np.broadcast_to(l - l_c, cont.shape)[cont]).max()))
-            else:
-                W = C
-                W[:, :, forced] = G[:, :, forced] + cdt * (n % decide_every)
-            if verbose and n % max(1, n_steps // 5) == 0:
-                print(f"    DP step {n}/{n_steps} [{_time.time() - t0:.0f}s]", flush=True)
-        if max_cont < l_inner - 1.5:
-            break
-        l_inner += 3.0                            # region reached the edge
-        if verbose:
-            print(f"    widening l_inner to {l_inner}", flush=True)
-
-    # R* at the prior: corner node (u = 1, v = 0), l = 0.
-    q = (0.0 - l_c) / dl + k0
-    s0 = int(np.floor(q))
-    w4 = _lagrange4(np.array(q - s0))
-    col = W[-1, 0]
-    risk = float(sum(w4[j] * col[s0 - 1 + j] for j in range(4)))
-    return OptimalDP(
-        params=params, econ=econ, horizon_us=T, dt_us=float(dt_us),
-        decision_dt_us=float(dt_us * decide_every), y=y, z=z, l_center=l_c,
-        risk=risk, l_lo=l_lo, l_hi=l_hi, max_continuation_abs_l=max_cont,
-        non_interval_columns=bad, l_inner=float(l_inner),
-        runtime_s=float(_time.time() - t0),
-    )
-
-
-def _bilinear(gy, gz, F, yq, zq):
-    yq = np.clip(yq, gy[0], gy[-1])
-    zq = np.clip(zq, gz[0], gz[-1])
-    iy = np.clip(np.searchsorted(gy, yq, side="right") - 1, 0, gy.size - 2)
-    iz = np.clip(np.searchsorted(gz, zq, side="right") - 1, 0, gz.size - 2)
-    wy = (yq - gy[iy]) / (gy[iy + 1] - gy[iy])
-    wz = (zq - gz[iz]) / (gz[iz + 1] - gz[iz])
-    return ((1 - wy) * (1 - wz) * F[iy, iz] + wy * (1 - wz) * F[iy + 1, iz]
-            + (1 - wy) * wz * F[iy, iz + 1] + wy * wz * F[iy + 1, iz + 1])
-
-
-def apply_optimal_dp(
-    dp: OptimalDP, paths: FilterPaths
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Run the DP rule on filter paths sampled at the DP's decision epochs.
-
-    Returns (stop_us, preds, llr_stop); the decision is the Bayes rule.
-    """
-    n_ep = paths.llr.shape[1]
-    step = dp.decision_dt_us
-    if abs(paths.t_us[-1] - dp.horizon_us) > 1e-6 or abs(paths.dt_us - step) > 1e-9:
-        raise ValueError("paths must sit on the DP's decision grid over its horizon")
-    n = paths.n_paths
-    stopped = np.zeros(n, bool)
-    k_stop = np.full(n, n_ep - 1)
-    for k in range(n_ep):
-        live = np.nonzero(~stopped)[0]
-        if live.size == 0:
-            break
-        m = int(round((dp.horizon_us - paths.t_us[k]) / step))
-        if m == 0:
-            k_stop[live] = k
-            break
-        yq, zq = paths.y[live, k], paths.z[live, k]
-        lo = _bilinear(dp.y, dp.z, dp.l_lo[m], yq, zq)
-        hi = _bilinear(dp.y, dp.z, dp.l_hi[m], yq, zq)
-        L = paths.llr[live, k]
-        stop = ~((L > lo) & (L < hi))
-        k_stop[live[stop]] = k
-        stopped[live[stop]] = True
-    llr_stop = paths.llr[np.arange(n), k_stop]
-    preds = decide(llr_stop, dp.econ)
-    return paths.t_us[k_stop], preds, llr_stop
-
-
-def optimal_dp_paths(
-    shots: Sequence[np.ndarray],
-    labels: np.ndarray,
-    params: MMPPParams,
-    horizon_us: float,
-    decision_dt_us: float,
-    spec: NoClickSpectral | None = None,
-    chunk: int = 2500,
-) -> list[FilterPaths]:
-    """Filter paths on the DP's (fine) decision grid, in memory-sized chunks."""
-    labels = np.asarray(labels, dtype=int)
-    out = []
-    for s in range(0, len(shots), chunk):
-        out.append(
-            filter_on_grid(
-                shots[s : s + chunk], labels[s : s + chunk], params,
-                horizon_us, decision_dt_us, spec,
-            )
-        )
-    return out
-
-
-def evaluate_optimal_dp(
-    dp: OptimalDP, chunks: Sequence[FilterPaths]
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """apply_optimal_dp over chunked paths, concatenated in shot order."""
-    parts = [apply_optimal_dp(dp, p) for p in chunks]
-    return tuple(np.concatenate([q[i] for q in parts]) for i in range(3))
-
-
-def posterior_risk(
-    stop_us: np.ndarray,
-    preds: np.ndarray,
-    llr_stop: np.ndarray,
-    labels: np.ndarray,
-    econ: Economics,
-) -> tuple[float, float]:
-    """
-    Rao-Blackwellised Bayes risk and its standard error.
-
-    Each shot contributes c tau + (the posterior probability that its call
-    is wrong, times the cost) instead of the 0/1 realised error. Unbiased
-    when the filter is the true posterior, and 3-4x tighter than the label
-    risk -- which is what makes a 0.3% agreement with R* checkable.
-    """
-    p = _sigmoid(llr_stop)
-    x = econ.cost_per_us * np.asarray(stop_us, float) + np.where(
-        np.asarray(preds) == DECLARE_ZERO, econ.cost_miss * p,
-        np.where(np.asarray(preds) == DECLARE_MINUS, econ.cost_false * (1.0 - p),
-                 econ.cost_discard if econ.discard_allowed else 0.0),
-    )
-    labels = np.asarray(labels, int)
-    m0, m1 = labels == 0, labels == 1
-    r = 0.5 * (x[m0].mean() + x[m1].mean())
-    se = 0.5 * np.sqrt(x[m0].var(ddof=1) / m0.sum() + x[m1].var(ddof=1) / m1.sum())
-    return float(r), float(se)
-
-
 def run_optimal_stopping(
     point: OperatingPoint,
     cfg: RunConfig,
     n_epochs: int = N_EPOCHS_DEFAULT,
     a_over_c: Sequence[float] | None = None,
-    with_dp: bool = True,
 ) -> dict:
     """
     Five stopping rules on identical shots, in both currencies.
@@ -6505,25 +5901,6 @@ def run_optimal_stopping(
     exh_correct = np.column_stack(exh_correct)
     exh_time = np.column_stack(exh_time)
 
-    # ---- 6. the Ludkovski-Sezer optimum itself ----------------------------
-    # One DP per a/c, its rule applied to the SAME test shots on its own fine
-    # decision grid. This is the reference every gap below is measured
-    # against; without it "optimal" in this table meant the learned policy,
-    # which is itself 2-5% above the true optimum.
-    dp_chunks, dp_dt = None, None
-    if with_dp and horizon_us / optimal_dp_step_us(filter_params, horizon_us) > 5000:
-        with_dp = False
-        if cfg.verbose:
-            print("  DP skipped: it would need more than 5000 time steps here")
-    if with_dp:
-        dp_dt = optimal_dp_step_us(filter_params, horizon_us)
-        dp_chunks = optimal_dp_paths(
-            test_shots, test_labels, filter_params, horizon_us, dp_dt, spec
-        )
-        if cfg.verbose:
-            print(f"  DP decision grid {dp_dt:.3f} us, paths built "
-                  f"[{time.time() - t0:.0f}s]")
-
     # ---- 5. the learned policy, one column per a/c ------------------------
     # This one genuinely is parameterised by a/c: the policy IS the solution
     # to a particular trade-off, so the frontier is traced by varying it.
@@ -6534,24 +5911,13 @@ def run_optimal_stopping(
         econ = Economics(cost_per_us=1.0 / float(ac))
 
         # Tuned on calibration, scored on test -- same protocol as the policy.
-        # Tuned with a deadline axis, like the exact rule, and SCORED with the
-        # same Bayes decision they were tuned under. They used to be tuned
-        # with decide() but scored by the offset sign, and tuned with no
-        # deadline at all -- most of their apparent +19-29% gap to the true
-        # optimum at a/c = 500 was that missing axis, not the epoch grid.
-        cal_base = best_constant_boundary(
-            cal_paths, econ, 0.0, deadlines_us=deadlines_us
-        )
+        cal_base = best_constant_boundary(cal_paths, econ, 0.0)
         st_g, pr_g = sprt_on_epochs(
-            test_paths, cal_base["L"], cal_base["offset"], 0.0,
-            cal_base["deadline_us"], econ,
+            test_paths, cal_base["L"], cal_base["offset"], 0.0
         )
-        cal_exh = best_constant_boundary(
-            cal_paths, econ, EXHAUSTION_EPS, deadlines_us=deadlines_us
-        )
+        cal_exh = best_constant_boundary(cal_paths, econ, EXHAUSTION_EPS)
         st_x, pr_x = sprt_on_epochs(
-            test_paths, cal_exh["L"], cal_exh["offset"], EXHAUSTION_EPS,
-            cal_exh["deadline_us"], econ,
+            test_paths, cal_exh["L"], cal_exh["offset"], EXHAUSTION_EPS
         )
         # The exact grid-free boundary, tuned under the same economics. Without
         # it the risk comparison below would pit the learned policy against an
@@ -6565,29 +5931,15 @@ def run_optimal_stopping(
             EXHAUSTION_EPS, econ,
         )
         coeffs = fit_stopping_rule(cal_paths, econ)
-        # The Bayes decision, L&S (2.5) -- the one the policy was fitted
-        # against. A cutoff re-fitted on calibration used to be applied here
-        # instead; see apply_stopping_rule for what that cost.
-        cut_l = bayes_decision_llr(econ)
-        st_l, pr_l, _ = apply_stopping_rule(test_paths, coeffs, econ)
+        # The policy's terminal cutoff is calibrated on the same paths it
+        # was fitted to, then applied to test -- the convention every other
+        # decision rule here follows.
+        _, _, cal_llr_stop = apply_stopping_rule(cal_paths, coeffs, econ)
+        cut_l, _ = optimize_scalar_cutoff(cal_llr_stop, cal_labels)
+        st_l, pr_l, _ = apply_stopping_rule(test_paths, coeffs, econ, cut_l)
 
         lsm_correct.append((pr_l == test_labels).astype(float))
         lsm_time.append(st_l)
-
-        dp_row = {}
-        if with_dp:
-            dp = solve_optimal_dp(filter_params, horizon_us, econ, dt_us=dp_dt)
-            st_o, pr_o, ls_o = evaluate_optimal_dp(dp, dp_chunks)
-            rb, rb_se = posterior_risk(st_o, pr_o, ls_o, test_labels, econ)
-            dp_row = {
-                "risk_optimal": bayes_risk(st_o, pr_o, test_labels, econ),
-                "risk_optimal_star": dp.risk,
-                "risk_optimal_posterior": rb,
-                "risk_optimal_posterior_se": rb_se,
-                "F_optimal": balanced_fidelity(test_labels, pr_o),
-                "T_optimal": balanced_mean_time(test_labels, st_o),
-                "optimal_dt_us": dp.decision_dt_us,
-            }
 
         rows.append(
             {
@@ -6610,7 +5962,6 @@ def run_optimal_stopping(
                 "L": cal_base["L"],
                 "offset": cal_base["offset"],
                 "learned_cutoff": float(cut_l),
-                **dp_row,
             }
         )
         # Against the BETTER of the two boundary rules, so the learned policy
@@ -6627,28 +5978,18 @@ def run_optimal_stopping(
         # Paired over the test shots. The risk panels had no uncertainty at
         # all until this existed, while the differences being read off them
         # are a few percent.
-        arms = {
-            "grid_sprt": (st_g, pr_g),
-            "exhaustion": (st_x, pr_x),
-            "exact_sprt": (st_e, pr_e),
-            "learned": (st_l, pr_l),
-        }
-        if with_dp:
-            arms["optimal"] = (st_o, pr_o)
-        bs_r = risk_bootstrap(arms, test_labels, econ, cfg.n_boot, seed + 4417)
-        # Every rule's distance ABOVE the optimum, paired on the same shots.
-        # pair_ci["X_vs_optimal"] is the percent by which X beats the optimum,
-        # so the gap is its negative.
-        if with_dp:
-            r_opt = rows[-1]["risk_optimal"]
-            for mkey in ("grid_sprt", "exhaustion", "exact_sprt", "learned"):
-                rows[-1][f"gap_{mkey}_pct"] = (
-                    100.0 * (rows[-1][f"risk_{mkey}"] - r_opt) / r_opt
-                )
-                pc = bs_r["pair_ci"].get(f"{mkey}_vs_optimal")
-                rows[-1][f"gap_{mkey}_ci_low"] = -pc["hi"] if pc else np.nan
-                rows[-1][f"gap_{mkey}_ci_high"] = -pc["lo"] if pc else np.nan
-                rows[-1][f"gap_{mkey}_resolved"] = int(pc["resolved"]) if pc else 0
+        bs_r = risk_bootstrap(
+            {
+                "grid_sprt": (st_g, pr_g),
+                "exhaustion": (st_x, pr_x),
+                "exact_sprt": (st_e, pr_e),
+                "learned": (st_l, pr_l),
+            },
+            test_labels,
+            econ,
+            cfg.n_boot,
+            seed + 4417,
+        )
         for mkey, (lo, hi) in bs_r["risk_ci"].items():
             rows[-1][f"risk_{mkey}_ci_low"] = lo
             rows[-1][f"risk_{mkey}_ci_high"] = hi
@@ -6763,20 +6104,6 @@ def run_optimal_stopping(
 
     t_exh_us = exhaustion_times_us(test_paths, EXHAUSTION_EPS)
 
-    if cfg.verbose and with_dp:
-        print(
-            f"\n{'a/c(us)':>9}{'OPTIMUM':>10}{'R* (DP)':>10} | gap to the optimum, "
-            f"* = paired 95% CI excludes zero"
-        )
-        print(f"{'':>9}{'':>10}{'':>10} | {'epoch':>9}{'+exh':>9}{'exact':>9}{'learned':>9}")
-        for r in rows:
-            cells = "".join(
-                f"{r[f'gap_{k}_pct']:8.1f}%{'*' if r[f'gap_{k}_resolved'] else ' '}"
-                for k in ("grid_sprt", "exhaustion", "exact_sprt", "learned")
-            )
-            print(f"{r['a_over_c']:9.0f}{r['risk_optimal']:10.4f}"
-                  f"{r['risk_optimal_star']:10.4f} | {cells}")
-
     if cfg.verbose:
         print(
             f"\n{'a/c(us)':>9}{'risk SPRT':>11}{'+exh':>10}{'exact':>10}{'learned':>10}"
@@ -6839,8 +6166,6 @@ def run_optimal_stopping(
         "learned_T": T_lsm,
         "exhaustion_times_us": t_exh_us,
         "exhaustion_eps": EXHAUSTION_EPS,
-        "with_dp": bool(with_dp),
-        "optimal_dt_us": dp_dt,
         "ceilings": {
             "threshold": float(F_thr.max()),
             "exact_mmpp": float(F_exact.max()),
@@ -7627,10 +6952,8 @@ def validate_all(verbose: bool = True) -> int:
     # Optimal stopping. The claims that have to hold are structural, not
     # statistical: the epoch filter is exact, the information gap only ever
     # shrinks and never at a click, and the LLR is frozen once it closes.
-    # Those three are what make the exhaustion exit free. They do NOT make
-    # (llr, gap) a sufficient statistic -- the drift, jump and click rate at
-    # fixed (l, d) still depend on the level y -- so the regression on them
-    # is a projection; the exact DP below uses the full (l, y, z).
+    # Those three are what make the exhaustion exit free and what justify
+    # using (llr, gap) as a sufficient pair of regression features.
     # -------------------------------------------------------------------------
     os_params = shields_2015_params(BASE_POWER_UW)
     os_shots, os_labels = simulate_balanced_dataset(150, 0.250, os_params, 31)
@@ -7817,7 +7140,7 @@ def validate_all(verbose: bool = True) -> int:
     # rest of this file makes, and it is the one that holds.
     base_cal = best_constant_boundary(cal_paths_os, econ_a, 0.0)
     st_b, pr_b = sprt_on_epochs(
-        te_paths_os, base_cal["L"], base_cal["offset"], 0.0, None, econ_a
+        te_paths_os, base_cal["L"], base_cal["offset"], 0.0
     )
     r_base_out = bayes_risk(st_b, pr_b, te_paths_os.labels, econ_a)
     check(
@@ -7826,125 +7149,6 @@ def validate_all(verbose: bool = True) -> int:
         f"learned {r_out:.4f} vs best (L, offset) = "
         f"({base_cal['L']:.2f}, {base_cal['offset']:.2f}) at {r_base_out:.4f}, "
         f"both scored on held-out shots",
-    )
-
-    # -------------------------------------------------------------------------
-    # The Ludkovski-Sezer optimum itself, and the facts the fixes rest on.
-    # -------------------------------------------------------------------------
-    # Zero switching once flipped the sign of the no-click LLR slope in
-    # build_no_click_spectral (V = I paired mu1 with the wrong axis). It is a
-    # legal parameter set, so pin it against a tiny-but-positive rate.
-    p_zero = MMPPParams(0.0, 0.0, 5.0, 1.0)
-    p_tiny = MMPPParams(1e-12, 1e-12, 5.0, 1.0)
-    zs = [np.array([]), np.array([0.03])]
-    try:
-        p_zero.validate()
-        zero_ok = True
-    except ValueError:
-        zero_ok = False            # this physics layer rejects it outright
-    if zero_ok:
-        l_zero = filter_on_grid(zs, np.array([0, 0]), p_zero, 100.0, 50.0).llr[:, -1]
-        l_tiny = filter_on_grid(zs, np.array([0, 0]), p_tiny, 100.0, 50.0).llr[:, -1]
-        check(
-            "zero switching gives the right no-click LLR slope",
-            np.allclose(l_zero, l_tiny, atol=1e-9) and abs(l_zero[0] + 0.4) < 1e-12,
-            f"no clicks for 100 us: {l_zero[0]:+.6f} (expected -0.4); one "
-            f"click: {l_zero[1]:+.6f} = -0.4 + log 5",
-        )
-    else:
-        check(
-            "zero switching gives the right no-click LLR slope",
-            True,
-            "this physics layer rejects zero switching in validate(), so the "
-            "degenerate eigenvector branch is unreachable",
-        )
-
-    # The d* stop rests on a pathwise bound: from any state with gap d, l
-    # moves by at most d (N + Dlam s / 4) over the next s us with N clicks.
-    lam_ms = (os_params.lambda_minus_khz - os_params.lambda_zero_khz) / 1000.0
-    cum = _cumulative_counts(os_shots, os_paths.t_us)
-    worst = 0.0
-    for k in range(0, os_paths.t_us.size - 1, 4):
-        for k2 in range(k + 1, os_paths.t_us.size, 8):
-            s_ = os_paths.t_us[k2] - os_paths.t_us[k]
-            moved = np.abs(os_paths.llr[:, k2] - os_paths.llr[:, k])
-            bound = os_paths.gap[:, k] * (cum[:, k2] - cum[:, k] + lam_ms * s_ / 4.0)
-            ok_ = bound > 1e-12
-            if ok_.any():
-                worst = max(worst, float((moved[ok_] / bound[ok_]).max()))
-    d_star_500 = information_cost_gap(os_params, Economics(cost_per_us=1 / 500))
-    check(
-        "the information bound behind the d* stop holds pathwise",
-        worst <= 1.0 + 1e-9,
-        f"max |dl| / [d (N + Dlam s/4)] = {worst:.3f} over every epoch pair; "
-        f"so V = H once d <= d* = {d_star_500:.2e} at a/c = 500",
-    )
-
-    # The exact engine now detects exhaustion at the closed-form time inside
-    # the no-click interval, not at the next click.
-    xs_spec = build_no_click_spectral(os_params)
-    xs_packed = pack_records(build_records(os_shots, 250.0, os_params, xs_spec), xs_spec)
-    fine = filter_on_grid(os_shots, os_labels, os_params, 250.0, 0.25, xs_spec)
-    t_e0, _ = run_sprt(xs_packed, 11.0, 0.0, 250.0, 0.0)
-    t_e1, _ = run_sprt(xs_packed, 11.0, 0.0, 250.0, EXHAUSTION_EPS)
-    first = np.where((fine.gap <= EXHAUSTION_EPS).any(1),
-                     fine.t_us[np.argmax(fine.gap <= EXHAUSTION_EPS, 1)], np.inf)
-    exh_shots = np.isfinite(first) & (first < t_e0 - 1e-9)
-    caught = t_e1[exh_shots] < t_e0[exh_shots] - 1e-9
-    on_time = np.abs(t_e1[exh_shots] - first[exh_shots]) <= 0.25 + 1e-9
-    check(
-        "the exact engine catches exhaustion between clicks",
-        exh_shots.any() and caught.all() and on_time.all(),
-        f"{int(caught.sum())}/{int(exh_shots.sum())} exhausted shots stopped, "
-        f"all within one 0.25 us epoch of the gap crossing (it used to wait "
-        f"for the next click)",
-    )
-
-    # The DP against the paper's own published example (section 6.2): rates
-    # 5 and 1 per ms, wrong-decision cost 2, unit waiting cost per ms, T = 2
-    # ms, switching -> 0. The exact answer (two independent 1-D solvers):
-    # R* = 0.681312, continuation region pi2 in [0.2253, 0.7050]; the paper
-    # prints [0.230, 0.705] at its 1e-4 tolerance. The DP's decision step is
-    # Bermudan, first order in dt, so two steps are Richardson-extrapolated.
-    p62 = MMPPParams(1e-6, 1e-6, 5.0, 1.0)
-    e62 = Economics(cost_per_us=1e-3, cost_miss=2.0, cost_false=2.0)
-    dps = [solve_optimal_dp(p62, 2000.0, e62, dt_us=dt_, h=1.0, dl=0.05)
-           for dt_ in (20.0, 10.0)]
-    sig = lambda v: 1.0 / (1.0 + np.exp(-v))
-    R62 = 2 * dps[1].risk - dps[0].risk
-    lo62 = 2 * sig(dps[1].continuation_at_prior()[0]) - sig(dps[0].continuation_at_prior()[0])
-    hi62 = 2 * sig(dps[1].continuation_at_prior()[1]) - sig(dps[0].continuation_at_prior()[1])
-    check(
-        "the exact DP reproduces Ludkovski-Sezer section 6.2",
-        abs(R62 / 0.681312 - 1) < 1e-3 and abs(lo62 - 0.2253) < 5e-3
-        and abs(hi62 - 0.7050) < 5e-3,
-        f"R* = {R62:.5f} (exact 0.681312); continuation pi2 in "
-        f"[{lo62:.4f}, {hi62:.4f}] (exact [0.2253, 0.7050], paper [0.230, 0.705])",
-    )
-
-    # The DP's policy, simulated through the repo's filter on fresh shots,
-    # must score its own R*; and no feasible rule may beat it beyond noise.
-    # Short horizon keeps this fast; Rao-Blackwellised risk keeps it tight.
-    e_dp = Economics(cost_per_us=1.0 / 500.0)
-    dp_s = solve_optimal_dp(os_params, 60.0, e_dp)
-    sh_d, lb_d = simulate_balanced_dataset(2500, 0.060, os_params, 4242)
-    ch_d = optimal_dp_paths(sh_d, lb_d, os_params, 60.0, dp_s.decision_dt_us)
-    st_d, pr_d, ls_d = evaluate_optimal_dp(dp_s, ch_d)
-    r_d, se_d = posterior_risk(st_d, pr_d, ls_d, lb_d, e_dp)
-    sp_d = build_no_click_spectral(os_params)
-    pk_d = pack_records(build_records(sh_d, 60.0, os_params, sp_d), sp_d)
-    beaten = []
-    for L_ in (1.5, 2.8, 4.0):
-        t_s, p_s, l_s = run_sprt(
-            pk_d, L_, 0.0, 60.0, EXHAUSTION_EPS, e_dp, return_llr=True
-        )
-        r_s, se_s = posterior_risk(t_s, p_s, l_s, lb_d, e_dp)
-        beaten.append(r_s < r_d - 3 * np.hypot(se_s, se_d))
-    check(
-        "the exact DP policy scores its own R* and no SPRT beats it",
-        abs(r_d - dp_s.risk) < 3 * se_d and not any(beaten),
-        f"simulated {r_d:.5f} +- {se_d:.5f} vs R* {dp_s.risk:.5f} "
-        f"(T = 60 us, a/c = 500, 2500 shots/state)",
     )
 
     # -------------------------------------------------------------------------
@@ -8203,31 +7407,22 @@ def validate_all(verbose: bool = True) -> int:
         "reproduced exactly",
     )
 
-    # The exact engine's `econ` argument changes only the DECISION, never
-    # where the rule stops. With two actions it is the Bayes rule l >= 0
-    # rather than the boundary centre, and the two must agree on every
-    # BOUNDARY stop (D < 0 < U always); they may differ only on shots stopped
-    # by the deadline or the exhaustion exit. Pinned structurally: stop times
-    # are identical, and every shot that stopped before the deadline without
-    # the exit gets the same call either way.
+    # The exact engine gained an `econ` argument so the third action reaches
+    # the strongest rule here, not only the epoch-restricted one. Two things
+    # must hold: it changes only the DECISION, never the stopping, and with
+    # no discard it reproduces the two-action code byte for byte.
     ex_dl = 250.0
-    econ_inf = Economics(cost_per_us=1.0 / 500.0)
-    same_stop, same_on_boundary, n_flip = True, True, 0
+    econ_none, econ_inf = None, Economics(cost_per_us=1.0 / 500.0)
+    same_inf = True
     for L, off in ((0.5, 0.0), (2.0, -0.3), (6.0, 0.5)):
-        t_a, p_a = run_sprt(ex_packed, L, off, ex_dl, EXHAUSTION_EPS, None)
+        t_a, p_a = run_sprt(ex_packed, L, off, ex_dl, EXHAUSTION_EPS, econ_none)
         t_b, p_b = run_sprt(ex_packed, L, off, ex_dl, EXHAUSTION_EPS, econ_inf)
-        t_0, _ = run_sprt(ex_packed, L, off, ex_dl, 0.0, None)
-        same_stop &= bool(np.array_equal(t_a, t_b))
-        boundary = (t_0 < ex_dl - 1e-9) & (np.abs(t_a - t_0) < 1e-9)
-        same_on_boundary &= bool(np.array_equal(p_a[boundary], p_b[boundary]))
-        n_flip += int((p_a != p_b).sum())
-        if off == 0.0:
-            same_on_boundary &= bool(np.array_equal(p_a, p_b))
+        same_inf &= bool(np.array_equal(t_a, t_b) and np.array_equal(p_a, p_b))
     check(
-        "the exact engine's Bayes decision changes no stop and no boundary call",
-        same_stop and same_on_boundary,
-        f"identical stop times; identical decisions on every boundary stop; "
-        f"{n_flip} deadline/exhaustion calls moved to the Bayes side l >= 0",
+        "an Economics without discard leaves the exact engine unchanged",
+        same_inf,
+        "cost_discard = inf is bit-identical to passing no economics at all, "
+        "so every result produced before the third action existed stands",
     )
 
     stops_fixed, nested_ok = True, True
@@ -8898,17 +8093,13 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
     p.grid(alpha=0.25)
     p.legend(fontsize=8.5, loc="lower right")
 
-    has_dp = "risk_optimal" in rows[0]
     p = ax[0, 1]
-    arms_b = [
+    for key, style, col, lw, lab in (
         ("grid_sprt", "-o", "#1f77b4", 1.5, "epoch boundary (tuned)"),
         ("exhaustion", "--s", "#2ca02c", 1.5, "+ exhaustion exit"),
         ("exact_sprt", "-^", "#9467bd", 1.5, "exact grid-free boundary"),
-        ("learned", "-D", "#d62728", 2.2, "learned policy (regression MC)"),
-    ]
-    if has_dp:
-        arms_b.append(("optimal", "-", "k", 2.4, "L&S optimum (exact DP)"))
-    for key, style, col, lw, lab in arms_b:
+        ("learned", "-D", "#d62728", 2.2, "learned policy"),
+    ):
         y = np.array([r[f"risk_{key}"] for r in rows])
         lo = np.array([r.get(f"risk_{key}_ci_low", np.nan) for r in rows])
         hi = np.array([r.get(f"risk_{key}_ci_high", np.nan) for r in rows])
@@ -8926,44 +8117,42 @@ def plot_optimal_stopping(result: dict, save_path: str | None = None):
 
     p = ax[1, 0]
     x = np.arange(len(ac))
-    if has_dp:
-        # Distance ABOVE the true optimum -- the question "is this rule
-        # optimal?" answered directly, rather than one approximation of the
-        # optimum measured against another.
-        for j, (key, col, lab) in enumerate((
-            ("exact_sprt", "#9467bd", "exact grid-free boundary"),
-            ("learned", "#d62728", "learned policy"),
-            ("exhaustion", "#2ca02c", "epoch boundary + exhaustion exit"),
-        )):
-            g = np.array([r[f"gap_{key}_pct"] for r in rows])
-            glo = np.array([r.get(f"gap_{key}_ci_low", np.nan) for r in rows])
-            ghi = np.array([r.get(f"gap_{key}_ci_high", np.nan) for r in rows])
-            err = (np.vstack([np.maximum(g - glo, 0), np.maximum(ghi - g, 0)])
-                   if np.isfinite(glo).all() else None)
-            p.bar(x + (j - 1) * 0.27, g, width=0.27, color=col, alpha=0.85,
-                  yerr=err, ecolor="#333333", capsize=2, label=lab)
-        p.set_ylabel("risk above the L&S optimum (%, 95% paired CI)")
-    else:
-        red = np.array([r["risk_reduction_pct"] for r in rows])
-        rlo = np.array([r.get("risk_reduction_ci_low", np.nan) for r in rows])
-        rhi = np.array([r.get("risk_reduction_ci_high", np.nan) for r in rows])
-        yerr = (
-            np.vstack([np.maximum(red - rlo, 0), np.maximum(rhi - red, 0)])
-            if np.isfinite(rlo).all()
-            else None
-        )
-        p.bar(x, red, width=0.6, color="#d62728", alpha=0.85,
-              yerr=yerr, ecolor="#5a1114", capsize=2,
-              label="learned vs best boundary (95% paired CI)")
-        p.set_ylabel("risk reduction vs tuned constant boundary (%)")
+    red = np.array([r["risk_reduction_pct"] for r in rows])
+    rlo = np.array([r.get("risk_reduction_ci_low", np.nan) for r in rows])
+    rhi = np.array([r.get("risk_reduction_ci_high", np.nan) for r in rows])
+    yerr = (
+        np.vstack([np.maximum(red - rlo, 0), np.maximum(rhi - red, 0)])
+        if np.isfinite(rlo).all()
+        else None
+    )
+    p.bar(x - 0.2, red, width=0.4, color="#d62728", alpha=0.85,
+          yerr=yerr, ecolor="#5a1114", capsize=2,
+          label="learned vs best boundary (95% paired CI)")
+    exh = np.array(
+        [
+            100.0 * (r["risk_grid_sprt"] - r["risk_exhaustion"])
+            / r["risk_grid_sprt"]
+            for r in rows
+        ]
+    )
+    elo = np.array([r.get("exhaustion_gain_ci_low", np.nan) for r in rows])
+    ehi = np.array([r.get("exhaustion_gain_ci_high", np.nan) for r in rows])
+    eerr = (
+        np.vstack([np.maximum(exh - elo, 0), np.maximum(ehi - exh, 0)])
+        if np.isfinite(elo).all()
+        else None
+    )
+    p.bar(
+        x + 0.2, exh, width=0.4, color="#2ca02c", alpha=0.85,
+        yerr=eerr, ecolor="#14501a", capsize=2,
+        label="exhaustion exit alone (95% paired CI)",
+    )
     p.set_xticks(x)
     p.set_xticklabels([f"{v:g}" for v in ac], rotation=60, fontsize=7)
     p.axhline(0, color="k", lw=0.8)
     p.set_xlabel("a/c (us)")
-    p.set_title(
-        "(c) how far each rule is from optimal" if has_dp
-        else "(c) learned policy vs the best boundary", fontsize=11,
-    )
+    p.set_ylabel("risk reduction vs tuned constant boundary (%)")
+    p.set_title("(c) what the extra state dimension buys", fontsize=11)
     p.grid(alpha=0.25, axis="y")
     p.legend(fontsize=8.5)
 
@@ -9028,29 +8217,6 @@ _OPTIMAL_CSV_COLUMNS = [
     "exhaustion_gain_ci_low",
     "exhaustion_gain_ci_high",
     "exhaustion_gain_resolved",
-    "risk_optimal",
-    "risk_optimal_star",
-    "risk_optimal_posterior",
-    "risk_optimal_posterior_se",
-    "F_optimal",
-    "T_optimal",
-    "optimal_dt_us",
-    "gap_grid_sprt_pct",
-    "gap_grid_sprt_ci_low",
-    "gap_grid_sprt_ci_high",
-    "gap_grid_sprt_resolved",
-    "gap_exhaustion_pct",
-    "gap_exhaustion_ci_low",
-    "gap_exhaustion_ci_high",
-    "gap_exhaustion_resolved",
-    "gap_exact_sprt_pct",
-    "gap_exact_sprt_ci_low",
-    "gap_exact_sprt_ci_high",
-    "gap_exact_sprt_resolved",
-    "gap_learned_pct",
-    "gap_learned_ci_low",
-    "gap_learned_ci_high",
-    "gap_learned_resolved",
     "F_grid_sprt",
     "T_grid_sprt",
     "F_exhaustion",
@@ -9230,10 +8396,7 @@ def cmd_optimal(args: argparse.Namespace) -> int:
 
     results = []
     for i in wanted:
-        res = run_optimal_stopping(
-            points[i], cfg, n_epochs=args.n_epochs,
-            with_dp=not getattr(args, "no_dp", False),
-        )
+        res = run_optimal_stopping(points[i], cfg, n_epochs=args.n_epochs)
         res["point_index"] = i
         results.append(res)
         with open(directory / f"optimal_{i:02d}_{points[i].name}.pkl", "wb") as f:
@@ -9433,12 +8596,9 @@ def run_discard_sweep(
         econ.validate()
         lo, hi = discard_thresholds(econ)
 
-        base = best_constant_boundary(
-            cal_paths, econ, EXHAUSTION_EPS, deadlines_us=deadlines_us
-        )
+        base = best_constant_boundary(cal_paths, econ, EXHAUSTION_EPS)
         st_s, pr_s = sprt_on_epochs(
-            test_paths, base["L"], base["offset"], EXHAUSTION_EPS,
-            base["deadline_us"], econ,
+            test_paths, base["L"], base["offset"], EXHAUSTION_EPS, None, econ
         )
         m_sprt = three_action_metrics(st_s, pr_s, test_labels, econ)
 
@@ -10156,10 +9316,8 @@ def _method_risks(
     # ---- 4, 5. adaptive MMPP SPRT on the epoch grid, without and with the
     #            exhaustion exit ----------------------------------------------
     for tag, eps in (("mmpp_sprt", 0.0), ("mmpp_sprt_exh", EXHAUSTION_EPS)):
-        b = best_constant_boundary(cal_paths, econ, eps, deadlines_us=deadlines_us)
-        st, pr = sprt_on_epochs(
-            test_paths, b["L"], b["offset"], eps, b["deadline_us"], econ
-        )
+        b = best_constant_boundary(cal_paths, econ, eps)
+        st, pr = sprt_on_epochs(test_paths, b["L"], b["offset"], eps, None, econ)
         _record(tag, st, pr, L=b["L"], offset=b["offset"])
 
     # ---- 6. the exact grid-free boundary ----------------------------------
@@ -10948,7 +10106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "optimal",
-        help="the Ludkovski-Sezer optimum (exact DP) against every rule here",
+        help="learned optimal stopping against the four tuned rules",
     )
     add_common(sp)
     sp.add_argument(
@@ -10967,11 +10125,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Fixed in count rather than spacing so the memory stays bounded "
             "across a power sweep whose horizons span 96 us to 23 ms"
         ),
-    )
-    sp.add_argument(
-        "--no-dp", action="store_true",
-        help="skip the exact DP optimum (it is also skipped automatically "
-        "when it would need more than 5000 time steps)",
     )
     sp.add_argument("--no-plot", action="store_true")
     sp.set_defaults(func=cmd_optimal)
