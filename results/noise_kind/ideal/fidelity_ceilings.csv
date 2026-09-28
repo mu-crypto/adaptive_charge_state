@@ -3,11 +3,17 @@ noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,threshold,0.94041666666
 noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,adaptive_count,0.9370138888888888
 noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,fixed_count_mmpp,0.9470833333333333
 noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,adaptive_mmpp,0.9470833333333333
+noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,learned,0.946875
+noise_kind,ideal,nv_charge_readout_master_v1_4,0,off,0.0,optimal,0.9468055555555556
 noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,threshold,0.9361805555555556
 noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,adaptive_count,0.9295833333333333
 noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,fixed_count_mmpp,0.9427777777777777
 noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,adaptive_mmpp,0.944236111111111
+noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,learned,0.9422222222222223
+noise_kind,ideal,nv_charge_readout_master_v1_4,1,ou,1.0,optimal,0.9439583333333333
 noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,threshold,0.9385416666666666
 noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,adaptive_count,0.9318055555555556
 noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,fixed_count_mmpp,0.94625
 noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,adaptive_mmpp,0.9483333333333333
+noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,learned,0.9479861111111111
+noise_kind,ideal,nv_charge_readout_master_v1_4,2,telegraph,2.0,optimal,0.9484027777777778
