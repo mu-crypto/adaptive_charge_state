@@ -568,6 +568,71 @@ def report_snr_sweep(rows: list[dict], ceilings: dict) -> None:
         )
 
 
+def report_optimum(rows: list[dict]) -> None:
+    """
+    How much of the achievable speedup the SPRT already takes.
+
+    speedup_optimal is the L&S exact-DP frontier (concave hull of its
+    Bayes-optimal points) and speedup_learned the regression-fitted rule,
+    both on the same test shots. Their ratio to speedup_mmpp is the part
+    of the optimum's speedup the SPRT realises. Under the detector and noise
+    presets the DP is optimal for the FILTER's model, not the data, so it
+    is no longer a hard ceiling there.
+    """
+    section("Adaptive MMPP SPRT vs the L&S optimum and the learned policy")
+    pools = (
+        ("ideal detector, no noise", ideal_pool(rows)),
+        ("detector presets", [r for r in rows if not r["_ideal"]]),
+        ("rate noise (ideal detector)", [r for r in rows if r["_ideal"] and r["_noisy"]]),
+    )
+    for label, pool in pools:
+        pool = [
+            r for r in pool
+            if np.isfinite(_f(r, "speedup_mmpp")) and np.isfinite(_f(r, "speedup_optimal"))
+        ]
+        if not pool:
+            continue
+        pts = {(r["experiment"], r["detector"], r["point"]) for r in pool}
+        print(f"\n{label}: {len(pool)} rows over {len(pts)} operating points")
+        print(
+            f"{'headroom':>14} {'n':>5} {'a.MMPP':>8} {'learned':>8} {'optimum':>8}"
+            f" {'MMPP/opt':>9} {'opt>MMPP':>9} {'MMPP>opt':>9}"
+        )
+        for lo, hi in HEADROOM_BANDS + [(-1.0, 0.0)]:
+            sel = [r for r in pool if in_band(r, lo, hi)]
+            if not sel:
+                continue
+            sp_m = np.array([_f(r, "speedup_mmpp") for r in sel])
+            sp_o = np.array([_f(r, "speedup_optimal") for r in sel])
+            # "clearly" = the other method's point estimate lies outside
+            # this one's paired 95% interval.
+            opt_win = np.mean([_f(r, "speedup_optimal_ci_low") > _f(r, "speedup_mmpp") for r in sel])
+            mm_win = np.mean([_f(r, "speedup_mmpp_ci_low") > _f(r, "speedup_optimal") for r in sel])
+            band = "above ceil." if hi <= 0.0 else f"[{lo:.2f}, {hi:.2f})"
+            print(
+                f"  {band:>12} {len(sel):5d} {med(sp_m):8.3f} "
+                f"{med(_f(r, 'speedup_learned') for r in sel):8.3f} {med(sp_o):8.3f}"
+                f" {med(sp_m / sp_o):9.3f} {100 * opt_win:8.0f}% {100 * mm_win:8.0f}%"
+            )
+
+    no_opt = sorted(
+        {
+            (r["experiment"], r["detector"], r["point"])
+            for r in rows
+            if np.isfinite(_f(r, "speedup_mmpp"))
+        }
+        - {
+            (r["experiment"], r["detector"], r["point"])
+            for r in rows
+            if np.isfinite(_f(r, "speedup_optimal"))
+        }
+    )
+    if no_opt:
+        print("\nno optimum curve (DP skipped or never reaches the targets):")
+        for k in no_opt:
+            print(f"  {k[0]} / {k[1]} / {k[2]}")
+
+
 def report_ci_widths(rows: list[dict]) -> None:
     section("Bootstrap interval widths")
     pool = ideal_pool(rows)
@@ -629,6 +694,7 @@ def main() -> int:
     report_overhead(rows)
     report_detector(rows, ceilings)
     report_noise(rows)
+    report_optimum(rows)
     report_ci_widths(rows)
     return 0
 
