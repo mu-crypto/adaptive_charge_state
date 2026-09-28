@@ -2516,58 +2516,6 @@ def min_time_for_fidelity(
     return float(np.min(np.asarray(times, dtype=float)[mask]))
 
 
-def concave_hull_frontier(
-    times: np.ndarray,
-    fidelities: np.ndarray,
-    origin: tuple[float, float] = (0.0, 0.5),
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Upper concave hull of (T, F) points, in LINEAR time, including `origin`.
-
-    For a family of Bayes-optimal rules (one per a/c) this hull IS the best
-    achievable fidelity-vs-mean-time frontier: any point on a hull edge is
-    reached by randomising, per shot, between the two rules at its ends, and
-    by Lagrangian duality no rule of any kind lies above it. The origin
-    (stop at once and guess, F = 1/2 at T = 0) is always feasible.
-    """
-    T = np.concatenate([[origin[0]], np.asarray(times, float)])
-    F = np.concatenate([[origin[1]], np.asarray(fidelities, float)])
-    ok = np.isfinite(T) & np.isfinite(F)
-    T, F = T[ok], F[ok]
-    order = np.lexsort((-F, T))
-    T, F = T[order], F[order]
-    hull: list[int] = []
-    for i in range(T.size):
-        if hull and T[i] == T[hull[-1]]:
-            continue                      # same time, lower fidelity
-        if hull and F[i] <= F[hull[-1]]:
-            continue                      # dominated: later and no better
-        while len(hull) >= 2:
-            a, b = hull[-2], hull[-1]
-            cross = (T[b] - T[a]) * (F[i] - F[a]) - (F[b] - F[a]) * (T[i] - T[a])
-            if cross >= 0.0:
-                hull.pop()                # b lies on or below the chord a-i
-            else:
-                break
-        hull.append(i)
-    return T[hull], F[hull]
-
-
-def time_for_fidelity_hull(
-    times: np.ndarray, fidelities: np.ndarray, target: float
-) -> float:
-    """Mean time to reach `target` on the concave hull (linear interpolation)."""
-    Th, Fh = concave_hull_frontier(times, fidelities)
-    target = float(target)
-    if Fh.size == 0 or target > Fh[-1]:
-        return np.nan
-    j = int(np.searchsorted(Fh, target, side="left"))
-    if j == 0:
-        return float(Th[0])
-    w = (target - Fh[j - 1]) / (Fh[j] - Fh[j - 1])
-    return float(Th[j - 1] + w * (Th[j] - Th[j - 1]))
-
-
 def time_for_fidelity_interp(
     times: np.ndarray,
     fidelities: np.ndarray,
@@ -2856,15 +2804,6 @@ class RunConfig:
     detector: DetectorModel = DETECTOR_OFF
     noise: RateNoise = NOISE_OFF
     include_fixed_mmpp: bool = False
-    # Methods 5 and 6: the learned stopping policy (regression MC) and the
-    # exact Ludkovski-Sezer optimum (DP). Each traces its frontier through
-    # a/c, one configuration per value; the optimum's Bayes-optimal rules
-    # over all a/c ARE the lower convex hull of achievable (time, error)
-    # pairs, so its curve is the best any stopping rule can do here.
-    include_learned: bool = True
-    include_optimal: bool = True
-    n_learned_ac: int = 24
-    n_optimal_ac: int = 14
     n_q_shots: int = 300
     # "thin_all_counts": eta multiplies both lambdas, so contrast is held
     # exactly and the efficiency sweep varies one thing, sparsity. Under
@@ -2902,8 +2841,6 @@ class RunConfig:
             boundary_widths=np.geomspace(0.3, 8.0, 5),
             offsets=np.array([-0.6, 0.0, 0.3]),
             target_fidelities=np.round(np.arange(0.55, 0.99, 0.05), 4),
-            n_learned_ac=8,
-            n_optimal_ac=5,
         )
 
 
@@ -3271,21 +3208,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
             f"configurations in {time.time() - t0:.1f} s"
         )
 
-    new = _run_new_schemes(
-        cfg, filter_params, horizon_us, spec,
-        cal_shots, cal_labels, test_shots, test_labels,
-    )
-    lrn_correct, lrn_time = new["learned_correct"], new["learned_time"]
-    opt_correct, opt_time = new["optimal_correct"], new["optimal_time"]
-    F_lrn = T_lrn = F_opt = T_opt = None
-    if lrn_correct is not None:
-        F_lrn, T_lrn = _method_curve(test_labels, lrn_correct, lrn_time)
-    if opt_correct is not None:
-        F_opt, T_opt = _method_curve(test_labels, opt_correct, opt_time)
-    if cfg.verbose:
-        print(f"  learned policy and exact optimum in {time.time() - t0:.1f} s"
-              + (f"  ({new['optimal_skipped']})" if new["optimal_skipped"] else ""))
-
     # ---- matched-fidelity speedups + paired bootstrap ----------------------
     # The point estimate and the bootstrap MUST range over the same set of
     # configurations. The point estimates below (t_cnt, t_fcm, t_ada) take the
@@ -3347,21 +3269,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
             )
         )
 
-    # Methods 5 and 6 on the SAME resamples, so their intervals are paired
-    # with the threshold baseline exactly as the others are.
-    boot_new = []
-    for i0, i1 in boots:
-        entry = {}
-        for tag, C, Tm in (("learned", lrn_correct, lrn_time),
-                           ("optimal", opt_correct, opt_time)):
-            if C is None:
-                continue
-            entry[tag] = (
-                0.5 * (C[i0].mean(axis=0) + C[i1].mean(axis=0)),
-                0.5 * (Tm[i0].mean(axis=0) + Tm[i1].mean(axis=0)),
-            )
-        boot_new.append(entry)
-
     def _ci(v) -> tuple[float, float]:
         v = np.asarray(v, dtype=float)
         if v.size < 20:
@@ -3374,31 +3281,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     rows = []
     for F_star in np.asarray(cfg.target_fidelities, dtype=float):
         t_thr = time_for_fidelity_interp(T_thr, F_thr, F_star)
-        new_cols = {}
-        for tag, Fm, Tm in (("learned", F_lrn, T_lrn), ("optimal", F_opt, T_opt)):
-            if Fm is None:
-                continue
-            # The optimum's frontier is the concave hull of its Bayes-optimal
-            # points; the learned policy is a deterministic rule and uses the
-            # same interpolation as methods 1-4.
-            interp = (time_for_fidelity_hull if tag == "optimal"
-                      else time_for_fidelity_interp)
-            t_m = interp(Tm, Fm, F_star)
-            sp_b = []
-            for (Fb_thr, *_), entry in zip(boot_curves, boot_new):
-                base = time_for_fidelity_interp(readout_times_us, Fb_thr, F_star)
-                if not np.isfinite(base) or tag not in entry:
-                    continue
-                Fb, Tb = entry[tag]
-                tb = interp(Tb, Fb, F_star)
-                if np.isfinite(tb) and tb > 0:
-                    sp_b.append(base / tb)
-            lo_n, hi_n = _ci(sp_b)
-            good = np.isfinite(t_thr) and np.isfinite(t_m) and t_m > 0
-            new_cols[f"t_{tag}_us"] = t_m
-            new_cols[f"speedup_{tag}"] = t_thr / t_m if good else np.nan
-            new_cols[f"speedup_{tag}_ci_low"] = lo_n
-            new_cols[f"speedup_{tag}_ci_high"] = hi_n
         t_cnt = time_for_fidelity_interp(T_cnt, F_cnt, F_star)
         t_ada = time_for_fidelity_interp(T_ada, F_ada, F_star)
         t_fcm = time_for_fidelity_interp(T_fcm, F_fcm, F_star)
@@ -3460,7 +3342,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
                 "speedup_ci_low": lo_m,
                 "speedup_ci_high": hi_m,
                 "speedup_from_adaptivity_only": sp_count,
-                **new_cols,
             }
         )
 
@@ -3468,7 +3349,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         print(
             f"\n  {'F*':>6} {'t_thr':>10} {'t_cnt':>10} {'t_fcm':>10} "
             f"{'t_mmpp':>10} {'sp_mmpp':>8} {'sp_fcm':>8} {'sp_cnt':>8}"
-            f" {'sp_learn':>8} {'sp_opt':>8}"
         )
         for r in rows:
             if not np.isfinite(r["speedup_mmpp"]):
@@ -3479,9 +3359,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
                 f"{r['t_fixed_count_mmpp_us']:10.2f} "
                 f"{r['t_adaptive_mmpp_us']:10.2f} "
                 f"{r['speedup_mmpp']:8.2f} {r['speedup_fixed_count_mmpp']:8.2f} "
-                f"{r['speedup_count']:8.2f} "
-                f"{r.get('speedup_learned', np.nan):8.2f} "
-                f"{r.get('speedup_optimal', np.nan):8.2f}"
+                f"{r['speedup_count']:8.2f}"
             )
         ceil = f"threshold {F_thr.max():.4f}"
         if F_mmpp is not None:
@@ -3491,10 +3369,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
             f"fixed-count MMPP {F_fcm.max():.4f}, "
             f"adaptive MMPP {F_ada.max():.4f}"
         )
-        if F_lrn is not None:
-            ceil += f", learned {F_lrn.max():.4f}"
-        if F_opt is not None:
-            ceil += f", L&S optimum {F_opt.max():.4f}"
         print(f"\n  ceilings: {ceil}")
         if mcnemar is not None:
             print(
@@ -3547,22 +3421,6 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         "F_adaptive_mmpp_cal": np.asarray(ada_cal_F),
         "T_adaptive_mmpp_cal": np.asarray(ada_cal_T),
         "frontier_adaptive_mmpp": pareto_frontier(T_ada, F_ada),
-        "F_learned": F_lrn,
-        "T_learned": T_lrn,
-        "frontier_learned": None if F_lrn is None else pareto_frontier(T_lrn, F_lrn),
-        "learned_a_over_c": new["learned_ac"],
-        "F_optimal": F_opt,
-        "T_optimal": T_opt,
-        "frontier_optimal": None if F_opt is None else pareto_frontier(T_opt, F_opt),
-        "hull_optimal": None if F_opt is None else np.vstack(
-            concave_hull_frontier(T_opt, F_opt)
-        ),
-        "optimal_a_over_c": new["optimal_ac"],
-        "optimal_risk_star": new["optimal_risk_star"],
-        "optimal_dt_us": new["optimal_dt_us"],
-        "optimal_dt_per_ac_us": new.get("optimal_dt_per_ac_us"),
-        "optimal_horizon_per_ac_us": new.get("optimal_horizon_per_ac_us"),
-        "optimal_skipped": new["optimal_skipped"],
         "speedup_table": rows,
         "n_cal_per_state": cfg.n_cal,
         "n_test_per_state": cfg.n_test,
@@ -3586,165 +3444,8 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
 
     if mmpp_correct is not None:
         result["fixed_mmpp_correct"] = mmpp_correct.astype(bool)
-    if lrn_correct is not None:
-        result["learned_correct"] = lrn_correct.astype(bool)
-        result["learned_time"] = lrn_time.astype(np.float32)
-    if opt_correct is not None:
-        result["optimal_correct"] = opt_correct.astype(bool)
-        result["optimal_time"] = opt_time.astype(np.float32)
 
     return result
-
-
-# DP settings for the sweeps. Twice the default step (lambda dt <= 0.1) and
-# a 0.7 y/z grid: at the moderate point R* moves 0.084129 -> 0.084217
-# (+0.1%), entirely from the step, at a fifth of the cost -- and a slightly
-# coarser step can only make the DP policy slightly WORSE, so the curve it
-# traces stays a feasible, conservative estimate of the optimum.
-SWEEP_DP_LAM_DT = 0.1
-SWEEP_DP_FINE_LAM_DT = 0.025
-SWEEP_DP_H = 0.7
-SWEEP_DP_MAX_STEPS = 5000
-
-
-def _run_new_schemes(
-    cfg: RunConfig,
-    filter_params: MMPPParams,
-    horizon_us: float,
-    spec: NoClickSpectral,
-    cal_shots, cal_labels, test_shots, test_labels,
-) -> dict:
-    """
-    Methods 5 and 6 at one operating point, as correctness/time columns.
-
-    One column per a/c, on the test shots. The learned policy is fitted on
-    calibration (128 epochs, Bayes decision); the DP needs no data. Both
-    see the same shots as methods 1-4, and the filter they use is the one
-    the other MMPP methods use -- so under the detector and noise presets
-    both are optimal only for that model, not for the data.
-    """
-    out = {
-        "learned_correct": None, "learned_time": None, "learned_ac": None,
-        "optimal_correct": None, "optimal_time": None, "optimal_ac": None,
-        "optimal_risk_star": None, "optimal_dt_us": None,
-        "optimal_skipped": "",
-    }
-    # Below a/c* ~ (1/a + 1/b)/Dlam = 2/Dlam the optimum stops at t = 0
-    # (L&S Remark 6.1), so every value down there lands on one point. Just
-    # above it the frontier is steepest: the whole low-fidelity end, F ~
-    # 0.55-0.75, is traced by a/c within a factor ~2 of a/c*. So the grid is
-    # log-spaced in the distance ABOVE a/c*, not in a/c: a plain geometric
-    # grid put one point there and the hull chord across the gap made the
-    # optimum look slower than the SPRT at low targets. Switching moves the
-    # true threshold slightly above 2/Dlam (~1.08x at the moderate point), so
-    # the grid starts 10% above it rather than wasting points at T = 0.
-    dlam = abs(filter_params.lambda_minus_khz - filter_params.lambda_zero_khz) / 1000.0
-    ac_star = 2.0 / max(dlam, 1e-12)
-
-    def _grid(n, hi):
-        hi = max(hi, 8.0 * ac_star)
-        return ac_star * (1.0 + np.geomspace(0.1, hi / ac_star - 1.0, int(n)))
-
-    if cfg.include_learned:
-        ac = _grid(cfg.n_learned_ac, 2.0e5)
-        dt_e = horizon_us / N_EPOCHS_DEFAULT
-        cal_paths = filter_on_grid(
-            cal_shots, cal_labels, filter_params, horizon_us, dt_e, spec
-        )
-        test_paths = filter_on_grid(
-            test_shots, test_labels, filter_params, horizon_us, dt_e, spec
-        )
-        C, Tm = [], []
-        for a in ac:
-            econ = Economics(cost_per_us=1.0 / float(a))
-            co = fit_stopping_rule(cal_paths, econ)
-            st, pr, _ = apply_stopping_rule(test_paths, co, econ)
-            C.append((pr == test_labels).astype(float))
-            Tm.append(st)
-        out.update(learned_correct=np.column_stack(C),
-                   learned_time=np.column_stack(Tm), learned_ac=ac)
-
-    if cfg.include_optimal:
-        dt_o = optimal_dp_step_us(filter_params, horizon_us, lam_dt=SWEEP_DP_LAM_DT)
-        n_steps = int(round(horizon_us / dt_o))
-        if n_steps > SWEEP_DP_MAX_STEPS:
-            out["optimal_skipped"] = (
-                f"exact optimum skipped: {n_steps} DP steps > {SWEEP_DP_MAX_STEPS}"
-            )
-            return out
-        ac = _grid(cfg.n_optimal_ac, 5.0e4)
-        dps = [
-            solve_optimal_dp(
-                filter_params, horizon_us, Economics(cost_per_us=1.0 / float(a)),
-                dt_us=dt_o, h=SWEEP_DP_H,
-            )
-            for a in ac
-        ]
-        # Paths on the DP's decision grid are large, so build them a chunk at
-        # a time and run every a/c's policy on each chunk before moving on.
-        parts = [[] for _ in dps]
-        labels = np.asarray(test_labels, dtype=int)
-        for s in range(0, len(test_shots), 2500):
-            paths = filter_on_grid(
-                test_shots[s : s + 2500], labels[s : s + 2500], filter_params,
-                horizon_us, dt_o, spec,
-            )
-            for j, dp in enumerate(dps):
-                st, pr, _ = apply_optimal_dp(dp, paths)
-                parts[j].append((st, pr))
-            del paths
-        C, Tm = [], []
-        for pj in parts:
-            st = np.concatenate([p[0] for p in pj])
-            pr = np.concatenate([p[1] for p in pj])
-            C.append((pr == labels).astype(float))
-            Tm.append(st)
-
-        # Low a/c: the optimum stops within a few coarse steps, so the step
-        # itself (the rule may only stop on an epoch, up to dt after the
-        # click it is waiting for) costs it several percent of E[T] against
-        # the grid-free SPRT. Those rules also never run long, so re-solve
-        # them with a 4x finer step on a horizon cut to 8x the latest stop
-        # the coarse rule makes on CALIBRATION shots. A shorter horizon only
-        # forces stops, so the refined rule is still a feasible one; at the
-        # moderate point it lowers the empirical risk at a/c = 11 and 14 by
-        # 0.004 and 0.005, to within 0.004 of the best SPRT.
-        cal_lab = np.asarray(cal_labels, dtype=int)
-        cal_paths = filter_on_grid(
-            cal_shots, cal_lab, filter_params, horizon_us, dt_o, spec
-        )
-        dt_used = np.full(len(dps), float(dt_o))
-        h_used = np.full(len(dps), float(horizon_us))
-        risk = np.array([dp.risk for dp in dps])
-        for j, dp in enumerate(dps):
-            st_cal, _, _ = apply_optimal_dp(dp, cal_paths)
-            h_f = 8.0 * float(np.max(st_cal))
-            if not 0.0 < h_f <= 0.5 * horizon_us:
-                continue
-            dt_f = optimal_dp_step_us(filter_params, h_f, lam_dt=SWEEP_DP_FINE_LAM_DT)
-            if h_f / dt_f > SWEEP_DP_MAX_STEPS:
-                continue
-            dp_f = solve_optimal_dp(
-                filter_params, h_f, Economics(cost_per_us=1.0 / float(ac[j])),
-                dt_us=dt_f, h=SWEEP_DP_H,
-            )
-            paths = filter_on_grid(
-                test_shots, labels, filter_params, h_f, dt_f, spec
-            )
-            st, pr, _ = apply_optimal_dp(dp_f, paths)
-            del paths
-            C[j] = (pr == labels).astype(float)
-            Tm[j] = st
-            dt_used[j], h_used[j], risk[j] = dt_f, h_f, dp_f.risk
-        del cal_paths
-
-        out.update(
-            optimal_correct=np.column_stack(C), optimal_time=np.column_stack(Tm),
-            optimal_ac=ac, optimal_risk_star=risk,
-            optimal_dt_us=float(dt_o), optimal_dt_per_ac_us=dt_used,
-            optimal_horizon_per_ac_us=h_used,
-        )
-    return out
 
 
 def max_fidelity_summary(result: dict) -> dict:
@@ -3756,10 +3457,6 @@ def max_fidelity_summary(result: dict) -> dict:
     if result.get("F_fixed_count_mmpp") is not None:
         out["fixed_count_mmpp"] = float(np.max(result["F_fixed_count_mmpp"]))
     out["adaptive_mmpp"] = float(np.max(result["F_adaptive_mmpp"]))
-    if result.get("F_learned") is not None:
-        out["learned"] = float(np.max(result["F_learned"]))
-    if result.get("F_optimal") is not None:
-        out["optimal"] = float(np.max(result["F_optimal"]))
     return out
 
 
@@ -4509,10 +4206,6 @@ _METHOD_STYLES = {
     "count": dict(ls="--", lw=1.5, marker="^", ms=3.5),
     "fixed_count_mmpp": dict(ls="-.", lw=1.6, marker="d", ms=3.2),
     "mmpp": dict(ls="-", lw=2.4, marker=None),
-    "learned": dict(ls="-", lw=1.0, marker="x", ms=4.0),
-    # The optimum bounds every other curve, so it is drawn as a translucent
-    # envelope underneath them rather than as one more line on top.
-    "optimal": dict(ls="-", lw=5.0, marker=None, alpha=0.30),
 }
 
 
@@ -4525,81 +4218,21 @@ def _pyplot():
     return plt
 
 
-def _learned_curve(res: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Learned-policy frontier without its T = 0 points (off a log axis)."""
-    fl = res["frontier_learned"]
-    T = np.asarray(res["T_learned"])[fl]
-    F = np.asarray(res["F_learned"])[fl]
-    return T[T > 0], F[T > 0]
-
-
-def _optimal_curve(res: dict) -> tuple[np.ndarray, np.ndarray]:
-    """The optimum's hull, densified: its edges are straight in LINEAR time."""
-    H = res.get("hull_optimal")
-    if H is None:
-        return np.array([]), np.array([])
-    Th, Fh = np.asarray(H[0], float), np.asarray(H[1], float)
-    Ts, Fs = [], []
-    for j in range(Th.size - 1):
-        w = np.linspace(0.0, 1.0, 25)
-        Ts.append(Th[j] + w * (Th[j + 1] - Th[j]))
-        Fs.append(Fh[j] + w * (Fh[j + 1] - Fh[j]))
-    if not Ts:
-        return Th, Fh
-    T, F = np.concatenate(Ts), np.concatenate(Fs)
-    keep = T > 0
-    return T[keep], F[keep]
-
-
-def _speedup_panel(ax, results, spec, key, style, title, bands=True):
-    """One speedup-vs-target curve per sweep point, with its paired CI."""
-    for k, res in enumerate(results):
-        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
-        tbl = res["speedup_table"]
-        F = np.array([r["target_fidelity"] for r in tbl])
-        S = np.array([r.get(f"speedup_{key}", np.nan) for r in tbl])
-        m = np.isfinite(S)
-        if not m.any():
-            continue
-        ax.plot(F[m], S[m], style, ms=3.5, color=c, lw=1.7, label=res["label"])
-        if bands:
-            lo = np.array([r.get(f"speedup_{key}_ci_low", np.nan) for r in tbl])
-            hi = np.array([r.get(f"speedup_{key}_ci_high", np.nan) for r in tbl])
-            g = m & np.isfinite(lo) & np.isfinite(hi)
-            ax.fill_between(F[g], lo[g], hi[g], color=c, alpha=0.13)
-    ax.axhline(1.0, color="k", lw=0.8, ls=":")
-    ax.set_xlabel("target balanced fidelity")
-    ax.set_ylabel("run-time reduction vs fixed-time threshold")
-    ax.set_title(title, fontsize=11)
-    ax.legend(title=spec.legend_title, fontsize=8.5, title_fontsize=8.5)
-    ax.grid(alpha=0.25)
-
-
 def plot_sweep(
     results: list[dict],
     spec: SweepSpec,
     save_path: str | None = None,
 ):
-    """
-    Fidelity-vs-time plus every method's speedup, one colour per sweep point.
-
-    Row 1: the frontier, the adaptive MMPP SPRT (the incumbent), and the
-    Ludkovski-Sezer optimum -- the ceiling on what any stopping rule can do.
-    Row 2: the learned policy, and the two single-axis controls.
-    """
+    """Fidelity-vs-time plus both speedup curves, one colour per sweep point."""
     plt = _pyplot()
     from matplotlib.lines import Line2D
 
-    fig, axes2 = plt.subplots(2, 3, figsize=(20.0, 11.0))
-    axes = axes2.ravel()
+    fig, axes = plt.subplots(1, 4, figsize=(24.0, 5.4))
 
     # ---- panel (a): fidelity vs mean run time ------------------------------
     ax = axes[0]
     for k, res in enumerate(results):
         c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
-        if res.get("F_optimal") is not None:
-            To, Fo = _optimal_curve(res)
-            ax.plot(To, Fo, color=c, **_METHOD_STYLES["optimal"])
         ax.plot(
             res["T_threshold"], res["F_threshold"], color=c,
             **_METHOD_STYLES["threshold"],
@@ -4626,8 +4259,6 @@ def plot_sweep(
             color=c,
             **_METHOD_STYLES["mmpp"],
         )
-        if res.get("F_learned") is not None:
-            ax.plot(*_learned_curve(res), color=c, **_METHOD_STYLES["learned"])
 
     ax.set_xscale("log")
     ax.set_xlabel("mean run time per shot (us)")
@@ -4645,56 +4276,101 @@ def plot_sweep(
         for k, res in enumerate(results)
     ]
     method_handles = [
-        Line2D([], [], color="0.35", label="fixed-time threshold",
-               **_METHOD_STYLES["threshold"]),
-        Line2D([], [], color="0.35", label="adaptive count SPRT",
-               **_METHOD_STYLES["count"]),
-        Line2D([], [], color="0.35", label="fixed-count MMPP",
-               **_METHOD_STYLES["fixed_count_mmpp"]),
-        Line2D([], [], color="0.35", label="adaptive MMPP SPRT",
-               **_METHOD_STYLES["mmpp"]),
+        Line2D(
+            [], [], color="0.35", label="fixed-time threshold",
+            **_METHOD_STYLES["threshold"],
+        ),
+        Line2D(
+            [], [], color="0.35", label="adaptive count SPRT",
+            **_METHOD_STYLES["count"],
+        ),
+        Line2D(
+            [], [], color="0.35", label="fixed-count MMPP",
+            **_METHOD_STYLES["fixed_count_mmpp"],
+        ),
+        Line2D(
+            [], [], color="0.35", label="adaptive MMPP SPRT",
+            **_METHOD_STYLES["mmpp"],
+        ),
     ]
-    if any(r.get("F_learned") is not None for r in results):
-        method_handles.append(Line2D([], [], color="0.35", label="learned policy",
-                                     **_METHOD_STYLES["learned"]))
-    if any(r.get("F_optimal") is not None for r in results):
-        method_handles.append(Line2D([], [], color="0.35",
-                                     label="L&S optimum (exact DP)",
-                                     **_METHOD_STYLES["optimal"]))
     leg1 = ax.legend(
-        handles=value_handles, title=spec.legend_title, fontsize=8.5,
-        title_fontsize=8.5, loc="lower right",
+        handles=value_handles, title=spec.legend_title, fontsize=9,
+        title_fontsize=9, loc="lower right",
     )
     ax.add_artist(leg1)
-    ax.legend(handles=method_handles, fontsize=8, loc="upper left")
+    ax.legend(handles=method_handles, fontsize=8.5, loc="upper left")
 
     # ---- panel (b): adaptive MMPP speedup ----------------------------------
-    _speedup_panel(axes[1], results, spec, "mmpp", "-o",
-                   "(b) adaptive MMPP SPRT speedup")
-    axes[1].axhline(2.0, color="0.5", lw=0.9, ls="--")
-    axes[1].annotate(
+    ax = axes[1]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        tbl = res["speedup_table"]
+        F = np.array([r["target_fidelity"] for r in tbl])
+        S = np.array([r["speedup_mmpp"] for r in tbl])
+        lo = np.array([r["speedup_mmpp_ci_low"] for r in tbl])
+        hi = np.array([r["speedup_mmpp_ci_high"] for r in tbl])
+        m = np.isfinite(S)
+        ax.plot(F[m], S[m], "-o", ms=3.5, color=c, lw=1.8, label=res["label"])
+        g = m & np.isfinite(lo) & np.isfinite(hi)
+        ax.fill_between(F[g], lo[g], hi[g], color=c, alpha=0.13)
+
+    ax.axhline(1.0, color="k", lw=0.8, ls=":")
+    ax.axhline(2.0, color="0.5", lw=0.9, ls="--")
+    ax.annotate(
         "D'Anjou bound, decay readout",
         xy=(0.985, 2.0), xycoords=("axes fraction", "data"),
         xytext=(0, 4), textcoords="offset points",
         fontsize=8, color="0.4", ha="right", va="bottom",
     )
+    ax.set_xlabel("target balanced fidelity")
+    ax.set_ylabel("run-time reduction vs fixed-time threshold")
+    ax.set_title("(b) adaptive MMPP speedup", fontsize=11)
+    ax.legend(title=spec.legend_title, fontsize=9, title_fontsize=9)
+    ax.grid(alpha=0.25)
 
-    # ---- panel (c): the optimum ---------------------------------------------
-    skipped = [r["name"] for r in results if r.get("optimal_skipped")]
-    _speedup_panel(
-        axes[2], results, spec, "optimal", "-*",
-        "(c) L&S optimum speedup (ceiling for any rule)"
-        + (f"\nnot computed at {', '.join(skipped)}: horizon too long"
-           if skipped else ""),
+    # ---- panel (c): fixed-count MMPP speedup -------------------------------
+    ax = axes[2]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        tbl = res["speedup_table"]
+        F = np.array([r["target_fidelity"] for r in tbl])
+        S = np.array([r.get("speedup_fixed_count_mmpp", np.nan) for r in tbl])
+        lo = np.array(
+            [r.get("speedup_fixed_count_mmpp_ci_low", np.nan) for r in tbl]
+        )
+        hi = np.array(
+            [r.get("speedup_fixed_count_mmpp_ci_high", np.nan) for r in tbl]
+        )
+        m = np.isfinite(S)
+        ax.plot(F[m], S[m], "-.d", ms=3.6, color=c, lw=1.7, label=res["label"])
+        g = m & np.isfinite(lo) & np.isfinite(hi)
+        ax.fill_between(F[g], lo[g], hi[g], color=c, alpha=0.13)
+
+    ax.axhline(1.0, color="k", lw=0.8, ls=":")
+    ax.set_xlabel("target balanced fidelity")
+    ax.set_ylabel("run-time reduction vs fixed-time threshold")
+    ax.set_title(
+        "(c) fixed-count MMPP speedup (statistic alone)", fontsize=11
     )
+    ax.legend(title=spec.legend_title, fontsize=9, title_fontsize=9)
+    ax.grid(alpha=0.25)
 
-    # ---- panels (d)-(f) ------------------------------------------------------
-    _speedup_panel(axes[3], results, spec, "learned", "-x",
-                   "(d) learned stopping policy speedup")
-    _speedup_panel(axes[4], results, spec, "fixed_count_mmpp", "-.d",
-                   "(e) fixed-count MMPP speedup (statistic alone)")
-    _speedup_panel(axes[5], results, spec, "count", "--^",
-                   "(f) adaptive count speedup (stopping alone)", bands=False)
+    # ---- panel (d): adaptive count speedup ---------------------------------
+    ax = axes[3]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        tbl = res["speedup_table"]
+        F = np.array([r["target_fidelity"] for r in tbl])
+        S = np.array([r["speedup_count"] for r in tbl])
+        m = np.isfinite(S)
+        ax.plot(F[m], S[m], "--^", ms=4.0, color=c, lw=1.6, label=res["label"])
+
+    ax.axhline(1.0, color="k", lw=0.8, ls=":")
+    ax.set_xlabel("target balanced fidelity")
+    ax.set_ylabel("run-time reduction vs fixed-time threshold")
+    ax.set_title("(d) adaptive count speedup (stopping alone)", fontsize=11)
+    ax.legend(title=spec.legend_title, fontsize=9, title_fontsize=9)
+    ax.grid(alpha=0.25)
 
     ylim = max(ax_.get_ylim()[1] for ax_ in axes[1:])
     for ax_ in axes[1:]:
@@ -4702,7 +4378,7 @@ def plot_sweep(
 
     det = results[0]["detector"] if results else DETECTOR_OFF
     fig.suptitle(f"{spec.title}  --  {det.describe()}", fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -4736,33 +4412,16 @@ def plot_sweep_vs_x(
             sp.append(hit[0] if hit else np.nan)
         sp = np.array(sp, dtype=float)
         m = np.isfinite(sp)
-        line = None
         if m.any():
-            (line,) = ax.plot(
+            ax.plot(
                 x[m], sp[m], f"-{mk}", lw=1.8, ms=5, label=f"F* = {F_star:.2f}"
             )
-        opt = []
-        for res in results:
-            hit = [
-                r.get("speedup_optimal", np.nan)
-                for r in res["speedup_table"]
-                if abs(r["target_fidelity"] - F_star) < 5e-3
-            ]
-            opt.append(hit[0] if hit else np.nan)
-        opt = np.array(opt, dtype=float)
-        mo = np.isfinite(opt)
-        if mo.any():
-            ax.plot(x[mo], opt[mo], f":{mk}", lw=1.4, ms=4, mfc="none",
-                    color=line.get_color() if line is not None else None)
 
     ax.axhline(1.0, color="k", lw=0.8, ls=":")
     ax.set_xscale(spec.xscale)
     ax.set_xlabel(spec.xlabel)
-    ax.set_ylabel("speedup vs fixed-time threshold")
-    ax.set_title(
-        "speedup at fixed fidelity: adaptive MMPP SPRT (solid), "
-        "L&S optimum (dotted)", fontsize=10,
-    )
+    ax.set_ylabel("adaptive MMPP speedup")
+    ax.set_title("speedup at fixed fidelity", fontsize=11)
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
 
@@ -4776,10 +4435,6 @@ def plot_sweep_vs_x(
         series.insert(2, ("F_fixed_count_mmpp", "fixed-count MMPP", "-.d"))
     if results and results[0].get("F_fixed_mmpp") is not None:
         series.insert(1, ("F_fixed_mmpp", "fixed-time MMPP", "--*"))
-    if any(r.get("F_learned") is not None for r in results):
-        series.append(("F_learned", "learned policy", "-x"))
-    if any(r.get("F_optimal") is not None for r in results):
-        series.append(("F_optimal", "L&S optimum (exact DP)", "-*"))
 
     for key, lab, st in series:
         ceil = [
@@ -4850,18 +4505,6 @@ def plot_operating_point(result: dict, save_path: str | None = None):
         np.asarray(result["F_adaptive_mmpp"])[fa],
         "-", lw=2.4, color="#d62728", label="adaptive MMPP SPRT (this work)",
     )
-    if result.get("F_learned") is not None:
-        ax.plot(
-            *_learned_curve(result),
-            "x-", ms=4, lw=1.2, color="#ff7f0e", label="learned stopping policy",
-        )
-    if result.get("F_optimal") is not None:
-        To, Fo = _optimal_curve(result)
-        ax.plot(To, Fo, "-", lw=1.4, color="k",
-                label="L&S optimum (exact DP, concave hull)")
-        H = result["hull_optimal"]
-        v = np.asarray(H[0]) > 0
-        ax.plot(np.asarray(H[0])[v], np.asarray(H[1])[v], "*", ms=6, color="k")
 
     # Mark the time reduction at the largest jointly achievable target.
     rows = [r for r in result["speedup_table"] if np.isfinite(r["speedup_mmpp"])]
@@ -4923,14 +4566,6 @@ def plot_operating_point(result: dict, save_path: str | None = None):
         F[ok2], S_cnt[ok2], "^--", color="#2ca02c",
         label="adaptive count (stopping only)",
     )
-    for key, st, col, lab in (
-        ("learned", "x-", "#ff7f0e", "learned stopping policy"),
-        ("optimal", "*-", "k", "L&S optimum (exact DP)"),
-    ):
-        S_n = np.array([r.get(f"speedup_{key}", np.nan) for r in tbl])
-        okn = np.isfinite(S_n)
-        if okn.any():
-            ax.plot(F[okn], S_n[okn], st, color=col, ms=5, lw=1.4, label=lab)
     ax.axhline(1.0, color="k", lw=0.8, ls=":")
     ax.axhline(
         2.0, color="#888888", lw=0.9, ls="--",
@@ -4973,9 +4608,8 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
         f"{'point':>14}{'ph/dwell':>10}{'F*':>7}{'t_thr(us)':>11}"
         f"{'t_count(us)':>12}{'t_fcm(us)':>11}{'T_mmpp(us)':>12}"
         f"{'sp_mmpp':>9}{'95% CI':>15}{'sp_fcm':>8}{'sp_count':>10}"
-        f"{'sp_learn':>10}{'sp_opt':>8}"
     )
-    print("-" * 134)
+    print("-" * 116)
     for res in results:
         ph = res["regime"]["photons_per_bright_dwell"]
         first = True
@@ -4996,17 +4630,13 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
             sf = f"{sf_v:8.2f}" if np.isfinite(sf_v) else f"{'-':>8}"
             t_fcm = r.get("t_fixed_count_mmpp_us", np.nan)
             tf = f"{t_fcm:11.2f}" if np.isfinite(t_fcm) else f"{'-':>11}"
-            sl_v = r.get("speedup_learned", np.nan)
-            so_v = r.get("speedup_optimal", np.nan)
-            sl = f"{sl_v:10.2f}" if np.isfinite(sl_v) else f"{'-':>10}"
-            so = f"{so_v:8.2f}" if np.isfinite(so_v) else f"{'-':>8}"
             print(
                 f"{res['name'] if first else '':>14}"
                 f"{f'{ph:.1f}' if first else '':>10}"
                 f"{r['target_fidelity']:7.2f}{r['t_threshold_us']:11.2f}"
                 f"{r['t_adaptive_count_us']:12.2f}{tf}"
                 f"{r['t_adaptive_mmpp_us']:12.2f}"
-                f"{r['speedup_mmpp']:9.2f}{ci:>15}{sf}{sc}{sl}{so}"
+                f"{r['speedup_mmpp']:9.2f}{ci:>15}{sf}{sc}"
             )
             first = False
         if first:
@@ -5014,9 +4644,7 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
                 f"{res['name']:>14}{ph:10.1f}"
                 "   (no target fidelity reachable by both methods)"
             )
-        if res.get("optimal_skipped"):
-            print(f"{'':>14}  {res['optimal_skipped']}")
-        print("-" * 134)
+        print("-" * 116)
 
     print("\nfidelity ceiling by method")
     keys = list(max_fidelity_summary(results[0]).keys())
@@ -6443,14 +6071,11 @@ class OptimalDP:
 
 
 def optimal_dp_step_us(
-    params: MMPPParams,
-    horizon_us: float,
-    decide_every: int = 1,
-    lam_dt: float = 0.05,
+    params: MMPPParams, horizon_us: float, decide_every: int = 1
 ) -> float:
-    """Default DP step: largest dt with dt * lambda_max <= lam_dt dividing T."""
+    """Default DP step: largest dt with dt * lambda_max <= 0.05 dividing T."""
     lam = max(params.lambda_minus_khz, params.lambda_zero_khz) / 1000.0
-    n = max(int(np.ceil(float(horizon_us) * lam / float(lam_dt))), 100)
+    n = max(int(np.ceil(float(horizon_us) * lam / 0.05)), 100)
     n = int(np.ceil(n / decide_every)) * decide_every
     return float(horizon_us) / n
 
@@ -8934,10 +8559,6 @@ def config_from_args(args: argparse.Namespace, spec: SweepSpec) -> RunConfig:
         cfg = replace(cfg, n_boot=int(args.n_boot))
     if getattr(args, "efficiency_model", None) is not None:
         cfg = replace(cfg, efficiency_model=str(args.efficiency_model))
-    if getattr(args, "no_learned", False):
-        cfg = replace(cfg, include_learned=False)
-    if getattr(args, "no_optimal", False):
-        cfg = replace(cfg, include_optimal=False)
     return cfg
 
 
@@ -9084,14 +8705,6 @@ _SPEEDUP_CSV_COLUMNS = [
     "speedup_fixed_count_mmpp",
     "speedup_fixed_count_mmpp_ci_low",
     "speedup_fixed_count_mmpp_ci_high",
-    "t_learned_us",
-    "speedup_learned",
-    "speedup_learned_ci_low",
-    "speedup_learned_ci_high",
-    "t_optimal_us",
-    "speedup_optimal",
-    "speedup_optimal_ci_low",
-    "speedup_optimal_ci_high",
 ]
 
 _CEILING_CSV_COLUMNS = [
@@ -11315,14 +10928,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_list)
 
     sp = sub.add_parser("run", help="simulate and analyze an experiment")
-    sp.add_argument(
-        "--no-learned", action="store_true",
-        help="skip method 5, the learned stopping policy",
-    )
-    sp.add_argument(
-        "--no-optimal", action="store_true",
-        help="skip method 6, the exact Ludkovski-Sezer optimum (the slow one)",
-    )
     add_common(sp)
     sp.add_argument(
         "--point", default="all",
