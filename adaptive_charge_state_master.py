@@ -3277,6 +3277,10 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     )
     lrn_correct, lrn_time = new["learned_correct"], new["learned_time"]
     opt_correct, opt_time = new["optimal_correct"], new["optimal_time"]
+    # Scored at the precision it is stored at, so that `refine-optimum`
+    # rebuilding these columns from the pickle reproduces them exactly.
+    if opt_time is not None:
+        opt_time = opt_time.astype(np.float32).astype(float)
     F_lrn = T_lrn = F_opt = T_opt = None
     if lrn_correct is not None:
         F_lrn, T_lrn = _method_curve(test_labels, lrn_correct, lrn_time)
@@ -3349,27 +3353,14 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
 
     # Methods 5 and 6 on the SAME resamples, so their intervals are paired
     # with the threshold baseline exactly as the others are.
-    boot_new = []
-    for i0, i1 in boots:
-        entry = {}
+    boot_thr = [F for F, *_ in boot_curves]
+    boot_new = {
+        tag: _boot_scheme_curves(boots, C, Tm)
         for tag, C, Tm in (("learned", lrn_correct, lrn_time),
-                           ("optimal", opt_correct, opt_time)):
-            if C is None:
-                continue
-            entry[tag] = (
-                0.5 * (C[i0].mean(axis=0) + C[i1].mean(axis=0)),
-                0.5 * (Tm[i0].mean(axis=0) + Tm[i1].mean(axis=0)),
-            )
-        boot_new.append(entry)
-
-    def _ci(v) -> tuple[float, float]:
-        v = np.asarray(v, dtype=float)
-        if v.size < 20:
-            return np.nan, np.nan
-        return (
-            float(np.nanpercentile(v, 2.5)),
-            float(np.nanpercentile(v, 97.5)),
-        )
+                           ("optimal", opt_correct, opt_time))
+        if C is not None
+    }
+    _ci = _boot_ci
 
     rows = []
     for F_star in np.asarray(cfg.target_fidelities, dtype=float):
@@ -3378,27 +3369,10 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         for tag, Fm, Tm in (("learned", F_lrn, T_lrn), ("optimal", F_opt, T_opt)):
             if Fm is None:
                 continue
-            # The optimum's frontier is the concave hull of its Bayes-optimal
-            # points; the learned policy is a deterministic rule and uses the
-            # same interpolation as methods 1-4.
-            interp = (time_for_fidelity_hull if tag == "optimal"
-                      else time_for_fidelity_interp)
-            t_m = interp(Tm, Fm, F_star)
-            sp_b = []
-            for (Fb_thr, *_), entry in zip(boot_curves, boot_new):
-                base = time_for_fidelity_interp(readout_times_us, Fb_thr, F_star)
-                if not np.isfinite(base) or tag not in entry:
-                    continue
-                Fb, Tb = entry[tag]
-                tb = interp(Tb, Fb, F_star)
-                if np.isfinite(tb) and tb > 0:
-                    sp_b.append(base / tb)
-            lo_n, hi_n = _ci(sp_b)
-            good = np.isfinite(t_thr) and np.isfinite(t_m) and t_m > 0
-            new_cols[f"t_{tag}_us"] = t_m
-            new_cols[f"speedup_{tag}"] = t_thr / t_m if good else np.nan
-            new_cols[f"speedup_{tag}_ci_low"] = lo_n
-            new_cols[f"speedup_{tag}_ci_high"] = hi_n
+            new_cols.update(_scheme_speedup_cols(
+                tag, Fm, Tm, F_star, t_thr, readout_times_us,
+                boot_thr, boot_new[tag],
+            ))
         t_cnt = time_for_fidelity_interp(T_cnt, F_cnt, F_star)
         t_ada = time_for_fidelity_interp(T_ada, F_ada, F_star)
         t_fcm = time_for_fidelity_interp(T_fcm, F_fcm, F_star)
@@ -3562,6 +3536,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         "optimal_dt_us": new["optimal_dt_us"],
         "optimal_dt_per_ac_us": new.get("optimal_dt_per_ac_us"),
         "optimal_horizon_per_ac_us": new.get("optimal_horizon_per_ac_us"),
+        "optimal_threshold_ac": new.get("optimal_threshold_ac"),
         "optimal_skipped": new["optimal_skipped"],
         "speedup_table": rows,
         "n_cal_per_state": cfg.n_cal,
@@ -3605,6 +3580,155 @@ SWEEP_DP_LAM_DT = 0.1
 SWEEP_DP_FINE_LAM_DT = 0.025
 SWEEP_DP_H = 0.7
 SWEEP_DP_MAX_STEPS = 5000
+SWEEP_DP_THRESHOLD_POINTS = 5
+
+
+def _boot_ci(v) -> tuple[float, float]:
+    v = np.asarray(v, dtype=float)
+    if v.size < 20:
+        return np.nan, np.nan
+    return (
+        float(np.nanpercentile(v, 2.5)),
+        float(np.nanpercentile(v, 97.5)),
+    )
+
+
+def _boot_scheme_curves(boots, C, Tm) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Per-resample (F, T) of one method's columns, on the shared resamples."""
+    return [
+        (0.5 * (C[i0].mean(axis=0) + C[i1].mean(axis=0)),
+         0.5 * (Tm[i0].mean(axis=0) + Tm[i1].mean(axis=0)))
+        for i0, i1 in boots
+    ]
+
+
+def _scheme_speedup_cols(
+    tag: str, Fm, Tm, F_star: float, t_thr: float, readout_times_us,
+    boot_thr, boot_scheme,
+) -> dict:
+    """t_{tag}_us, speedup_{tag} and its paired CI at one target."""
+    # The optimum's frontier is the concave hull of its Bayes-optimal
+    # points; the learned policy is a deterministic rule and uses the
+    # same interpolation as methods 1-4.
+    interp = time_for_fidelity_hull if tag == "optimal" else time_for_fidelity_interp
+    t_m = interp(Tm, Fm, F_star)
+    sp_b = []
+    for Fb_thr, (Fb, Tb) in zip(boot_thr, boot_scheme):
+        base = time_for_fidelity_interp(readout_times_us, Fb_thr, F_star)
+        if not np.isfinite(base):
+            continue
+        tb = interp(Tb, Fb, F_star)
+        if np.isfinite(tb) and tb > 0:
+            sp_b.append(base / tb)
+    lo, hi = _boot_ci(sp_b)
+    good = np.isfinite(t_thr) and np.isfinite(t_m) and t_m > 0
+    return {
+        f"t_{tag}_us": t_m,
+        f"speedup_{tag}": t_thr / t_m if good else np.nan,
+        f"speedup_{tag}_ci_low": lo,
+        f"speedup_{tag}_ci_high": hi,
+    }
+
+
+def _refine_optimum_threshold(
+    filter_params: MMPPParams,
+    horizon_us: float,
+    spec: NoClickSpectral,
+    test_shots, test_labels,
+    new: dict,
+) -> dict:
+    """
+    Pin down the optimum's low-fidelity end, just above its t = 0 threshold.
+
+    2/Dlam is the no-switching threshold. Switching moves the real one up --
+    by 10-50% across the sweeps, most at low contrast -- so a grid anchored on
+    2/Dlam can put several points at T = 0 and only one in the steep stretch
+    just above, where a/c within ~20% of threshold traces F = 0.5-0.62. The
+    hull chord across that gap then ran BELOW the SPRT at the lowest targets
+    (0.95x against 1.09x at F* = 0.55, contrast 0.5), which is the grid, not
+    the optimum.
+
+    So: bisect for the smallest a/c whose rule continues at the prior, and
+    add SWEEP_DP_THRESHOLD_POINTS rules log-spaced in the excess above it,
+    up to the first grid point that already runs. These rules stop within
+    a few us, so they use the fine step on the same truncated horizon as the
+    refined low-a/c rules (and forcing a stop there only makes them
+    feasible-but-worse). Idempotent: marked by `optimal_threshold_ac`.
+    """
+    if new.get("optimal_correct") is None or new.get("optimal_threshold_ac") is not None:
+        return new
+    ac = np.asarray(new["optimal_ac"], dtype=float)
+    Tm = np.asarray(new["optimal_time"], dtype=float)
+    live = np.nonzero(Tm.mean(axis=0) > 0)[0]
+    if live.size == 0:
+        return new
+    j1 = int(live[0])
+    a_hi = float(ac[j1])
+    dlam = abs(filter_params.lambda_minus_khz - filter_params.lambda_zero_khz) / 1000.0
+    a_lo = float(ac[j1 - 1]) if j1 > 0 else min(float(ac[0]), 2.0 / max(dlam, 1e-12))
+
+    h_used = new.get("optimal_horizon_per_ac_us")
+    h_f = float(h_used[j1]) if h_used is not None else float(horizon_us)
+    if not h_f < horizon_us:
+        h_f = min(float(horizon_us), 8.0 * float(Tm[:, j1].max()))
+    dt_f = optimal_dp_step_us(filter_params, h_f, lam_dt=SWEEP_DP_FINE_LAM_DT)
+
+    def solve(a):
+        return solve_optimal_dp(
+            filter_params, h_f, Economics(cost_per_us=1.0 / a), dt_us=dt_f, h=SWEEP_DP_H,
+        )
+
+    def runs(dp):
+        lo, hi = dp.continuation_at_prior()
+        return lo < 0.0 < hi
+
+    if runs(solve(a_lo)):
+        a_thr = a_lo
+    else:
+        lo_, hi_ = a_lo, a_hi
+        for _ in range(8):
+            mid = float(np.sqrt(lo_ * hi_))
+            if runs(solve(mid)):
+                hi_ = mid
+            else:
+                lo_ = mid
+        a_thr = hi_
+    if a_hi / a_thr - 1.0 < 1e-2:
+        new["optimal_threshold_ac"] = float(a_thr)
+        return new
+
+    extra =a_thr * (1.0 + np.geomspace(3e-3, a_hi / a_thr - 1.0, SWEEP_DP_THRESHOLD_POINTS + 1)[:-1])
+    labels = np.asarray(test_labels, dtype=int)
+    paths = filter_on_grid(test_shots, labels, filter_params, h_f, dt_f, spec)
+    C_new, T_new, risk_new = [], [], []
+    for a in extra:
+        dp = solve(float(a))
+        st, pr, _ = apply_optimal_dp(dp, paths)
+        C_new.append((pr == labels).astype(float))
+        T_new.append(st)
+        risk_new.append(dp.risk)
+    del paths
+
+    C_all = np.column_stack([np.asarray(new["optimal_correct"], dtype=float)] + C_new)
+    T_all = np.column_stack([Tm] + T_new)
+    ac_all = np.concatenate([ac, extra])
+    o = np.argsort(ac_all, kind="stable")
+    n_old = ac.size
+
+    def _ext(key, fill):
+        v = new.get(key)
+        v = np.full(n_old, np.nan) if v is None else np.asarray(v, dtype=float)
+        return np.concatenate([v, np.full(extra.size, fill)])[o]
+
+    new.update(
+        optimal_correct=C_all[:, o], optimal_time=T_all[:, o], optimal_ac=ac_all[o],
+        optimal_risk_star=np.concatenate(
+            [np.asarray(new["optimal_risk_star"], dtype=float), risk_new])[o],
+        optimal_dt_per_ac_us=_ext("optimal_dt_per_ac_us", dt_f),
+        optimal_horizon_per_ac_us=_ext("optimal_horizon_per_ac_us", h_f),
+        optimal_threshold_ac=float(a_thr),
+    )
+    return new
 
 
 def _run_new_schemes(
@@ -3743,6 +3867,9 @@ def _run_new_schemes(
             optimal_ac=ac, optimal_risk_star=risk,
             optimal_dt_us=float(dt_o), optimal_dt_per_ac_us=dt_used,
             optimal_horizon_per_ac_us=h_used,
+        )
+        out = _refine_optimum_threshold(
+            filter_params, horizon_us, spec, test_shots, test_labels, out
         )
     return out
 
@@ -9207,6 +9334,118 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def refine_result_optimum(res: dict, point: OperatingPoint, cfg: RunConfig) -> bool:
+    """
+    Apply _refine_optimum_threshold to a saved point, in place.
+
+    The test shots are re-simulated from the stored seed (and checked against
+    the stored labels and one stored optimum column), the new rules are run on
+    them, and the optimum's curve, hull and speedup columns are rebuilt on the
+    same bootstrap resamples `run` used. Nothing else in the result changes.
+    """
+    if res.get("optimal_correct") is None or res.get("optimal_threshold_ac") is not None:
+        return False
+    params = point.params
+    horizon_us = float(res["horizon_us"])
+    detector = cfg.detector
+    noise = point.noise if point.noise is not None else cfg.noise
+    filter_params = _filter_params_for(params, detector, noise)
+    seed = int(res["seed"])
+    test_shots, test_labels = simulate_balanced_dataset(
+        int(res["n_test_per_state"]), horizon_us / 1000.0, params, seed + 7717,
+        detector, noise,
+    )
+    if not np.array_equal(test_labels, np.asarray(res["test_labels"])):
+        raise RuntimeError(f"{res['name']}: re-simulated test labels do not match")
+    spec_nc = build_no_click_spectral(filter_params)
+
+    new = {
+        "optimal_correct": np.asarray(res["optimal_correct"], dtype=float),
+        "optimal_time": np.asarray(res["optimal_time"], dtype=float),
+        "optimal_ac": np.asarray(res["optimal_a_over_c"], dtype=float),
+        "optimal_risk_star": res["optimal_risk_star"],
+        "optimal_dt_per_ac_us": res.get("optimal_dt_per_ac_us"),
+        "optimal_horizon_per_ac_us": res.get("optimal_horizon_per_ac_us"),
+        "optimal_threshold_ac": None,
+    }
+
+    # The re-simulated shots must be the ones scored: rerun the first
+    # refined rule and require it to reproduce its stored column.
+    h_used = new["optimal_horizon_per_ac_us"]
+    if h_used is not None:
+        j = next((k for k, h in enumerate(h_used) if h < horizon_us), None)
+        if j is not None:
+            dt_j = float(new["optimal_dt_per_ac_us"][j])
+            dp = solve_optimal_dp(
+                filter_params, float(h_used[j]),
+                Economics(cost_per_us=1.0 / float(new["optimal_ac"][j])),
+                dt_us=dt_j, h=SWEEP_DP_H,
+            )
+            paths = filter_on_grid(
+                test_shots, test_labels, filter_params, float(h_used[j]), dt_j, spec_nc
+            )
+            st, _, _ = apply_optimal_dp(dp, paths)
+            del paths
+            if not np.allclose(st.astype(np.float32), res["optimal_time"][:, j]):
+                raise RuntimeError(f"{res['name']}: stored optimum column not reproduced")
+
+    new = _refine_optimum_threshold(
+        filter_params, horizon_us, spec_nc, test_shots, test_labels, new
+    )
+    opt_correct = new["optimal_correct"]
+    opt_time = np.asarray(new["optimal_time"], dtype=np.float32).astype(float)
+    F_opt, T_opt = _method_curve(test_labels, opt_correct, opt_time)
+
+    boots = stratified_bootstrap_indices(test_labels, int(res["n_boot"]), seed + 991)
+    thr = np.asarray(res["thr_correct"], dtype=float)
+    boot_thr = [0.5 * (thr[i0].mean(axis=0) + thr[i1].mean(axis=0)) for i0, i1 in boots]
+    boot_opt = _boot_scheme_curves(boots, opt_correct, opt_time)
+    for row in res["speedup_table"]:
+        row.update(_scheme_speedup_cols(
+            "optimal", F_opt, T_opt, float(row["target_fidelity"]),
+            float(row["t_threshold_us"]), res["readout_times_us"], boot_thr, boot_opt,
+        ))
+
+    res.update(
+        F_optimal=F_opt, T_optimal=T_opt,
+        frontier_optimal=pareto_frontier(T_opt, F_opt),
+        hull_optimal=np.vstack(concave_hull_frontier(T_opt, F_opt)),
+        optimal_a_over_c=new["optimal_ac"],
+        optimal_risk_star=new["optimal_risk_star"],
+        optimal_dt_per_ac_us=new["optimal_dt_per_ac_us"],
+        optimal_horizon_per_ac_us=new["optimal_horizon_per_ac_us"],
+        optimal_threshold_ac=new["optimal_threshold_ac"],
+        optimal_correct=opt_correct.astype(bool),
+        optimal_time=opt_time.astype(np.float32),
+    )
+    return True
+
+
+def cmd_refine_optimum(args: argparse.Namespace) -> int:
+    spec = _resolve_spec(args.experiment)
+    cfg = config_from_args(args, spec)
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    )
+    n = 0
+    for i, point in enumerate(spec.build_points(cfg)):
+        fp = directory / f"point_{i:02d}_{point.name}.pkl"
+        if not fp.exists():
+            continue
+        with open(fp, "rb") as f:
+            res = _from_plain(pickle.load(f))
+        t0 = time.time()
+        if refine_result_optimum(res, point, cfg):
+            save_result(res, i, directory)
+            n += 1
+            print(f"  {point.name}: threshold a/c = {res['optimal_threshold_ac']:.2f} "
+                  f"({time.time() - t0:.0f} s)")
+        else:
+            print(f"  {point.name}: nothing to do")
+    print(f"refined {n} points in {directory}")
+    return 0
+
+
 def cmd_summary(args: argparse.Namespace) -> int:
     spec = _resolve_spec(args.experiment)
     cfg = config_from_args(args, spec)
@@ -11350,6 +11589,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser(
+        "refine-optimum",
+        help="add the optimum's near-threshold rules to saved runs (idempotent)",
+    )
+    add_common(sp)
+    sp.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
+    sp.set_defaults(func=cmd_refine_optimum)
 
     sp = sub.add_parser(
         "robustness", help="does the speedup survive parameter error?"
