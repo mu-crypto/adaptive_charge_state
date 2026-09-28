@@ -17,8 +17,11 @@ Always, on identical shots:
 2. **adaptive count SPRT** — stop at the n-th photon, decide on whether you got there
 3. **fixed-count MMPP** — same stopping rule as 2, decide with the calibrated MMPP LLR
 4. **adaptive MMPP SPRT** — stop when the LLR crosses a calibrated boundary
-5. **learned stopping policy** — a regression approximation of the optimum, via `optimal`
-6. **the Ludkovski–Sezer optimum** — the Bayes-optimal rule itself, by exact dynamic programming, via `optimal`
+5. **learned stopping policy** — a regression approximation of the optimum
+6. **the Ludkovski–Sezer optimum** — the Bayes-optimal rule itself, by exact dynamic programming
+
+All six run in every sweep (`run`); `optimal` studies 5 and 6 in more depth
+at the `demo` points, in Bayes risk as well as speedup.
 
 The design is a 2×2 of stopping rule against decision statistic, plus the
 optimum the 2×2 is measured against:
@@ -77,6 +80,27 @@ never-longer run times. The optimum stops earlier still: once
 `d <= d* = 4c / (max(a,b)(λ_max + Δλ/4))` no remaining information can pay
 for itself, which is proven and pinned in `validate`, and the learned policy
 enforces it.
+
+**In the sweeps** each point runs the learned policy at 24 values of a/c and
+the DP at 14, on the same test shots and bootstrap resamples as methods 1–4.
+Every a/c gives one Bayes-optimal (T, F) point; mixing two such rules shot by
+shot reaches any point on the chord between them, so the optimum's
+fidelity-vs-time frontier is the **concave hull** of its points (with the
+trivial (0, ½)), interpolated linearly in T. The grid is anchored on the
+immediate-stop threshold a/c ≈ 2/Δλ (L&S Remark 6.1), below which the
+optimum guesses at t = 0. Switching moves the real threshold up by 10–50%, so
+the run bisects for it and adds five rules just above it, where the whole
+low-fidelity end of the frontier is traced. Rules that stop within a few µs
+are re-solved on a 4× finer step over a truncated horizon, so the decision
+grid does not handicap them against the grid-free SPRT. The sweep DP uses
+λ·dt ≤ 0.1 and a 0.7 y/z grid (+0.1% in R\* against the defaults, at a fifth
+of the cost) and still skips points needing more than 5000 steps.
+`--no-learned` / `--no-optimal` turn them off; `refine-optimum` adds the
+near-threshold rules to runs saved before that step existed.
+
+Under the detector and noise presets the DP is optimal for the *filter's*
+model, not for the data, so there it is a strong model-based rule rather
+than a ceiling.
 
 See `results/README.md` for how far each rule sits from the optimum.
 
@@ -160,6 +184,8 @@ python adaptive_charge_state_master.py list              # experiments, points, 
 python adaptive_charge_state_master.py validate          # 97 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
+python adaptive_charge_state_master.py run power --no-optimal   # methods 1-5 only, fast
+python adaptive_charge_state_master.py refine-optimum demo      # upgrade older saved runs
 python adaptive_charge_state_master.py plot contrast     # figures + summary
 python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
@@ -169,8 +195,12 @@ python adaptive_charge_state_master.py noiserisk demo    # all six under rate no
 python results/analysis.py                              # cross-experiment tables
 ```
 
-A full five-point sweep takes a couple of minutes; `--quick` runs a small
-smoke version. Results are pickled under `out_master/<experiment>/<detector>/`
+With the exact optimum a five-point sweep at the committed sample size
+(`--n-test 7200 --n-boot 400`) takes 30–90 min; `--no-optimal` brings it back
+to a few minutes, and `--quick` runs a small smoke version. Run parallel
+sweeps with `OPENBLAS_NUM_THREADS=1`: the DP's matrix products are small,
+and several processes each spawning a BLAS thread per core ran 10× slower
+than single-threaded ones. Results are pickled under `out_master/<experiment>/<detector>/`
 so figures and the speedup analysis can be regenerated without re-simulating.
 
 ## Detector model (dead time and afterpulsing)
