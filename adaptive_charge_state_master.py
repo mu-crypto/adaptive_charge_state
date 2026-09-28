@@ -4637,8 +4637,8 @@ _METHOD_STYLES = {
     "fixed_count_mmpp": dict(ls="-.", lw=1.6, marker="d", ms=3.2),
     "mmpp": dict(ls="-", lw=2.4, marker=None),
     "learned": dict(ls="-", lw=1.0, marker="x", ms=4.0),
-    # The optimum bounds every other curve, so it is drawn as a translucent
-    # envelope underneath them rather than as one more line on top.
+    # The optimum bounds the other curves (to within its decision step), so it
+    # is drawn as a translucent envelope underneath them, not one more line.
     "optimal": dict(ls="-", lw=5.0, marker=None, alpha=0.30),
 }
 
@@ -4711,7 +4711,9 @@ def plot_sweep(
     Fidelity-vs-time plus every method's speedup, one colour per sweep point.
 
     Row 1: the frontier, the adaptive MMPP SPRT (the incumbent), and the
-    Ludkovski-Sezer optimum -- the ceiling on what any stopping rule can do.
+    Ludkovski-Sezer optimum -- the ceiling on what any stopping rule can do
+    under the filter's model, up to the DP's decision step (which leaves it
+    ~2% behind the grid-free SPRT at the lowest targets).
     Row 2: the learned policy, and the two single-axis controls.
     """
     plt = _pyplot()
@@ -4810,7 +4812,7 @@ def plot_sweep(
     skipped = [r["name"] for r in results if r.get("optimal_skipped")]
     _speedup_panel(
         axes[2], results, spec, "optimal", "-*",
-        "(c) L&S optimum speedup (ceiling for any rule)"
+        "(c) L&S optimum speedup (exact DP)"
         + (f"\nnot computed at {', '.join(skipped)}: horizon too long"
            if skipped else ""),
     )
