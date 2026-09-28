@@ -290,6 +290,91 @@ incumbent):
 | moderate | 27.43 | 0.9397 | 0.9461 | 0.9455 |
 | sparse | 2.74 | 0.7941 | 0.7991 | 0.7989 |
 
+### Across the full matrix, in the speedup currency
+
+The comparison above is three points in Bayes risk. Methods 5 and 6 now also
+run at **every point of every sweep** — 92 points over 10 experiments and
+three detector models — on the same test shots and bootstrap resamples as
+methods 1–4, so their speedups carry the same paired intervals. The learned
+policy runs at 24 values of a/c and the DP at 14, plus five just above its
+t = 0 threshold (below). The optimum's fidelity-vs-time curve is the
+**concave hull** of its Bayes-optimal (T, F) points: by Lagrangian duality
+every point of the true frontier minimises c·T − F for some c, and mixing two
+rules shot by shot reaches the chord between them. Methods 1–4 are
+bit-identical to the previous run — every one of their CSV columns, intervals
+included. From `report_optimum` in `results/analysis.py`, ideal detector, no
+rate noise, 25 distinct operating points:
+
+| headroom below thr ceiling | rows | SPRT | learned | optimum | SPRT / optimum | optimum resolved faster | SPRT resolved faster |
+|---|---|---|---|---|---|---|---|
+| [0.00, 0.01) | 25 | 1.400× | 1.738× | **1.869×** | 0.856 | 76% | 0% |
+| [0.01, 0.02) | 25 | 1.440× | 1.591× | **1.776×** | 0.835 | 84% | 0% |
+| [0.02, 0.05) | 72 | 1.436× | 1.457× | **1.645×** | 0.897 | 71% | 3% |
+| [0.05, 0.10) | 117 | 1.312× | 1.145× | 1.355× | 0.989 | 35% | 9% |
+| [0.10, 0.20) | 214 | 1.193× | 1.003× | 1.210× | 0.992 | 42% | 19% |
+| [0.20, 1.00) | 324 | 1.085× | 0.339× | 1.076× | 1.017 | 9% | 56% |
+
+Medians; "resolved faster" means the other method's point estimate lies
+below this one's paired 95% interval.
+
+**Near the ceiling the SPRT leaves real speed on the table.** Within 0.02
+of the threshold's ceiling the optimum is 1.78–1.87× against the SPRT's
+1.40–1.44×, resolved in 76–84% of rows and never the other way. The SPRT
+realises ~85% of the achievable speedup there. By sweep, in the same
+[0, 0.02) band: power 1.43 → 1.96×, snr 1.24 → 1.86×, ratio 1.58 → 1.87×,
+contrast 1.45 → 1.85×, demo 1.44 → 1.64×, and efficiency only 1.23 → 1.26×.
+Efficiency's sparse points have little information left to schedule.
+
+**In the headline band it takes ~95%.** At matched headroom [0.02, 0.08)
+— the band every cross-experiment comparison in this file uses — the
+median is 1.371× for the SPRT against 1.454× for the optimum, and the
+median per-row ratio is 0.949.
+
+**Far below the ceiling the two tie, and the DP's resolution shows.** At
+headroom ≥ 0.20 both sit near 1.08×. There the SPRT is nominally ahead by a
+median 1.7% (10th–90th percentile −1.6% to +3.0%), and its interval clears
+the DP's point in 56% of rows. That is the DP's decision step, not a loss
+of the optimum. These rules stop within 0.3–2 µs, and a DP rule can only
+stop on its epochs: 0.1 µs at the moderate point even after refinement,
+against a grid-free SPRT that stops at the click. A 4× finer step halved the
+gap in empirical risk there (+0.0075 → +0.0036 at a/c = 11). Read the
+optimum as tied with the SPRT at these targets, not as beaten by it.
+
+**The optimum buys speed, not fidelity.** Its fidelity ceiling equals the
+SPRT's to within 0.002 at every ideal point (mean −0.0002; learned policy
+−0.0006). The information in a horizon is what it is; the optimum just
+collects it sooner.
+
+**The learned policy is the best practical rule near the ceiling, and the
+worst far from it.** It reaches 1.74× against the SPRT's 1.40× in [0, 0.01),
+but only 0.34× at headroom ≥ 0.2. Its 128 decision epochs (2 µs at the
+moderate point) floor its earliest stop above the few hundred ns in which
+those targets are reached. That is the epoch-grid caveat below, now
+measured across the matrix.
+
+**Under the detector presets and rate noise the pattern holds.** Near the
+ceiling the optimum reaches 1.91× vs 1.47× over the 44 detector-preset
+points, and 1.90× vs 1.62× over the 15 rate-noise points. The pattern at
+the low end is the same too. There the DP is optimal only for the
+filter's model, not the data, so this is a model-based rule that happens
+to beat the SPRT, not a ceiling.
+
+**The low-fidelity end needed the true threshold.** Below a/c ≈ 2/Δλ the
+optimum stops at t = 0 (Remark 6.1). With switching the real threshold is
+higher: 1.17–1.53× that value, median 1.17×. On a grid anchored at 2/Δλ,
+several rules then sat at T = 0 with one in the steep stretch just above,
+and the hull chord across the gap ran below the SPRT. At contrast 0.5 it
+gave 0.95× against 1.09× at F\* = 0.55. Each point now bisects for the
+threshold and adds five rules just above it, which moves that entry to
+1.06×. Rules that stop within a few µs are also re-solved on a 4× finer
+step over a horizon cut to 8× their latest calibration stop.
+
+**Not computed:** power P0.875 under all three detectors. Its 4449 µs
+horizon needs ~9000 DP steps against the 5000-step cap. The sweep DP uses
+λ·dt ≤ 0.1 and a 0.7 y/z grid, which moves R\* +0.1% at the moderate point
+against the defaults. A coarser grid can only make the rule worse, so the
+curves are conservative.
+
 ### The information-exhaustion exit is free, and worth taking
 
 In log-odds coordinates a photon translates both hypotheses equally, so the
@@ -885,8 +970,9 @@ custom classes, so a bare `pickle.load` with no imports works.
 - **The `snr` sweep has only 4 resolved points.** Its R² = 0.984 is a strong
   fit to few points. It is the cleanest available identification of the SNR
   effect at fixed sparsity, not a large sample.
-- **Optimal stopping is measured at three operating points, not the full
-  matrix**, and only at the ideal detector. Its epoch grid (128 epochs)
+- **The Bayes-risk comparison is at three operating points**, and only at
+  the ideal detector; the speedup comparison against the learned policy and
+  the optimum covers the full matrix. The learned policy's epoch grid (128 epochs)
   also floors how fast the epoch-restricted rules can stop, which is why they
   cannot reach the very lowest targets the fixed-time threshold reaches in a
   fraction of a microsecond.
@@ -921,6 +1007,13 @@ python adaptive_charge_state_master.py noiserisk demo --out results
 python results/analysis.py
 ```
 
-The readout matrix takes about 50 minutes at 3-way parallelism, the SNR and
-noise experiments a further 20, and `optimal demo` about 70 with the exact
-DP at every a/c (about 10 with `--no-dp`).
+With the learned policy and exact optimum in every sweep, the readout,
+SNR and noise matrix takes about 5 hours at 4-way parallelism. Run it with
+`OPENBLAS_NUM_THREADS=1`: parallel processes each spawning a BLAS thread
+per core ran 10× slower. `--no-optimal` brings it back close to the previous 70 minutes; the learned
+policy adds a little.
+`refine-optimum <experiment>` adds the near-threshold rules to runs saved
+before that step existed; it re-simulates the test shots, checks that one
+stored optimum column is reproduced, and rebuilds only the optimum's
+columns. `optimal demo` takes about 70 minutes with the exact DP at every
+a/c (about 10 with `--no-dp`).

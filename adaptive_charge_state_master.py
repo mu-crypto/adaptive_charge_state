@@ -3641,7 +3641,7 @@ def _refine_optimum_threshold(
     Pin down the optimum's low-fidelity end, just above its t = 0 threshold.
 
     2/Dlam is the no-switching threshold. Switching moves the real one up --
-    by 10-50% across the sweeps, most at low contrast -- so a grid anchored on
+    by 17-53% across the sweeps (median 17%) -- so a grid anchored on
     2/Dlam can put several points at T = 0 and only one in the steep stretch
     just above, where a/c within ~20% of threshold traces F = 0.5-0.62. The
     hull chord across that gap then ran BELOW the SPRT at the lowest targets

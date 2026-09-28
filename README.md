@@ -88,7 +88,7 @@ shot reaches any point on the chord between them, so the optimum's
 fidelity-vs-time frontier is the **concave hull** of its points (with the
 trivial (0, ½)), interpolated linearly in T. The grid is anchored on the
 immediate-stop threshold a/c ≈ 2/Δλ (L&S Remark 6.1), below which the
-optimum guesses at t = 0. Switching moves the real threshold up by 10–50%, so
+optimum guesses at t = 0. Switching moves the real threshold up by 17–53% (median 17%), so
 the run bisects for it and adds five rules just above it, where the whole
 low-fidelity end of the frontier is traced. Rules that stop within a few µs
 are re-solved on a 4× finer step over a truncated horizon, so the decision
