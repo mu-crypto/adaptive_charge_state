@@ -4839,6 +4839,121 @@ def plot_sweep(
     return fig
 
 
+def _ceiling_panel(ax, results: list[dict], spec: SweepSpec, series, title="fidelity ceiling"):
+    """Each method's best balanced fidelity against the swept variable."""
+    x = np.array([r["sweep_value"] for r in results], dtype=float)
+    for key, lab, st, col in series:
+        ceil = [
+            float(np.max(r[key])) if r.get(key) is not None else np.nan
+            for r in results
+        ]
+        ax.plot(x, ceil, st, lw=1.8, ms=5, color=col, label=lab)
+    ax.set_xscale(spec.xscale)
+    ax.set_xlabel(spec.xlabel)
+    ax.set_ylabel("best achievable balanced fidelity")
+    ax.set_title(title, fontsize=11)
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+
+
+# Sweeps that also get the three-method figure: the baseline, the count-only
+# stopping rule and the exact optimum, without the rules in between.
+THREE_WAY_SWEEPS = ("snr",)
+
+_THREE_WAY_METHODS = (
+    # (label, line style, marker, width)
+    ("fixed-time threshold", ":", "o", 1.5),
+    ("adaptive count SPRT", "--", "^", 1.5),
+    ("L&S optimum (exact DP)", "-", "*", 2.2),
+)
+
+
+def plot_three_way(
+    results: list[dict],
+    spec: SweepSpec,
+    save_path: str | None = None,
+):
+    """
+    The fixed-time threshold, the adaptive count SPRT and the L&S optimum
+    alone, with the swept variable as colour and the method as line style:
+      (a) fidelity vs mean run time -- the count rule's calibration frontier
+          and the optimum's concave hull, as in `plot_sweep`;
+      (b) each method's fidelity ceiling against the swept variable.
+    """
+    plt = _pyplot()
+    from matplotlib.lines import Line2D
+
+    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.4))
+    (lab_t, ls_t, mk_t, lw_t), (lab_c, ls_c, mk_c, lw_c), (lab_o, ls_o, mk_o, lw_o) = (
+        _THREE_WAY_METHODS
+    )
+
+    ax = axes[0]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        ax.plot(res["T_threshold"], res["F_threshold"], color=c, ls=ls_t,
+                marker=mk_t, ms=3.0, lw=lw_t)
+        fc = res["frontier_adaptive_count"]
+        ax.plot(np.asarray(res["T_adaptive_count"])[fc],
+                np.asarray(res["F_adaptive_count"])[fc],
+                color=c, ls=ls_c, marker=mk_c, ms=3.5, lw=lw_c)
+        if res.get("F_optimal") is not None:
+            To, Fo = _optimal_curve(res)
+            ax.plot(To, Fo, color=c, ls=ls_o, lw=lw_o)
+            H = np.asarray(res["hull_optimal"], float)
+            v = H[0] > 0
+            ax.plot(H[0][v], H[1][v], ls="none", marker=mk_o, ms=6, color=c)
+    ax.set_xscale("log")
+    ax.set_xlabel("mean run time per shot (us)")
+    ax.set_ylabel("balanced initial-state fidelity")
+    ax.set_title("(a) fidelity vs run time", fontsize=11)
+    ax.grid(alpha=0.25)
+    method_handles = [
+        Line2D([], [], color="0.3", ls=ls, marker=mk, lw=lw, label=lab)
+        for lab, ls, mk, lw in _THREE_WAY_METHODS
+    ]
+    value_handles = [
+        Line2D([], [], color=SWEEP_COLORS[k % len(SWEEP_COLORS)], lw=2.4,
+               label=res["label"])
+        for k, res in enumerate(results)
+    ]
+    leg = ax.legend(handles=method_handles, loc="upper left", fontsize=9)
+    ax.add_artist(leg)
+    ax.legend(handles=value_handles, loc="upper left", bbox_to_anchor=(0.0, 0.80),
+              fontsize=9, title=spec.legend_title)
+
+    ax = axes[1]
+    x = np.array([r["sweep_value"] for r in results], dtype=float)
+    for (lab, ls, mk, lw), key in zip(
+        _THREE_WAY_METHODS, ("F_threshold", "F_adaptive_count", "F_optimal")
+    ):
+        ceil = np.array([
+            float(np.max(r[key])) if r.get(key) is not None else np.nan
+            for r in results
+        ])
+        m = np.isfinite(ceil)
+        ax.plot(x[m], ceil[m], color="0.35", ls=ls, lw=lw, label=lab)
+        for k in np.nonzero(m)[0]:
+            ax.plot(x[k], ceil[k], ls="none", marker=mk, ms=8 if mk == "*" else 6,
+                    color=SWEEP_COLORS[k % len(SWEEP_COLORS)], mec="0.2", mew=0.5)
+    ax.set_xscale(spec.xscale)
+    ax.set_xlabel(spec.xlabel)
+    ax.set_ylabel("best achievable balanced fidelity")
+    ax.set_title("(b) fidelity ceiling", fontsize=11)
+    ax.legend(handles=method_handles, fontsize=9, loc="upper left")
+    ax.grid(alpha=0.25)
+
+    det = results[0]["detector"] if results else DETECTOR_OFF
+    fig.suptitle(
+        f"{spec.title}: threshold, adaptive count and L&S optimum  --  "
+        f"{det.describe()}", fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
 def plot_sweep_vs_x(
     results: list[dict],
     spec: SweepSpec,
@@ -4895,34 +5010,20 @@ def plot_sweep_vs_x(
     ax.legend(fontsize=9)
     ax.grid(alpha=0.25)
 
-    ax = axes[1]
     series = [
-        ("F_threshold", "fixed-time threshold", ":o"),
-        ("F_adaptive_count", "adaptive count SPRT", "--^"),
-        ("F_adaptive_mmpp", "adaptive MMPP SPRT", "-s"),
+        ("F_threshold", "fixed-time threshold", ":o", "C0"),
+        ("F_adaptive_count", "adaptive count SPRT", "--^", "C1"),
+        ("F_adaptive_mmpp", "adaptive MMPP SPRT", "-s", "C3"),
     ]
     if results and results[0].get("F_fixed_count_mmpp") is not None:
-        series.insert(2, ("F_fixed_count_mmpp", "fixed-count MMPP", "-.d"))
+        series.insert(2, ("F_fixed_count_mmpp", "fixed-count MMPP", "-.d", "C2"))
     if results and results[0].get("F_fixed_mmpp") is not None:
-        series.insert(1, ("F_fixed_mmpp", "fixed-time MMPP", "--*"))
+        series.insert(1, ("F_fixed_mmpp", "fixed-time MMPP", "--*", "C9"))
     if any(r.get("F_learned") is not None for r in results):
-        series.append(("F_learned", "learned policy", "-x"))
+        series.append(("F_learned", "learned policy", "-x", "C4"))
     if any(r.get("F_optimal") is not None for r in results):
-        series.append(("F_optimal", "L&S optimum (exact DP)", "-*"))
-
-    for key, lab, st in series:
-        ceil = [
-            float(np.max(r[key])) if r.get(key) is not None else np.nan
-            for r in results
-        ]
-        ax.plot(x, ceil, st, lw=1.8, ms=5, label=lab)
-
-    ax.set_xscale(spec.xscale)
-    ax.set_xlabel(spec.xlabel)
-    ax.set_ylabel("best achievable balanced fidelity")
-    ax.set_title("fidelity ceiling", fontsize=11)
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.25)
+        series.append(("F_optimal", "L&S optimum (exact DP)", "-*", "C5"))
+    _ceiling_panel(axes[1], results, spec, series)
 
     det = results[0]["detector"] if results else DETECTOR_OFF
     fig.suptitle(f"{spec.title}  --  {det.describe()}", fontsize=11)
@@ -9164,6 +9265,12 @@ def cmd_plot(args: argparse.Namespace) -> int:
         results, spec, save_path=str(directory / f"{spec.key}_vs_x.png")
     )
     del f1, f2
+    if spec.key in THREE_WAY_SWEEPS:
+        f3 = plot_three_way(
+            results, spec,
+            save_path=str(directory / f"{spec.key}_thr_count_opt.png"),
+        )
+        del f3
 
     for res in results:
         f = plot_operating_point(

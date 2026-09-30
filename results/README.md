@@ -931,6 +931,9 @@ results/analysis.py                     regenerates every number above
 results/<experiment>/<detector>/
     <experiment>_sweep.png              fidelity vs run time, all speedup curves
     <experiment>_vs_x.png               speedup and ceiling vs the swept variable
+    snr_thr_count_opt.png               (snr only) fidelity vs run time and
+                                        ceiling vs SNR for just the threshold,
+                                        adaptive count and L&S optimum
     speedup_table.csv                   every target, every method, bootstrap CIs
     fidelity_ceilings.csv               best achievable fidelity per method
     summary.txt                         as printed by `summary`
