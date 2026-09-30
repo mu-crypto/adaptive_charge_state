@@ -4868,79 +4868,28 @@ _THREE_WAY_METHODS = (
 )
 
 
-def _parameter_columns(results: list[dict], spec: SweepSpec) -> list[tuple[str, list[str]]]:
+def _rates_and_power_text(results: list[dict]) -> str:
     """
-    The model and run parameters behind a sweep, for printing under a figure:
-    one value where the sweep holds it fixed, the range where it does not.
+    The four MMPP rates and the laser power behind a sweep, on one line: one
+    value where the sweep holds it fixed, the range where it moves.
     """
-    def fmt(vals, unit="", digits=3):
+    def fmt(vals, unit):
         v = np.asarray([x for x in vals if x is not None], dtype=float)
         if v.size == 0:
             return "n/a"
         lo, hi = float(v.min()), float(v.max())
-        u = f" {unit}" if unit else ""
         if abs(hi - lo) <= 1e-9 * max(abs(hi), 1e-300):
-            return f"{lo:.{digits}g}{u}"
-        return f"{lo:.{digits}g} – {hi:.{digits}g}{u}  (varies)"
+            return f"{lo:.3g} {unit}"
+        return f"{lo:.3g} – {hi:.3g} {unit}"
 
     P = [r["params"] for r in results]
-    R = [r["regime"] for r in results]
-    rates = [
-        ("λ₋  (NV⁻, bright)", fmt([p.lambda_minus_khz for p in P], "kHz")),
-        ("λ₀  (NV⁰, dark)", fmt([p.lambda_zero_khz for p in P], "kHz")),
-        ("Γ₋₀  (ionization)", fmt([p.gamma_minus_to_zero_khz for p in P], "kHz")),
-        ("Γ₀₋  (recombination)", fmt([p.gamma_zero_to_minus_khz for p in P], "kHz")),
-        ("Γ_tot = Γ₋₀ + Γ₀₋", fmt([q["gamma_tot_khz"] for q in R], "kHz")),
-    ]
-    derived = [
-        ("p_bright = Γ₀₋/Γ_tot", fmt([q["p_bright_stationary"] for q in R])),
-        ("mean bright dwell 1/Γ₋₀", fmt([q["mean_bright_dwell_us"] for q in R], "µs")),
-        ("photons / bright dwell", fmt([q["photons_per_bright_dwell"] for q in R])),
-        ("contrast", fmt([q["contrast"] for q in R])),
-        ("SNR / bright dwell", fmt([q["snr_per_bright_dwell"] for q in R])),
-        ("Γ₋₀ / Γ₀₋", fmt([q["switching_ratio"] for q in R])),
-    ]
-    noise = [r.get("noise") for r in results]
-    noise_txt = (
-        "off" if all(n is None or getattr(n, "is_off", True) for n in noise)
-        else noise[0].describe()
-    )
-    experiment = [
-        ("594 nm power", fmt([r.get("power_uw") for r in results], "µW")),
-        ("detection efficiency η", fmt([r.get("detection_efficiency") for r in results])),
-        ("efficiency model", str(results[0].get("efficiency_model", "n/a"))),
-        ("horizon T", fmt([r["horizon_us"] for r in results], "µs", 4)),
-        ("rate noise", noise_txt),
-        ("initial state", "NV⁻ / NV⁰, prior ½ each"),
-    ]
-    n_opt = [len(r["optimal_a_over_c"]) for r in results if r.get("optimal_a_over_c") is not None]
-    analysis = [
-        ("shots / state", f"{results[0]['n_cal_per_state']} cal, "
-                          f"{results[0]['n_test_per_state']} test"),
-        ("bootstrap", f"{results[0]['n_boot']} paired, stratified resamples"),
-        ("error costs", "a = b = 1  (balanced fidelity)"),
-        ("L&S DP", (f"{min(n_opt)}" if min(n_opt) == max(n_opt) else f"{min(n_opt)}-{max(n_opt)}")
-                   + " values of a/c, λ·dt ≤ 0.1" if n_opt else "not computed"),
-        ("", "(4× finer for rules stopping in a few µs)"),
-        ("calibration", "cutoffs fit on cal; configs chosen on test"),
-    ]
-    # Mark the swept quantity, which the x axis / colour already carries.
-    swept = {
-        "snr": "SNR / bright dwell", "ratio": "Γ₋₀ / Γ₀₋",
-        "contrast": "contrast", "power": "594 nm power",
-        "efficiency": "detection efficiency η",
-    }.get(spec.key)
-    cols = [("MMPP rates", rates), ("derived", derived),
-            ("experiment", experiment), ("analysis", analysis)]
-    out = []
-    for title, rows in cols:
-        lines = []
-        for k, v in rows:
-            if k and k == swept:
-                v = v.replace("(varies)", "(swept)")
-            lines.append(f"{k:<26} {v}" if k else f"{'':<26} {v}")
-        out.append((title, lines))
-    return out
+    return "      ".join([
+        f"λ₋ = {fmt([p.lambda_minus_khz for p in P], 'kHz')}",
+        f"λ₀ = {fmt([p.lambda_zero_khz for p in P], 'kHz')}",
+        f"Γ₋₀ = {fmt([p.gamma_minus_to_zero_khz for p in P], 'kHz')}",
+        f"Γ₀₋ = {fmt([p.gamma_zero_to_minus_khz for p in P], 'kHz')}",
+        f"594 nm power = {fmt([r.get('power_uw') for r in results], 'µW')}",
+    ])
 
 
 def plot_three_way(
@@ -4960,7 +4909,7 @@ def plot_three_way(
     plt = _pyplot()
     from matplotlib.lines import Line2D
 
-    fig, axes = plt.subplots(1, 3, figsize=(21.0, 7.9))
+    fig, axes = plt.subplots(1, 3, figsize=(21.0, 6.1))
     (lab_t, ls_t, mk_t, lw_t), (lab_c, ls_c, mk_c, lw_c), (lab_o, ls_o, mk_o, lw_o) = (
         _THREE_WAY_METHODS
     )
@@ -5053,18 +5002,10 @@ def plot_three_way(
         f"{spec.title}: threshold, adaptive count and L&S optimum  --  "
         f"{det.describe()}", fontsize=11,
     )
-    fig.tight_layout(rect=(0, 0.27, 1, 0.95))
-
-    # Everything the plots do not show: the fixed model and run parameters.
-    fig.add_artist(Line2D([0.01, 0.99], [0.235, 0.235], color="0.6", lw=0.8,
-                          transform=fig.transFigure))
-    fig.text(0.01, 0.222, "model and run parameters (ranges are across the sweep)",
-             fontsize=10, weight="bold", va="top")
-    for k, (title, lines) in enumerate(_parameter_columns(results, spec)):
-        x0 = 0.01 + 0.25 * k
-        fig.text(x0, 0.185, title, fontsize=9.5, weight="bold", va="top")
-        fig.text(x0, 0.160, "\n".join(lines), fontsize=8.6, va="top",
-                 family="monospace", linespacing=1.45)
+    fig.tight_layout(rect=(0, 0.06, 1, 0.95))
+    # The rates and power the plots do not show (ranges are across the sweep).
+    fig.text(0.5, 0.015, _rates_and_power_text(results), ha="center",
+             va="bottom", fontsize=11)
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     return fig
