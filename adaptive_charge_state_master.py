@@ -4878,12 +4878,14 @@ def plot_three_way(
     alone, with the swept variable as colour and the method as line style:
       (a) fidelity vs mean run time -- the count rule's calibration frontier
           and the optimum's concave hull, as in `plot_sweep`;
-      (b) each method's fidelity ceiling against the swept variable.
+      (b) each method's fidelity ceiling against the swept variable;
+      (c) the count rule's and the optimum's speedup over the threshold at
+          matched fidelity, with their paired bootstrap intervals.
     """
     plt = _pyplot()
     from matplotlib.lines import Line2D
 
-    fig, axes = plt.subplots(1, 2, figsize=(14.0, 5.4))
+    fig, axes = plt.subplots(1, 3, figsize=(21.0, 5.6))
     (lab_t, ls_t, mk_t, lw_t), (lab_c, ls_c, mk_c, lw_c), (lab_o, ls_o, mk_o, lw_o) = (
         _THREE_WAY_METHODS
     )
@@ -4941,6 +4943,40 @@ def plot_three_way(
     ax.set_ylabel("best achievable balanced fidelity")
     ax.set_title("(b) fidelity ceiling", fontsize=11)
     ax.legend(handles=method_handles, fontsize=9, loc="upper left")
+    ax.grid(alpha=0.25)
+
+    # (c) the speedups, against the threshold, which is 1 by definition.
+    ax = axes[2]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        tbl = res["speedup_table"]
+        F = np.array([r["target_fidelity"] for r in tbl])
+        for key, (_, ls, mk, lw) in (("count", _THREE_WAY_METHODS[1]),
+                                     ("optimal", _THREE_WAY_METHODS[2])):
+            S = np.array([r.get(f"speedup_{key}", np.nan) for r in tbl], float)
+            lo = np.array([r.get(f"speedup_{key}_ci_low", np.nan) for r in tbl], float)
+            hi = np.array([r.get(f"speedup_{key}_ci_high", np.nan) for r in tbl], float)
+            m = np.isfinite(S)
+            if not m.any():
+                continue
+            ax.plot(F[m], S[m], color=c, ls=ls, marker=mk,
+                    ms=6 if mk == "*" else 3.5, lw=lw)
+            g = m & np.isfinite(lo) & np.isfinite(hi)
+            ax.fill_between(F[g], lo[g], hi[g], color=c, alpha=0.10, lw=0)
+    ax.axhline(1.0, color="0.3", lw=lw_t, ls=ls_t)
+    ax.set_ylim(bottom=max(0.5, ax.get_ylim()[0]))
+    ax.set_xlabel("target balanced fidelity")
+    ax.set_ylabel("run-time reduction vs fixed-time threshold")
+    ax.set_title("(c) speedup at matched fidelity, with paired 95% CI", fontsize=11)
+    speed_handles = [
+        Line2D([], [], color="0.3", ls=ls_t, lw=lw_t, label=f"{lab_t} (= 1)"),
+        Line2D([], [], color="0.3", ls=ls_c, marker=mk_c, lw=lw_c, label=lab_c),
+        Line2D([], [], color="0.3", ls=ls_o, marker=mk_o, lw=lw_o, label=lab_o),
+    ]
+    # Colour is keyed to the swept variable in panel (a); only the methods
+    # need a key here, in the empty space above the curves.
+    ax.legend(handles=speed_handles, loc="upper center",
+              bbox_to_anchor=(0.62, 1.0), fontsize=9)
     ax.grid(alpha=0.25)
 
     det = results[0]["detector"] if results else DETECTOR_OFF
