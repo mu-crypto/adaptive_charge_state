@@ -4858,7 +4858,7 @@ def _ceiling_panel(ax, results: list[dict], spec: SweepSpec, series, title="fide
 
 # Sweeps that also get the three-method figure: the baseline, the count-only
 # stopping rule and the exact optimum, without the rules in between.
-THREE_WAY_SWEEPS = ("snr",)
+THREE_WAY_SWEEPS = ("snr", "ratio", "contrast")
 
 _THREE_WAY_METHODS = (
     # (label, line style, marker, width)
@@ -4967,16 +4967,10 @@ def plot_three_way(
     ax.set_ylim(bottom=max(0.5, ax.get_ylim()[0]))
     ax.set_xlabel("target balanced fidelity")
     ax.set_ylabel("run-time reduction vs fixed-time threshold")
-    ax.set_title("(c) speedup at matched fidelity, with paired 95% CI", fontsize=11)
-    speed_handles = [
-        Line2D([], [], color="0.3", ls=ls_t, lw=lw_t, label=f"{lab_t} (= 1)"),
-        Line2D([], [], color="0.3", ls=ls_c, marker=mk_c, lw=lw_c, label=lab_c),
-        Line2D([], [], color="0.3", ls=ls_o, marker=mk_o, lw=lw_o, label=lab_o),
-    ]
-    # Colour is keyed to the swept variable in panel (a); only the methods
-    # need a key here, in the empty space above the curves.
-    ax.legend(handles=speed_handles, loc="upper center",
-              bbox_to_anchor=(0.62, 1.0), fontsize=9)
+    # Line styles are keyed in (a) and (b), colours in (a); a legend here
+    # would sit on some sweep's curves wherever it went.
+    ax.set_title("(c) speedup over the fixed-time threshold (dotted = 1),\n"
+                 "with paired 95% CI", fontsize=11)
     ax.grid(alpha=0.25)
 
     det = results[0]["detector"] if results else DETECTOR_OFF
