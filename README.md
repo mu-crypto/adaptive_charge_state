@@ -23,6 +23,13 @@ Always, on identical shots:
 All six run in every sweep (`run`); `optimal` studies 5 and 6 in more depth
 at the `demo` points, in Bayes risk as well as speedup.
 
+`run` also scores the **HMM readout** of Spethmann, Stano & Loss (2025): the
+exact posterior of the initial state from a fixed-length record, called at
+P = ½. For this chain that is the MMPP filter's initial-state LLR with a
+zero cutoff. Under the paper's own correlated-noise model (`paper_noise_*`)
+it keeps a 10–15% infidelity lead over the threshold at every T_c, and that
+lead closes only as the noise SNR falls; see `results/README.md`.
+
 The design is a 2×2 of stopping rule against decision statistic, plus the
 optimum the 2×2 is measured against:
 
@@ -167,6 +174,8 @@ the field: with post-selection the best-to-worst spread falls from 40% to
 | `noise_setpoint` | the same, without mean renormalisation |
 | `noise_tau` | rate-noise correlation time τ_c |
 | `noise_kind` | Gaussian against telegraph noise at matched variance |
+| `paper_noise_tau` | the noise model of Spethmann et al. (2025) — additive, Gaussian spectrum, one trace per state — sweeping T_c at SNR 3 |
+| `paper_noise_snr` | the same noise sweeping its SNR = Δλ/σ at T_c = 10 µs |
 
 `efficiency` and `snr` both move the readout's information content, but along
 different axes: η scales SNR² and sparsity together, while the SNR sweep holds
@@ -181,11 +190,12 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 97 numerical checks
+python adaptive_charge_state_master.py validate          # 99 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py run power --no-optimal   # methods 1-5 only, fast
 python adaptive_charge_state_master.py refine-optimum demo      # upgrade older saved runs
+python adaptive_charge_state_master.py add-hmm noise_tau        # add the HMM readout to saved runs
 python adaptive_charge_state_master.py plot contrast     # figures + summary
 python adaptive_charge_state_master.py summary efficiency
 python adaptive_charge_state_master.py robustness demo --point 1
@@ -256,6 +266,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 97/97 on both.
+active, every saved result records it, and `validate` passes 99/99 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.

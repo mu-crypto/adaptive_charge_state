@@ -583,7 +583,13 @@ def report_optimum(rows: list[dict]) -> None:
     pools = (
         ("ideal detector, no noise", ideal_pool(rows)),
         ("detector presets", [r for r in rows if not r["_ideal"]]),
-        ("rate noise (ideal detector)", [r for r in rows if r["_ideal"] and r["_noisy"]]),
+        ("rate noise (ideal detector)", [
+            r for r in rows if r["_ideal"] and r["_noisy"]
+            and not r["experiment"].startswith("paper_noise")
+        ]),
+        ("Spethmann et al. noise (paper_noise_*)", [
+            r for r in rows if r["experiment"].startswith("paper_noise")
+        ]),
     )
     for label, pool in pools:
         pool = [
