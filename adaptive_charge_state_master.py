@@ -909,6 +909,17 @@ class RateNoise:
                    cannot, and the one that decides the remedy: a telegraph
                    modulator is a genuine extra state and can be modelled as
                    one, Gaussian modulation cannot.
+                   'gauss_additive' is the noise model of Spethmann, Stano &
+                   Loss (2025) carried over to photon counting -- see
+                   `simulate_additive_noise_shot`. It is a different
+                   channel, not a third modulator shape: additive on the
+                   emission rates, an independent trace per charge state,
+                   Gaussian-shaped spectrum, switching untouched. For it
+                   `sigma` is the noise amplitude in units of the emission
+                   contrast, sigma = 1/SNR with the paper's SNR =
+                   |mu_1 - mu_2| / sqrt(Sigma_0) = Delta lambda / sigma_lambda,
+                   and tau_c_ms is the paper's T_c (Sigma_t ~ exp[-(t/T_c)^2]);
+                   photon_order and renormalise do not apply.
     photon_order   exponent coupling switching to emission; 2.0 for the
                    two-photon ionization/recombination of 594 nm readout
     steps_per_tau  segments per correlation time in the simulator
@@ -946,8 +957,8 @@ class RateNoise:
             raise ValueError("sigma must be non-negative.")
         if self.tau_c_ms <= 0.0:
             raise ValueError("tau_c_ms must be positive.")
-        if self.kind not in ("ou", "telegraph"):
-            raise ValueError("kind must be 'ou' or 'telegraph'.")
+        if self.kind not in ("ou", "telegraph", "gauss_additive"):
+            raise ValueError("kind must be 'ou', 'telegraph' or 'gauss_additive'.")
         if self.steps_per_tau < 1:
             raise ValueError("steps_per_tau must be >= 1.")
         if self.renormalise not in ("mean", "none"):
@@ -981,9 +992,19 @@ class RateNoise:
             f"noise_{self.kind}_s{self.sigma:g}_tau{self.tau_c_ms:g}ms{suffix}"
         )
 
+    @property
+    def additive(self) -> bool:
+        return self.kind == "gauss_additive"
+
     def describe(self) -> str:
         if self.is_off:
             return "no rate noise"
+        if self.additive:
+            return (
+                f"additive Gaussian-spectrum emission noise (Spethmann et al.), "
+                f"SNR = {1.0 / self.sigma:.3g}, T_c = {1000 * self.tau_c_ms:g} us, "
+                "independent per state"
+            )
         return (
             f"{self.kind} rate noise, sigma = {self.sigma:g}, "
             f"tau_c = {self.tau_c_ms:g} ms, photon order "
@@ -1212,6 +1233,136 @@ def simulate_modulated_shot(
     return np.asarray(out, dtype=float)
 
 
+def gaussian_spectrum_noise(
+    n: int,
+    tc_steps: float,
+    rng: np.random.Generator,
+    size: int = 1,
+) -> np.ndarray:
+    """
+    Unit-variance noise traces with a Gaussian-shaped spectrum, by the method
+    of Spethmann, Stano & Loss (2025), App. C (their Ref. [50]):
+
+        Lambda_k = T_c sqrt(pi) exp[-(k pi T_c / n)^2],   0 <= k <= n/2,
+
+    with T_c in grid steps, periodic over the n-point trace. Each Fourier
+    component is complex Gaussian with variance Lambda_k (real for k = 0 and
+    k = n/2), and the trace is its inverse transform, so the autocorrelation
+    is ~ exp[-(j/T_c)^2] for 1 << T_c << n. The spectrum is normalised so the
+    sample variance is exactly 1 in expectation rather than only for
+    T_c >> 1, which keeps the amplitude honest at the short end of a sweep.
+    Returns shape (size, n).
+    """
+    k = np.arange(n // 2 + 1)
+    lam = np.exp(-((k * np.pi * tc_steps / n) ** 2))
+    w = np.full(k.size, 2.0)
+    w[0] = 1.0
+    if n % 2 == 0:
+        w[-1] = 1.0
+    lam *= n / float(np.sum(w * lam))           # (1/n) sum_k Lambda_k = 1
+    # E|y_k|^2 = Lambda_k: the real components (k = 0, and k = n/2 for even
+    # n) carry all of it, the complex ones split it between Re and Im.
+    real = w == 1.0
+    sd = np.sqrt(np.where(real, lam, lam / 2.0))
+    yk = rng.normal(size=(size, k.size)) * sd
+    yk = yk + 1j * np.where(real, 0.0, rng.normal(size=(size, k.size)) * sd)
+    # y_t = n^(-1/2) sum_k y_k exp(i 2 pi t k / n); numpy's irfft has 1/n.
+    return np.fft.irfft(yk, n=n, axis=1) * np.sqrt(n)
+
+
+def _additive_noise_grid(noise: RateNoise, t_max_ms: float) -> tuple[int, float]:
+    """Grid for the additive noise: T_c / 8, at least 64 cells per shot."""
+    n = max(int(np.ceil(float(t_max_ms) / (noise.tau_c_ms / 8.0))), 64)
+    return n, float(t_max_ms) / n
+
+
+def additive_noise_mean_rate(rate_khz: float, sigma_khz: float) -> float:
+    """
+    E[max(rate + sigma xi, 0)] for xi ~ N(0, 1): the time-averaged emission
+    rate once the clamp at zero is applied -- the 'model-matched' mean the
+    paper hands its HMM. For the dark state, whose rate is far below the
+    noise amplitude, the clamp is what sets it.
+    """
+    from scipy.stats import norm
+
+    if sigma_khz <= 0.0:
+        return float(rate_khz)
+    z = rate_khz / sigma_khz
+    return float(rate_khz * norm.cdf(z) + sigma_khz * norm.pdf(z))
+
+
+def simulate_additive_noise_shot(
+    t_max_ms: float,
+    initial_state: int,
+    params: MMPPParams,
+    noise: RateNoise,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Photon arrivals under the noise model of Spethmann, Stano & Loss (2025),
+    transplanted from a charge-sensor signal to a click rate.
+
+    Paper: y_t = y_t^(s_t), where each state i has its own trace
+    y^(i) = mu_i + correlated Gaussian noise of common variance Sigma_0 and
+    Gaussian-shaped spectrum, and the transitions are those of the noiseless
+    chain. Here the observable is the emission rate, so
+
+        lambda(t) = max(lambda_{M_t} + sigma_lambda xi^(M_t)(t), 0),
+        sigma_lambda = sigma * |lambda_- - lambda_0|  (sigma = 1/SNR),
+
+    with xi^(-), xi^(0) independent unit-variance traces from
+    `gaussian_spectrum_noise`, and the charge state switching at the
+    noiseless rates. The clamp is the one addition photon counting forces:
+    a rate cannot be negative.
+
+    Because the noise does not touch switching, the charge path is drawn
+    exactly first and the clicks after it, as an inhomogeneous Poisson
+    process on the noise grid split at the switch times -- exact for the
+    piecewise-constant rate, and vectorised.
+    """
+    params.validate()
+    noise.validate()
+    state0 = int(initial_state)
+    if state0 not in (0, 1):
+        raise ValueError("initial_state must be 0 (NV-) or 1 (NV0).")
+    T = float(t_max_ms)
+
+    # 1. the charge path, at the noiseless switching rates
+    sw = []
+    t, st = 0.0, state0
+    g = (params.gamma_minus_to_zero_khz, params.gamma_zero_to_minus_khz)
+    while True:
+        t += float(rng.exponential(1.0 / g[st]))
+        if t >= T:
+            break
+        sw.append(t)
+        st = 1 - st
+    sw = np.asarray(sw)
+
+    # 2. one noise trace per state, and the clamped rates on the grid
+    n, dt = _additive_noise_grid(noise, T)
+    xi = gaussian_spectrum_noise(n, noise.tau_c_ms / dt, rng, size=2)
+    s_lam = noise.sigma * abs(params.lambda_minus_khz - params.lambda_zero_khz)
+    rate = np.maximum(
+        np.array([[params.lambda_minus_khz], [params.lambda_zero_khz]]) + s_lam * xi,
+        0.0,
+    )
+
+    # 3. clicks on the grid split at the switch times
+    edges = np.union1d(np.arange(n + 1) * dt, sw)
+    edges = edges[(edges >= 0.0) & (edges <= T)]
+    a, b = edges[:-1], edges[1:]
+    state = (state0 + np.searchsorted(sw, a, side="right")) % 2
+    cell = np.minimum((a / dt).astype(np.int64), n - 1)
+    mu = rate[state, cell] * (b - a)
+    k = rng.poisson(mu)
+    if not k.any():
+        return np.empty(0)
+    starts = np.repeat(a, k)
+    widths = np.repeat(b - a, k)
+    return np.sort(starts + widths * rng.random(starts.size))
+
+
 def simulate_mmpp_shot(
     t_max_ms: float,
     initial_state: int,
@@ -1228,6 +1379,10 @@ def simulate_mmpp_shot(
     """
     if noise.is_off:
         arrivals = _nv_simulate_mmpp_shot(t_max_ms, initial_state, params, rng)
+    elif noise.additive:
+        arrivals = simulate_additive_noise_shot(
+            t_max_ms, initial_state, params, noise, rng
+        )
     else:
         arrivals = simulate_modulated_shot(
             t_max_ms, initial_state, params, noise, rng
@@ -2986,7 +3141,16 @@ def _filter_params_for(
         A constant error is already known to be absorbed by the calibrated
         boundary, so leaving it in would only dilute the measurement.
     """
-    if noise.renormalise == "none" and not noise.is_off:
+    if noise.additive and not noise.is_off:
+        # Model-matched, as in the paper: the time-averaged (clamped) emission
+        # rates, the switching rates the noise leaves alone.
+        s_lam = noise.sigma * abs(params.lambda_minus_khz - params.lambda_zero_khz)
+        params = _replace_params(
+            params,
+            lambda_minus_khz=additive_noise_mean_rate(params.lambda_minus_khz, s_lam),
+            lambda_zero_khz=additive_noise_mean_rate(params.lambda_zero_khz, s_lam),
+        )
+    elif noise.renormalise == "none" and not noise.is_off:
         params = _replace_params(
             params,
             lambda_minus_khz=params.lambda_minus_khz
@@ -3175,6 +3339,10 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         )
         mcnemar["readout_time_us"] = float(readout_times_us[j_best])
 
+    # ---- HMM readout: the fixed-length posterior, called at P = 1/2 -------
+    hmm_correct = _hmm_correct(test_packed, readout_times_us, test_labels)
+    F_hmm, T_hmm = _method_curve(test_labels, hmm_correct, thr_times)
+
     # Deadlines span the SAME range as the threshold readout times, so the
     # adaptive methods are neither helped nor handicapped by their grid.
     deadlines_us = np.geomspace(4.0 * t_floor_us, horizon_us, cfg.n_deadlines)
@@ -3357,7 +3525,8 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     boot_new = {
         tag: _boot_scheme_curves(boots, C, Tm)
         for tag, C, Tm in (("learned", lrn_correct, lrn_time),
-                           ("optimal", opt_correct, opt_time))
+                           ("optimal", opt_correct, opt_time),
+                           ("hmm", hmm_correct, thr_times))
         if C is not None
     }
     _ci = _boot_ci
@@ -3366,7 +3535,8 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     for F_star in np.asarray(cfg.target_fidelities, dtype=float):
         t_thr = time_for_fidelity_interp(T_thr, F_thr, F_star)
         new_cols = {}
-        for tag, Fm, Tm in (("learned", F_lrn, T_lrn), ("optimal", F_opt, T_opt)):
+        for tag, Fm, Tm in (("learned", F_lrn, T_lrn), ("optimal", F_opt, T_opt),
+                            ("hmm", F_hmm, T_hmm)):
             if Fm is None:
                 continue
             new_cols.update(_scheme_speedup_cols(
@@ -3521,6 +3691,8 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
         "F_adaptive_mmpp_cal": np.asarray(ada_cal_F),
         "T_adaptive_mmpp_cal": np.asarray(ada_cal_T),
         "frontier_adaptive_mmpp": pareto_frontier(T_ada, F_ada),
+        "F_hmm": F_hmm,
+        "T_hmm": T_hmm,
         "F_learned": F_lrn,
         "T_learned": T_lrn,
         "frontier_learned": None if F_lrn is None else pareto_frontier(T_lrn, F_lrn),
@@ -3567,6 +3739,7 @@ def run_operating_point(point: OperatingPoint, cfg: RunConfig) -> dict:
     if opt_correct is not None:
         result["optimal_correct"] = opt_correct.astype(bool)
         result["optimal_time"] = opt_time.astype(np.float32)
+    result["hmm_correct"] = hmm_correct.astype(bool)
 
     return result
 
@@ -3581,6 +3754,21 @@ SWEEP_DP_FINE_LAM_DT = 0.025
 SWEEP_DP_H = 0.7
 SWEEP_DP_MAX_STEPS = 5000
 SWEEP_DP_THRESHOLD_POINTS = 5
+
+
+def _hmm_correct(packed, readout_times_us, labels) -> np.ndarray:
+    """
+    HMM readout (Spethmann, Stano & Loss 2025): the exact posterior of the
+    initial state given the whole record up to each fixed t_R, called as the
+    likelier state. For a two-state chain the forward-backward P(s_0 | y) is
+    the initial-state LLR the MMPP filter already computes, so at prior 1/2
+    the rule is LLR >= 0 -- no cutoff fitted, the model-matched rates as the
+    model (nominal ones under rate noise). The demo's fixed-time MMPP is the
+    same statistic with a calibrated cutoff instead.
+    """
+    llr = llr_at_times(packed, readout_times_us)
+    pred = np.where(llr >= 0.0, 0, 1)
+    return (pred == np.asarray(labels, dtype=int)[:, None]).astype(float)
 
 
 def _boot_ci(v) -> tuple[float, float]:
@@ -3887,6 +4075,8 @@ def max_fidelity_summary(result: dict) -> dict:
         out["learned"] = float(np.max(result["F_learned"]))
     if result.get("F_optimal") is not None:
         out["optimal"] = float(np.max(result["F_optimal"]))
+    if result.get("F_hmm") is not None:
+        out["hmm"] = float(np.max(result["F_hmm"]))
     return out
 
 
@@ -4249,6 +4439,47 @@ def _noise_setpoint_points(cfg: RunConfig) -> list[OperatingPoint]:
     return pts
 
 
+# The noise model of Spethmann, Stano & Loss (2025), carried over to photon
+# counting (`simulate_additive_noise_shot`): their Fig. 4 holds the SNR and
+# grows T_c, so one sweep does that and one moves the SNR at a fixed T_c.
+# T_c runs from well below the mean photon spacing (4.4 us at the reference
+# point) to near the 120 us bright dwell.
+PAPER_NOISE_TCS_US = [0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
+PAPER_NOISE_REF_SNR = 3.0
+PAPER_NOISE_SNRS = [10.0, 5.0, 3.0, 2.0, 1.0]
+PAPER_NOISE_REF_TC_US = 10.0
+
+
+def _paper_noise_point(snr: float, tc_us: float, name: str, label: str,
+                       sweep_value: float) -> OperatingPoint:
+    return OperatingPoint(
+        name=name,
+        label=label,
+        params=_base_params(),
+        sweep_value=float(sweep_value),
+        power_uw=BASE_POWER_UW,
+        detection_efficiency=1.0,
+        noise=RateNoise(sigma=1.0 / float(snr), tau_c_ms=float(tc_us) / 1000.0,
+                        kind="gauss_additive"),
+    )
+
+
+def _paper_noise_tau_points(cfg: RunConfig) -> list[OperatingPoint]:
+    return [
+        _paper_noise_point(PAPER_NOISE_REF_SNR, tc, f"tc{tc:g}us",
+                           f"$T_c$ = {tc:g} us", tc)
+        for tc in PAPER_NOISE_TCS_US
+    ]
+
+
+def _paper_noise_snr_points(cfg: RunConfig) -> list[OperatingPoint]:
+    return [
+        _paper_noise_point(snr, PAPER_NOISE_REF_TC_US, f"snr{snr:g}",
+                           f"noise SNR = {snr:g}", snr)
+        for snr in PAPER_NOISE_SNRS
+    ]
+
+
 def _noise_tau_points(cfg: RunConfig) -> list[OperatingPoint]:
     base = _base_params()
     pts = []
@@ -4456,6 +4687,37 @@ EXPERIMENTS: dict[str, SweepSpec] = {
             "dwell averages out "
             "within a dwell; noise much slower is quasi-static and the "
             "calibrated cutoff absorbs it. The damage should peak in between."
+        ),
+    ),
+    "paper_noise_tau": SweepSpec(
+        key="paper_noise_tau",
+        title=(
+            "Spethmann et al. noise model: correlation-time sweep "
+            f"(additive, Gaussian spectrum, SNR = {PAPER_NOISE_REF_SNR:g})"
+        ),
+        xlabel=r"noise correlation time $T_c$ (us)",
+        legend_title="correlation time",
+        build_points=_paper_noise_tau_points,
+        note=(
+            "Additive emission-rate noise with a Gaussian-shaped spectrum, an "
+            "independent trace per charge state, switching untouched, as in "
+            "Spethmann, Stano & Loss (2025). Every MMPP rule (HMM, SPRT, L&S) "
+            "is built from the model-matched mean rates, i.e. a white-noise "
+            "model of correlated data."
+        ),
+    ),
+    "paper_noise_snr": SweepSpec(
+        key="paper_noise_snr",
+        title=(
+            "Spethmann et al. noise model: SNR sweep "
+            f"(additive, Gaussian spectrum, T_c = {PAPER_NOISE_REF_TC_US:g} us)"
+        ),
+        xlabel=r"noise SNR = $\Delta\lambda / \sigma_\lambda$",
+        legend_title="noise SNR",
+        build_points=_paper_noise_snr_points,
+        note=(
+            "The paper's SNR = |mu_1 - mu_2| / sqrt(Sigma_0), with the click "
+            "rate as the signal."
         ),
     ),
     "noise_kind": SweepSpec(
@@ -5011,6 +5273,212 @@ def plot_three_way(
     return fig
 
 
+# Correlated-noise sweeps that get the four-method figure in the style of
+# Spethmann, Stano & Loss (2025): threshold, adaptive count, HMM, L&S optimum.
+NOISE_FOUR_WAY_SWEEPS = ("noise", "noise_setpoint", "noise_tau", "noise_kind",
+                         "paper_noise_tau", "paper_noise_snr")
+
+_FOUR_WAY_METHODS = (
+    # (key, label, line style, marker, width, correctness key, F key)
+    ("threshold", "fixed-time threshold", ":", "o", 1.5, "thr_correct", "F_threshold"),
+    ("count", "adaptive count SPRT", "--", "^", 1.5, "cnt_correct", "F_adaptive_count"),
+    ("hmm", "HMM (fixed-length posterior, P > 1/2)", "-.", "s", 1.7, "hmm_correct", "F_hmm"),
+    ("optimal", "L&S optimum (exact DP)", "-", "*", 2.2, "optimal_correct", "F_optimal"),
+)
+
+
+def _best_infidelity(res: dict, ckey: str, fkey: str) -> tuple[float, float]:
+    """
+    1 - F at a method's best configuration, with its binomial standard error
+    there (the balanced-fidelity analogue of the paper's finite-N error bars).
+    The max over configurations is itself biased low in infidelity; the bar
+    is the sampling error of the chosen configuration only.
+    """
+    F = res.get(fkey)
+    C = res.get(ckey)
+    if F is None or C is None:
+        return np.nan, np.nan
+    j = int(np.argmax(F))
+    lab = np.asarray(res["test_labels"], dtype=int)
+    c = np.asarray(C)[:, j].astype(float)
+    p0, p1 = c[lab == 0].mean(), c[lab == 1].mean()
+    n0, n1 = int((lab == 0).sum()), int((lab == 1).sum())
+    se = 0.5 * np.sqrt(p0 * (1 - p0) / n0 + p1 * (1 - p1) / n1)
+    return 1.0 - float(F[j]), float(se)
+
+
+def _noise_text(results: list[dict]) -> str:
+    """The rate-noise settings of a sweep, on one line."""
+    nz = [r.get("noise") for r in results]
+    on = [n for n in nz if n is not None and not n.is_off]
+    if not on:
+        return "rate noise off"
+
+    def rng(vals, fmt):
+        lo, hi = min(vals), max(vals)
+        return fmt.format(lo) if lo == hi else f"{fmt.format(lo)} – {fmt.format(hi)}"
+
+    sig = [0.0 if (n is None or n.is_off) else n.sigma for n in nz]
+    kinds = sorted({n.kind for n in on})
+    if on[0].additive:
+        fp = [_filter_params_for(r["params"], DETECTOR_OFF, r["noise"]) for r in results]
+        return (
+            "Spethmann et al. noise: additive on the emission rate, Gaussian "
+            f"spectrum, one trace per state, switching untouched;  SNR = "
+            f"{rng([1.0 / n.sigma for n in on], '{:.3g}')},  "
+            f"T_c = {rng([n.tau_c_ms * 1000 for n in on], '{:g}')} µs  --  HMM/L&S use "
+            f"model-matched λ₋ = {rng([f.lambda_minus_khz for f in fp], '{:.3g}')}, "
+            f"λ₀ = {rng([f.lambda_zero_khz for f in fp], '{:.3g}')} kHz"
+        )
+    return (
+        f"rate noise: {' / '.join(kinds)},  σ = {rng(sig, '{:g}')},  "
+        f"τ_c = {rng([n.tau_c_ms * 1000 for n in on], '{:g}')} µs,  "
+        f"photon order {on[0].photon_order:.3g},  "
+        f"{'mean-preserving' if on[0].renormalise == 'mean' else 'setpoint (mean shifts)'}"
+        "  --  every MMPP method uses the nominal (model-matched) rates"
+    )
+
+
+def plot_noise_four_way(
+    results: list[dict],
+    spec: SweepSpec,
+    save_path: str | None = None,
+):
+    """
+    Correlated rate noise against the fixed-time threshold, the adaptive count
+    SPRT, the HMM readout and the L&S optimum, after Spethmann et al. (2025):
+      (a) fidelity vs mean run time, colour by noise setting;
+      (b) the best infidelity 1 - F each method reaches, on a log axis with
+          binomial error bars, against the swept noise variable;
+      (c) speedup over the threshold at matched fidelity, with paired CIs.
+    Every MMPP-based rule (HMM, L&S) is built from the nominal rates, i.e. a
+    white-noise model of data whose rates fluctuate with correlation time
+    tau_c -- the mismatch the paper studies.
+    """
+    plt = _pyplot()
+    from matplotlib.lines import Line2D
+
+    fig, axes = plt.subplots(1, 3, figsize=(21.0, 6.3))
+    style = {m[0]: m for m in _FOUR_WAY_METHODS}
+
+    ax = axes[0]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        _, _, ls, mk, lw, _, _ = style["threshold"]
+        ax.plot(res["T_threshold"], res["F_threshold"], color=c, ls=ls,
+                marker=mk, ms=3.0, lw=lw)
+        _, _, ls, mk, lw, _, _ = style["count"]
+        fc = res["frontier_adaptive_count"]
+        ax.plot(np.asarray(res["T_adaptive_count"])[fc],
+                np.asarray(res["F_adaptive_count"])[fc],
+                color=c, ls=ls, marker=mk, ms=3.5, lw=lw)
+        if res.get("F_hmm") is not None:
+            _, _, ls, mk, lw, _, _ = style["hmm"]
+            ax.plot(res["T_hmm"], res["F_hmm"], color=c, ls=ls, marker=mk,
+                    ms=2.6, lw=lw)
+        if res.get("F_optimal") is not None:
+            _, _, ls, mk, lw, _, _ = style["optimal"]
+            To, Fo = _optimal_curve(res)
+            ax.plot(To, Fo, color=c, ls=ls, lw=lw)
+            H = np.asarray(res["hull_optimal"], float)
+            v = H[0] > 0
+            ax.plot(H[0][v], H[1][v], ls="none", marker=mk, ms=6, color=c)
+    ax.set_xscale("log")
+    ax.set_xlabel("mean run time per shot (us)")
+    ax.set_ylabel("balanced initial-state fidelity")
+    ax.set_title("(a) fidelity vs run time", fontsize=11)
+    ax.grid(alpha=0.25)
+    method_handles = [
+        Line2D([], [], color="0.3", ls=ls, marker=mk, lw=lw, label=lab)
+        for _, lab, ls, mk, lw, _, _ in _FOUR_WAY_METHODS
+    ]
+    value_handles = [
+        Line2D([], [], color=SWEEP_COLORS[k % len(SWEEP_COLORS)], lw=2.4,
+               label=res["label"])
+        for k, res in enumerate(results)
+    ]
+    leg = ax.legend(handles=method_handles, loc="upper left", fontsize=8.5)
+    ax.add_artist(leg)
+    ax.legend(handles=value_handles, loc="upper left", bbox_to_anchor=(0.0, 0.77),
+              fontsize=8.5, title=spec.legend_title)
+
+    # (b) best infidelity, log axis, as in the paper's Fig. 4.
+    ax = axes[1]
+    x = np.array([r["sweep_value"] for r in results], dtype=float)
+    offsets = np.linspace(-0.012, 0.012, len(_FOUR_WAY_METHODS))
+    for (key, lab, ls, mk, lw, ckey, fkey), off in zip(_FOUR_WAY_METHODS, offsets):
+        vals = np.array([_best_infidelity(r, ckey, fkey) for r in results])
+        inf, se = vals[:, 0], vals[:, 1]
+        m = np.isfinite(inf)
+        if not m.any():
+            continue
+        # A small horizontal offset per method keeps the error bars apart.
+        if spec.xscale == "log":
+            xs = x * 10 ** (off * 4)
+        else:
+            xs = x + off * (np.nanmax(x) - np.nanmin(x) if x.size > 1 else 1.0)
+        ax.plot(xs[m], inf[m], color="0.35", ls=ls, lw=lw, label=lab)
+        for k in np.nonzero(m)[0]:
+            ax.errorbar(xs[k], inf[k], yerr=se[k], ls="none", marker=mk,
+                        ms=8 if mk == "*" else 6, capsize=2.5, elinewidth=1.0,
+                        color=SWEEP_COLORS[k % len(SWEEP_COLORS)], mec="0.2", mew=0.5,
+                        ecolor="0.35")
+    ax.set_yscale("log")
+    # Headroom above the data, on the log axis, so the legend sits clear of it.
+    lo_y, hi_y = ax.get_ylim()
+    ax.set_ylim(lo_y, hi_y * (hi_y / lo_y) ** 0.45)
+    ax.set_xscale(spec.xscale)
+    if spec.key == "noise_kind":
+        ax.set_xticks(x)
+        ax.set_xticklabels([r["name"] for r in results])
+    ax.set_xlabel(spec.xlabel)
+    ax.set_ylabel("best infidelity  1 - F")
+    ax.set_title("(b) best infidelity (± binomial s.e. at the best setting)", fontsize=11)
+    ax.legend(handles=method_handles, fontsize=8.5, loc="upper center", ncol=2)
+    ax.grid(alpha=0.25, which="both")
+
+    # (c) speedups, the threshold being 1 by definition.
+    ax = axes[2]
+    for k, res in enumerate(results):
+        c = SWEEP_COLORS[k % len(SWEEP_COLORS)]
+        tbl = res["speedup_table"]
+        F = np.array([r["target_fidelity"] for r in tbl])
+        for key in ("count", "hmm", "optimal"):
+            _, _, ls, mk, lw, _, _ = style[key]
+            S = np.array([r.get(f"speedup_{key}", np.nan) for r in tbl], float)
+            lo = np.array([r.get(f"speedup_{key}_ci_low", np.nan) for r in tbl], float)
+            hi = np.array([r.get(f"speedup_{key}_ci_high", np.nan) for r in tbl], float)
+            mm = np.isfinite(S)
+            if not mm.any():
+                continue
+            ax.plot(F[mm], S[mm], color=c, ls=ls, marker=mk,
+                    ms=6 if mk == "*" else 3.0, lw=lw)
+            g = mm & np.isfinite(lo) & np.isfinite(hi)
+            ax.fill_between(F[g], lo[g], hi[g], color=c, alpha=0.10, lw=0)
+    _, _, ls_t, _, lw_t, _, _ = style["threshold"]
+    ax.axhline(1.0, color="0.3", lw=lw_t, ls=ls_t)
+    ax.set_ylim(bottom=max(0.5, ax.get_ylim()[0]))
+    ax.set_xlabel("target balanced fidelity")
+    ax.set_ylabel("run-time reduction vs fixed-time threshold")
+    ax.set_title("(c) speedup over the fixed-time threshold (dotted = 1),\n"
+                 "with paired 95% CI", fontsize=11)
+    ax.grid(alpha=0.25)
+
+    det = results[0]["detector"] if results else DETECTOR_OFF
+    fig.suptitle(
+        f"{spec.title}: threshold, adaptive count, HMM and L&S optimum  --  "
+        f"{det.describe()}", fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0.09, 1, 0.95))
+    fig.text(0.5, 0.045, _rates_and_power_text(results), ha="center",
+             va="bottom", fontsize=11)
+    fig.text(0.5, 0.012, _noise_text(results), ha="center", va="bottom",
+             fontsize=10)
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
 def plot_sweep_vs_x(
     results: list[dict],
     spec: SweepSpec,
@@ -5260,9 +5728,9 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
         f"{'point':>14}{'ph/dwell':>10}{'F*':>7}{'t_thr(us)':>11}"
         f"{'t_count(us)':>12}{'t_fcm(us)':>11}{'T_mmpp(us)':>12}"
         f"{'sp_mmpp':>9}{'95% CI':>15}{'sp_fcm':>8}{'sp_count':>10}"
-        f"{'sp_learn':>10}{'sp_opt':>8}"
+        f"{'sp_learn':>10}{'sp_opt':>8}{'sp_hmm':>8}"
     )
-    print("-" * 134)
+    print("-" * 142)
     for res in results:
         ph = res["regime"]["photons_per_bright_dwell"]
         first = True
@@ -5287,13 +5755,15 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
             so_v = r.get("speedup_optimal", np.nan)
             sl = f"{sl_v:10.2f}" if np.isfinite(sl_v) else f"{'-':>10}"
             so = f"{so_v:8.2f}" if np.isfinite(so_v) else f"{'-':>8}"
+            sh_v = r.get("speedup_hmm", np.nan)
+            sh = f"{sh_v:8.2f}" if np.isfinite(sh_v) else f"{'-':>8}"
             print(
                 f"{res['name'] if first else '':>14}"
                 f"{f'{ph:.1f}' if first else '':>10}"
                 f"{r['target_fidelity']:7.2f}{r['t_threshold_us']:11.2f}"
                 f"{r['t_adaptive_count_us']:12.2f}{tf}"
                 f"{r['t_adaptive_mmpp_us']:12.2f}"
-                f"{r['speedup_mmpp']:9.2f}{ci:>15}{sf}{sc}{sl}{so}"
+                f"{r['speedup_mmpp']:9.2f}{ci:>15}{sf}{sc}{sl}{so}{sh}"
             )
             first = False
         if first:
@@ -5303,7 +5773,7 @@ def print_summary(results: list[dict], spec: SweepSpec) -> None:
             )
         if res.get("optimal_skipped"):
             print(f"{'':>14}  {res['optimal_skipped']}")
-        print("-" * 134)
+        print("-" * 142)
 
     print("\nfidelity ceiling by method")
     keys = list(max_fidelity_summary(results[0]).keys())
@@ -8007,6 +8477,38 @@ def validate_all(verbose: bool = True) -> int:
         f"{nz.clamp_fraction():.4f}",
     )
 
+    # The Spethmann et al. noise: Gaussian-spectrum traces of unit variance
+    # whose autocorrelation is exp[-(j/T_c)^2] (App. C), and a simulator
+    # whose per-state click rate is the model-matched clamped mean.
+    xg = gaussian_spectrum_noise(1000, 6.0, np.random.default_rng(5), size=3000)
+    ac6 = float(np.mean(xg[:, :-6] * xg[:, 6:]) / xg.var())
+    ac12 = float(np.mean(xg[:, :-12] * xg[:, 12:]) / xg.var())
+    check(
+        "Gaussian-spectrum noise: unit variance, exp[-(t/T_c)^2] correlation",
+        abs(xg.var() - 1.0) < 0.01 and abs(ac6 - np.exp(-1)) < 0.01
+        and abs(ac12 - np.exp(-4)) < 0.01,
+        f"var {xg.var():.4f}, corr at T_c {ac6:.4f} (e^-1 = 0.3679), "
+        f"at 2 T_c {ac12:.4f} (e^-4 = 0.0183)",
+    )
+    nz = RateNoise(sigma=1.0 / 3.0, tau_c_ms=0.003, kind="gauss_additive")
+    frozen = _replace_params(tp, gamma_minus_to_zero_khz=1e-9,
+                             gamma_zero_to_minus_khz=1e-9)
+    fpn = _filter_params_for(tp, DETECTOR_OFF, nz)
+    rgn = np.random.default_rng(6)
+    r_m = np.mean([simulate_additive_noise_shot(5.0, 0, frozen, nz, rgn).size / 5.0
+                   for _ in range(300)])
+    r_0 = np.mean([simulate_additive_noise_shot(5.0, 1, frozen, nz, rgn).size / 5.0
+                   for _ in range(300)])
+    check(
+        "additive noise: click rates match the model-matched clamped means",
+        abs(r_m / fpn.lambda_minus_khz - 1) < 0.01
+        and abs(r_0 / fpn.lambda_zero_khz - 1) < 0.02
+        and fpn.gamma_minus_to_zero_khz == tp.gamma_minus_to_zero_khz,
+        f"bright {r_m:.1f} vs {fpn.lambda_minus_khz:.1f} kHz, dark {r_0:.2f} vs "
+        f"{fpn.lambda_zero_khz:.2f} kHz (nominal {tp.lambda_zero_khz:.2f}); "
+        "switching rates untouched",
+    )
+
     # sigma = 0 must reproduce the unmodulated simulator bit for bit, so every
     # earlier result stands unchanged.
     r_off = simulate_mmpp_shot(
@@ -9328,6 +9830,12 @@ def cmd_plot(args: argparse.Namespace) -> int:
             save_path=str(directory / f"{spec.key}_thr_count_opt.png"),
         )
         del f3
+    if spec.key in NOISE_FOUR_WAY_SWEEPS and any(r.get("F_hmm") is not None for r in results):
+        f4 = plot_noise_four_way(
+            results, spec,
+            save_path=str(directory / f"{spec.key}_thr_count_hmm_opt.png"),
+        )
+        del f4
 
     for res in results:
         f = plot_operating_point(
@@ -9385,6 +9893,10 @@ _SPEEDUP_CSV_COLUMNS = [
     "speedup_optimal",
     "speedup_optimal_ci_low",
     "speedup_optimal_ci_high",
+    "t_hmm_us",
+    "speedup_hmm",
+    "speedup_hmm_ci_low",
+    "speedup_hmm_ci_high",
 ]
 
 _CEILING_CSV_COLUMNS = [
@@ -9585,6 +10097,90 @@ def refine_result_optimum(res: dict, point: OperatingPoint, cfg: RunConfig) -> b
         optimal_time=opt_time.astype(np.float32),
     )
     return True
+
+
+def add_hmm_to_result(res: dict, point: OperatingPoint, cfg: RunConfig) -> bool:
+    """
+    Add the HMM readout to a saved point, in place.
+
+    Re-simulates the calibration and test shots from the stored seed and
+    requires the fixed-time threshold to reproduce its stored per-shot
+    correctness exactly -- so the HMM is scored on the very shots the other
+    methods were -- then adds its curve, ceiling and speedup columns on the
+    same bootstrap resamples `run` used. Nothing else changes.
+    """
+    if res.get("F_hmm") is not None:
+        return False
+    params = point.params
+    horizon_us = float(res["horizon_us"])
+    detector = cfg.detector
+    noise = point.noise if point.noise is not None else cfg.noise
+    filter_params = _filter_params_for(params, detector, noise)
+    seed = int(res["seed"])
+    cal_shots, cal_labels = simulate_balanced_dataset(
+        int(res["n_cal_per_state"]), horizon_us / 1000.0, params, seed, detector, noise
+    )
+    test_shots, test_labels = simulate_balanced_dataset(
+        int(res["n_test_per_state"]), horizon_us / 1000.0, params, seed + 7717,
+        detector, noise,
+    )
+    if not np.array_equal(test_labels, np.asarray(res["test_labels"])):
+        raise RuntimeError(f"{res['name']}: re-simulated test labels do not match")
+
+    readout_times_us = np.asarray(res["readout_times_us"], dtype=float)
+    cal_counts = total_counts_at_times(cal_shots, readout_times_us / 1000.0)
+    test_counts = total_counts_at_times(test_shots, readout_times_us / 1000.0)
+    thr = np.empty((len(test_shots), readout_times_us.size), dtype=bool)
+    for j in range(readout_times_us.size):
+        n_th, _ = optimize_count_threshold(cal_counts[:, j], cal_labels)
+        thr[:, j] = np.where(test_counts[:, j] >= n_th, 0, 1) == test_labels
+    if not np.array_equal(thr, np.asarray(res["thr_correct"], dtype=bool)):
+        raise RuntimeError(f"{res['name']}: stored threshold results not reproduced")
+
+    spec_nc = build_no_click_spectral(filter_params)
+    test_packed = pack_records(
+        build_records(test_shots, horizon_us, filter_params, spec_nc), spec_nc
+    )
+    hmm_correct = _hmm_correct(test_packed, readout_times_us, test_labels)
+    thr_times = np.tile(readout_times_us, (len(test_shots), 1))
+    F_hmm, T_hmm = _method_curve(test_labels, hmm_correct, thr_times)
+
+    boots = stratified_bootstrap_indices(test_labels, int(res["n_boot"]), seed + 991)
+    thr_f = thr.astype(float)
+    boot_thr = [0.5 * (thr_f[i0].mean(axis=0) + thr_f[i1].mean(axis=0)) for i0, i1 in boots]
+    boot_hmm = _boot_scheme_curves(boots, hmm_correct, thr_times)
+    for row in res["speedup_table"]:
+        row.update(_scheme_speedup_cols(
+            "hmm", F_hmm, T_hmm, float(row["target_fidelity"]),
+            float(row["t_threshold_us"]), readout_times_us, boot_thr, boot_hmm,
+        ))
+    res.update(F_hmm=F_hmm, T_hmm=T_hmm, hmm_correct=hmm_correct.astype(bool))
+    return True
+
+
+def cmd_add_hmm(args: argparse.Namespace) -> int:
+    spec = _resolve_spec(args.experiment)
+    cfg = config_from_args(args, spec)
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    )
+    n = 0
+    for i, point in enumerate(spec.build_points(cfg)):
+        fp = directory / f"point_{i:02d}_{point.name}.pkl"
+        if not fp.exists():
+            continue
+        with open(fp, "rb") as f:
+            res = _from_plain(pickle.load(f))
+        t0 = time.time()
+        if add_hmm_to_result(res, point, cfg):
+            save_result(res, i, directory)
+            n += 1
+            print(f"  {point.name}: HMM ceiling {np.max(res['F_hmm']):.4f} "
+                  f"({time.time() - t0:.0f} s)")
+        else:
+            print(f"  {point.name}: already has the HMM readout")
+    print(f"added the HMM readout to {n} points in {directory}")
+    return 0
 
 
 def cmd_refine_optimum(args: argparse.Namespace) -> int:
@@ -11755,6 +12351,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
     sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser(
+        "add-hmm",
+        help="add the HMM readout (Spethmann et al. 2025) to saved runs (idempotent)",
+    )
+    add_common(sp)
+    sp.add_argument("--quick", action="store_true", help=argparse.SUPPRESS)
+    sp.set_defaults(func=cmd_add_hmm)
 
     sp = sub.add_parser(
         "refine-optimum",
