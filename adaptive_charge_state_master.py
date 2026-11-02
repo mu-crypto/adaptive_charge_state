@@ -9632,6 +9632,91 @@ def validate_all(verbose: bool = True) -> int:
             f"state-independent background",
         )
 
+    # -- the rho sweep (10f): the discounted DP ported from v1.8 -------------
+    p_rho = _base_params()
+    M_r, tail_r = rho_photon_count_matrices(p_rho, 0.001, 12)
+    Q_r, L_r = _rho_generators(p_rho)
+    check(
+        "rho sweep: binned-count transition matrices are exact",
+        np.abs(M_r.sum(axis=(0, 1)) - 1.0).max() < 1e-12
+        and np.abs(M_r[0] - expm((Q_r - L_r) * 0.001)).max() < 1e-12,
+        f"column sums 1 to {np.abs(M_r.sum(axis=(0, 1)) - 1.0).max():.1e}, "
+        f"zero-photon block = expm((Q - Lambda) dt), tail {tail_r:.1e}",
+    )
+    g_r = (np.linspace(-12, 12, 97), np.linspace(0, 1, 41), np.linspace(0, 1, 41))
+    rgr = np.random.default_rng(21)
+    e_r, a_r, b_r = rgr.uniform(-12, 12, 3000), rgr.uniform(0, 1, 3000), rgr.uniform(0, 1, 3000)
+    idx_d, w_d = _rho_interp_weights(g_r, (e_r, a_r, a_r))
+    off = (idx_d % (41 * 41)) // 41 != idx_d % 41
+    idx_l, w_l = _rho_interp_weights(g_r, (e_r, a_r, b_r))
+    Eg, Ag, Bg = np.meshgrid(*g_r, indexing="ij")
+    lin = (Eg + 2 * Ag - 3 * Bg).ravel()
+    lin_err = float(np.abs((lin[idx_l] * w_l).sum(1) - (e_r + 2 * a_r - 3 * b_r)).max())
+    check(
+        "rho sweep: interpolation keeps a = b exact and reproduces linear functions",
+        float(np.abs(w_d[off]).max(initial=0.0)) == 0.0 and lin_err < 1e-12,
+        f"weight on off-diagonal nodes from a = b points "
+        f"{float(np.abs(w_d[off]).max(initial=0.0)):.1e}; linear error {lin_err:.1e}",
+    )
+    sh_r, lab_r = simulate_balanced_dataset(15, 0.05, p_rho, 3, DETECTOR_OFF, NOISE_OFF)
+    spec_r = build_no_click_spectral(p_rho)
+    pk_r = pack_records(build_records(sh_r, 50.0, p_rho, spec_r), spec_r)
+    exact_r = llr_at_times(pk_r, np.array([50.0]))[:, 0]
+    errs = []
+    for dt_r in (0.1, 0.01):
+        n_r = int(round(50.0 / dt_r))
+        cnt_r = rho_binned_counts(sh_r, dt_r / 1000.0, n_r)
+        Mx, _ = rho_photon_count_matrices(p_rho, dt_r / 1000.0, int(cnt_r.max()) + 1)
+        el, aa, bb = np.zeros(len(sh_r)), np.ones(len(sh_r)), np.zeros(len(sh_r))
+        for k in range(n_r):
+            el, aa, bb, _ = _rho_posterior_update(el, aa, bb, Mx[cnt_r[:, k]])
+        errs.append(float(np.abs(el - exact_r).max()))
+    check(
+        "rho sweep: the binned posterior tends to the exact event-time LLR",
+        errs[1] < 0.03 and errs[1] < 0.2 * errs[0],
+        f"max |binned - event-time LLR| at 50 us: {errs[0]:.3f} at dt = 0.1 us, "
+        f"{errs[1]:.4f} at 0.01 us",
+    )
+    ker_r = build_rho_kernel(p_rho, 0.001)
+    prior_r = (np.array([0.0]), np.array([1.0]), np.array([0.0]))
+    sol_r = solve_rho_stopping(ker_r, 0.060, 0.0, -1000.0 / 500.0)
+    v0_r = float(_rho_interp_on_grid(ker_r, sol_r["value_at_grid"], *prior_r)[0])
+    r_star = solve_optimal_dp(p_rho, 60.0, Economics(cost_per_us=1.0 / 500.0)).risk
+    check(
+        "rho sweep: at rho = 0 with c < 0 the DP is the Bayes-risk problem",
+        abs((1.0 - v0_r) / r_star - 1.0) < 0.02,
+        f"1 - V_0 = {1.0 - v0_r:.5f} vs the event-time DP's R* = {r_star:.5f} at "
+        f"a/c = 500 us, T = 60 us ({100 * ((1.0 - v0_r) / r_star - 1.0):+.2f}%) -- two "
+        "independent solvers",
+    )
+    sh_r, lab_r = simulate_balanced_dataset(400, 0.06, p_rho, 11, DETECTOR_OFF, NOISE_OFF)
+    cnt_r = rho_binned_counts(sh_r, 0.001, 60)
+    sol0 = solve_rho_stopping(ker_r, 0.060, 0.0, 0.0)
+    d0r = apply_rho_policy(ker_r, sol0, cnt_r, lab_r)
+    Mx, _ = rho_photon_count_matrices(p_rho, 0.001, int(cnt_r.max()) + 1)
+    el, aa, bb = np.zeros(len(sh_r)), np.ones(len(sh_r)), np.zeros(len(sh_r))
+    for k in range(60):
+        el, aa, bb, _ = _rho_posterior_update(el, aa, bb, Mx[cnt_r[:, k]])
+    flip = float(np.mean(d0r["predictions"] != np.where(el >= 0.0, 0, 1)))
+    check(
+        "rho sweep: at rho = c = 0 the eps-optimal rule keeps the at-T decision",
+        flip <= 0.005,
+        f"{100 * flip:.2f}% of calls differ from the binned posterior at T; "
+        f"mean tau {d0r['mean_tau_us']:.1f} of 60 us (eps = {RHO_STOP_TOLERANCE:g})",
+    )
+    v_prev = np.inf
+    mono = True
+    for rr in (0.0, 1.0, 10.0, 100.0):
+        sr = solve_rho_stopping(ker_r, 0.060, rr, 0.0)
+        vv = float(_rho_interp_on_grid(ker_r, sr["value_at_grid"], *prior_r)[0])
+        mono &= vv <= v_prev + 1e-12 and vv >= 0.5 - 1e-9
+        v_prev = vv
+    check(
+        "rho sweep: V_0 falls with rho and never below the immediate guess",
+        mono,
+        f"V_0 at rho = 100 kHz is {v_prev:.4f} (>= 1/2)",
+    )
+
     n_fail = sum(1 for _, ok in results if not ok)
     if verbose:
         print(f"\n{len(results) - n_fail}/{len(results)} checks passed")
@@ -12231,6 +12316,904 @@ def cmd_noiserisk(args: argparse.Namespace) -> int:
     return 0
 
 
+# =============================================================================
+# 10f. The rho sweep: discounted finite-horizon decision timing (L&S Eq. 1.5)
+# =============================================================================
+#
+# Ported from nv_charge_readout_master_v1_8, study 11 ("rho_sweep"). The
+# algorithm is unchanged -- same counting-generator transition matrices, same
+# triangle-split interpolation, same backward induction and policy -- and the
+# study is placed in this file's framework: the demo operating points, the
+# seeded calibration/test data every other command uses, this file's HMM and
+# count-threshold rules, two more of its rules scored on the same objective,
+# paired bootstrap intervals, and the cost-formulation L&S optimum as an
+# independent check.
+#
+# Ludkovski & Sezer (Stochastic Models 2012, arXiv:1105.1484), Eq. (1.5):
+#
+#     sup_{tau <= T, d}  E[ int_0^tau e^{-rho t} c dt + e^{-rho tau} mu_d ],
+#
+# with the hidden chain augmented to (initial state i, current state j) and
+# terminal reward mu = 1{d = i}. At equal priors the expected terminal reward
+# is the balanced fidelity, and with c = 0 the objective is
+#
+#     J(rho) = E[ e^{-rho tau} 1{correct} ],
+#
+# so rho (kHz = 1/ms) alone sets how fast a late answer loses value; 1/rho is
+# that time scale. This is the DISCOUNTED-reward counterpart of the
+# Bayes-risk problem `solve_optimal_dp` solves (a running cost c per us and a
+# terminal cost per error). For rho tau << 1, e^{-rho tau} ~ 1 - rho tau and
+# the two coincide at c = rho; `run_rho_sweep` checks exactly that.
+#
+# State: ell = initial-state LLR, a = P(j = NV- | i = NV-, data),
+# b = P(j = NV- | i = NV0, data). Decisions at epochs k dt; the record enters
+# through the exact photon COUNT in each bin, so the DP is exact for binned
+# observation up to grid interpolation and tends to the event-time problem as
+# dt -> 0. Recursion: V_K = H = max(sigma(ell), 1 - sigma(ell)),
+# C_k = c (1 - e^{-rho dt}) / rho + e^{-rho dt} E[V_{k+1} | state],
+# V_k = max(H, C_k); stop at the first k with C_k - H <= tol.
+#
+# Sign convention (v1.8's note, kept): rho > 0 pushes toward EARLIER stopping
+# only because the terminal quantity is a reward. Discounting a terminal COST
+# would make waiting look cheaper -- the opposite effect.
+
+RHO_SWEEP_VALUES_KHZ = tuple([0.0] + [float(x) for x in np.geomspace(0.3, 300.0, 13)])
+# v1.8's default bin is 1 us at 228 kHz (the moderate point): lambda_max dt =
+# 0.228. Other points keep that photon number per bin rather than the bin
+# width, so high flux bins at 0.42 us and the sparse point at 10 us.
+RHO_REF_LAMBDA_DT = 0.22809
+RHO_N_LLR = 97
+RHO_N_CURRENT = 41
+RHO_LLR_MAX = 12.0
+RHO_STOP_TOLERANCE = 1.0e-6
+
+
+def _rho_generators(params: MMPPParams) -> tuple[np.ndarray, np.ndarray]:
+    """Q (for column probability vectors, dp/dt = Q p) and Lambda, from rates."""
+    gm0 = float(params.gamma_minus_to_zero_khz)
+    g0m = float(params.gamma_zero_to_minus_khz)
+    Q = np.array([[-gm0, g0m], [gm0, -g0m]], dtype=float)
+    Lam = np.diag([float(params.lambda_minus_khz), float(params.lambda_zero_khz)])
+    return Q, Lam
+
+
+def rho_photon_count_matrices(
+    params: MMPPParams, dt_ms: float, n_max: int
+) -> tuple[np.ndarray, float]:
+    """
+    M[n][j', j] = P(current state j' at t + dt and n photons in the bin |
+    current state j at t), n = 0..n_max, from the exponential of the
+    counting-augmented generator. Returns (M, worst-case truncated mass of
+    more than n_max photons). v1.8 `photon_count_transition_matrices`.
+    """
+    from scipy.linalg import expm
+
+    params.validate()
+    if dt_ms <= 0:
+        raise ValueError("dt_ms must be > 0.")
+    if int(n_max) < 1:
+        raise ValueError("n_max must be >= 1.")
+    n_max = int(n_max)
+    Q, Lam = _rho_generators(params)
+    size = 2 * (n_max + 1)
+    G = np.zeros((size, size), dtype=float)
+    for n in range(n_max + 1):
+        s = slice(2 * n, 2 * n + 2)
+        G[s, s] = Q - Lam
+        if n < n_max:
+            G[2 * (n + 1):2 * (n + 1) + 2, s] = Lam
+    E = expm(G * float(dt_ms))
+    M = np.empty((n_max + 1, 2, 2), dtype=float)
+    for n in range(n_max + 1):
+        M[n] = E[2 * n:2 * n + 2, 0:2]
+    M[M < 0.0] = 0.0
+    kept = np.sum(M, axis=(0, 1))
+    return M, max(float(np.max(1.0 - kept)), 0.0)
+
+
+def _rho_interp_weights(grids, points) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Flat node indices (N, 6) and weights (N, 6): linear in ell times
+    barycentric on triangles in (a, b), every square cell split along a = b.
+    Points are clamped to the grid box. v1.8 `_interp_weights`.
+
+    The split matters: a = b is the information-exhausted manifold (both
+    hypotheses predict the same current state, so no future photon separates
+    them) and it is invariant under the exact update. Bilinear interpolation
+    would mix off-diagonal nodes into points on it, inject fictitious
+    information and bias the value upward step after step.
+    """
+    g_ell, g_a, g_b = grids
+    if g_a.size != g_b.size or not np.allclose(g_a, g_b):
+        raise ValueError("a and b grids must be identical.")
+
+    def locate(g, x):
+        x = np.clip(np.asarray(x, dtype=float), g[0], g[-1])
+        step = (g[-1] - g[0]) / (g.size - 1)
+        i = np.clip(np.floor((x - g[0]) / step).astype(np.int64), 0, g.size - 2)
+        return i, np.clip((x - g[i]) / step, 0.0, 1.0)
+
+    ie, fe = locate(g_ell, points[0])
+    ia, fa = locate(g_a, points[1])
+    ib, fb = locate(g_b, points[2])
+    n = g_a.size
+    upper = fa >= fb
+    zero, one = np.zeros_like(ia), np.ones_like(ia)
+    verts = (
+        (zero, zero, np.where(upper, 1.0 - fa, 1.0 - fb)),
+        (np.where(upper, 1, 0), np.where(upper, 0, 1), np.abs(fa - fb)),
+        (one, one, np.where(upper, fb, fa)),
+    )
+    idx, wts = [], []
+    for de, we in ((0, 1.0 - fe), (1, fe)):
+        for da, db, wv in verts:
+            idx.append((ie + de) * (n * n) + (ia + da) * n + (ib + db))
+            wts.append(we * wv)
+    return np.stack(idx, axis=1), np.stack(wts, axis=1)
+
+
+def _rho_posterior_update(ell, a, b, Mn):
+    """
+    Exact Bayes update of (ell, a, b) after one bin with transition matrix Mn
+    (one 2x2, or one per point with shape (N, 2, 2)). Returns
+    (ell', a', b', P(n | ell, a, b)). v1.8 `_posterior_update`.
+    """
+    if Mn.ndim == 2:
+        m00, m01, m10, m11 = Mn[0, 0], Mn[0, 1], Mn[1, 0], Mn[1, 1]
+    else:
+        m00, m01, m10, m11 = Mn[:, 0, 0], Mn[:, 0, 1], Mn[:, 1, 0], Mn[:, 1, 1]
+    u0_minus = m00 * a + m01 * (1.0 - a)
+    u0_zero = m10 * a + m11 * (1.0 - a)
+    L_minus = np.maximum(u0_minus + u0_zero, 1.0e-300)
+    u1_minus = m00 * b + m01 * (1.0 - b)
+    u1_zero = m10 * b + m11 * (1.0 - b)
+    L_zero = np.maximum(u1_minus + u1_zero, 1.0e-300)
+    ell_new = ell + np.log(L_minus) - np.log(L_zero)
+    s = _sigmoid(ell)
+    return ell_new, u0_minus / L_minus, u1_minus / L_zero, s * L_minus + (1.0 - s) * L_zero
+
+
+def build_rho_kernel(
+    params: MMPPParams,
+    dt_ms: float,
+    llr_max: float = RHO_LLR_MAX,
+    n_llr: int = RHO_N_LLR,
+    n_current: int = RHO_N_CURRENT,
+    n_max: int | None = None,
+    tail_tolerance: float = 1.0e-12,
+) -> dict:
+    """
+    One-step expectation operator (K V)(x) = sum_n P(n | x) V(x'_n) on the
+    (ell, a, b) grid, as a sparse matrix of interpolation weights. The model
+    is time-homogeneous, so it is built once and reused for every epoch and
+    every rho. v1.8 `build_optimal_stopping_kernel`.
+    """
+    from scipy import sparse
+
+    if n_max is None:
+        n_max = 4
+        while True:
+            _, tail = rho_photon_count_matrices(params, dt_ms, n_max)
+            if tail < tail_tolerance or n_max > 200:
+                break
+            n_max += 2
+    M, tail = rho_photon_count_matrices(params, dt_ms, int(n_max))
+    ell_grid = np.linspace(-float(llr_max), float(llr_max), int(n_llr))
+    a_grid = np.linspace(0.0, 1.0, int(n_current))
+    grids = (ell_grid, a_grid, a_grid)
+    E, A, B = np.meshgrid(ell_grid, a_grid, a_grid, indexing="ij")
+    ell, a, b = E.ravel(), A.ravel(), B.ravel()
+    n_points = ell.size
+    rows, cols, vals = [], [], []
+    prob_total = np.zeros(n_points)
+    for n in range(M.shape[0]):
+        ell_n, a_n, b_n, p_n = _rho_posterior_update(ell, a, b, M[n])
+        prob_total += p_n
+        idx, w = _rho_interp_weights(grids, (ell_n, a_n, b_n))
+        rows.append(np.repeat(np.arange(n_points), idx.shape[1]))
+        cols.append(idx.ravel())
+        vals.append((w * p_n[:, None]).ravel())
+    K = sparse.csr_matrix(
+        (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n_points, n_points),
+    )
+    # Renormalise rows to remove the (tiny) photon-number truncation.
+    K = sparse.diags(1.0 / prob_total) @ K
+    return {
+        "params": params,
+        "dt_ms": float(dt_ms),
+        "n_max": int(n_max),
+        "tail_mass": float(tail),
+        "grids": grids,
+        "grid_shape": E.shape,
+        "K": K.tocsr(),
+        "terminal_reward": np.maximum(_sigmoid(ell), 1.0 - _sigmoid(ell)),
+    }
+
+
+def solve_rho_stopping(
+    kernel: dict,
+    horizon_ms: float,
+    rho_khz: float,
+    running_reward_per_ms: float = 0.0,
+) -> dict:
+    """
+    Backward induction for one rho. Stores the margin D_k = C_k - H at every
+    epoch (float32) so the policy can be applied to records.
+    v1.8 `solve_finite_horizon_stopping`.
+    """
+    rho = float(rho_khz)
+    c = float(running_reward_per_ms)
+    if not np.isfinite(rho) or rho < 0:
+        raise ValueError("rho_khz must be finite and >= 0.")
+    if c > 0:
+        import warnings
+
+        warnings.warn(
+            "running_reward_per_ms > 0 rewards waiting; the Lemma 4.2 "
+            "early-stopping guarantee then relies on rho > 0 alone."
+        )
+    dt = kernel["dt_ms"]
+    n_steps = int(round(float(horizon_ms) / dt))
+    if n_steps < 1:
+        raise ValueError("horizon_ms must be at least one dt.")
+    discount = np.exp(-rho * dt)
+    running = c * dt if rho == 0 else c * (1.0 - discount) / rho
+    K, H = kernel["K"], kernel["terminal_reward"]
+    V = H.copy()
+    margins = np.empty((n_steps, H.size), dtype=np.float32)
+    for k in range(n_steps - 1, -1, -1):
+        C = running + discount * (K @ V)
+        margins[k] = (C - H).astype(np.float32)
+        V = np.maximum(H, C)
+    return {
+        "rho_khz": rho,
+        "running_reward_per_ms": c,
+        "n_steps": n_steps,
+        "horizon_ms": n_steps * dt,
+        "margins": margins,
+        "value_at_grid": V,
+    }
+
+
+def _rho_interp_on_grid(kernel, values_flat, ell, a, b) -> np.ndarray:
+    idx, w = _rho_interp_weights(kernel["grids"], (ell, a, b))
+    return np.sum(np.asarray(values_flat, dtype=float)[idx] * w, axis=1)
+
+
+def rho_binned_counts(shots, dt_ms: float, n_steps: int) -> np.ndarray:
+    """Photons per decision bin [k dt, (k+1) dt), shape (n_shots, n_steps)."""
+    edges = np.arange(n_steps + 1, dtype=float) * float(dt_ms)
+    out = np.empty((len(shots), n_steps), dtype=np.int64)
+    for i, ts in enumerate(shots):
+        out[i] = np.diff(np.searchsorted(np.asarray(ts, dtype=float), edges, side="left"))
+    return out
+
+
+def _rho_discounted(tau_ms, correct, rho_khz: float, c: float) -> np.ndarray:
+    """Per-shot int_0^tau e^{-rho t} c dt + e^{-rho tau} 1{correct}."""
+    tau_ms = np.asarray(tau_ms, dtype=float)
+    rho = float(rho_khz)
+    running = c * tau_ms if rho == 0 else c * (1.0 - np.exp(-rho * tau_ms)) / rho
+    return running + np.exp(-rho * tau_ms) * np.asarray(correct, dtype=float)
+
+
+def apply_rho_policy(
+    kernel: dict,
+    solution: dict,
+    counts: np.ndarray,
+    labels: np.ndarray,
+    stop_tolerance: float = RHO_STOP_TOLERANCE,
+) -> dict:
+    """
+    Run the rho-optimal policy on binned records: stop at the first epoch
+    with C_k - H <= stop_tolerance (always at T). stop_tolerance = 0 is the
+    earliest optimal stopping time; a small positive value is the paper's
+    eps-optimal U_eps and keeps rho = 0 robust to round-off. v1.8
+    `apply_stopping_policy`, returning the per-shot quantities as well so the
+    bootstrap can pair them with the other rules on the same shots.
+    """
+    params = kernel["params"]
+    dt = kernel["dt_ms"]
+    n_steps = solution["n_steps"]
+    rho = solution["rho_khz"]
+    c = solution["running_reward_per_ms"]
+    counts = np.asarray(counts, dtype=np.int64)[:, :n_steps]
+    n_shots = counts.shape[0]
+    max_count = int(np.max(counts)) if counts.size else 0
+    M_eval, _ = rho_photon_count_matrices(params, dt, max(max_count, 1) + 1)
+    ell, a, b = np.zeros(n_shots), np.ones(n_shots), np.zeros(n_shots)
+    active = np.ones(n_shots, dtype=bool)
+    stop_step = np.full(n_shots, n_steps, dtype=np.int64)
+    ell_at_stop = np.zeros(n_shots)
+    for k in range(n_steps):
+        idx = np.flatnonzero(active)
+        if idx.size == 0:
+            break
+        margin = _rho_interp_on_grid(
+            kernel, solution["margins"][k], ell[idx], a[idx], b[idx]
+        )
+        stop_now = margin <= float(stop_tolerance)
+        stopped = idx[stop_now]
+        stop_step[stopped] = k
+        ell_at_stop[stopped] = ell[stopped]
+        active[stopped] = False
+        go = idx[~stop_now]
+        if go.size:
+            ell[go], a[go], b[go], _ = _rho_posterior_update(
+                ell[go], a[go], b[go], M_eval[counts[go, k]]
+            )
+    ell_at_stop[active] = ell[active]
+    tau_ms = stop_step * dt
+    predictions = np.where(ell_at_stop >= 0.0, 0, 1)
+    labels = np.asarray(labels, dtype=int)
+    correct = predictions == labels
+    realized = _rho_discounted(tau_ms, correct, rho, c)
+    # Rao-Blackwellised objective: the posterior probability the call is
+    # right, max(sigma, 1 - sigma), in place of the 0/1 outcome. Unbiased when
+    # the filter is the true posterior and much tighter than the label
+    # version, so it is the one to hold against the DP's own value V_0.
+    p_right = np.maximum(_sigmoid(ell_at_stop), 1.0 - _sigmoid(ell_at_stop))
+    rb = _rho_discounted(tau_ms, p_right, rho, c)
+    return {
+        "tau_ms": tau_ms,
+        "predictions": predictions,
+        "correct": correct,
+        "realized": realized,
+        "fidelity": balanced_fidelity(labels, predictions),
+        "mean_tau_us": 1000.0 * float(np.mean(tau_ms)),
+        "median_tau_us": 1000.0 * float(np.median(tau_ms)),
+        "fraction_at_horizon": float(np.mean(stop_step == n_steps)),
+        "objective": float(np.mean(realized)),
+        "objective_posterior": float(np.mean(rb)),
+    }
+
+
+def rho_dt_us(params: MMPPParams, horizon_us: float) -> float:
+    """Decision bin holding lambda_max dt at v1.8's default and dividing T."""
+    lam = max(params.lambda_minus_khz, params.lambda_zero_khz) / 1000.0
+    n = max(int(round(float(horizon_us) * lam / RHO_REF_LAMBDA_DT)), 20)
+    return float(horizon_us) / n
+
+
+def _select_on_calibration(cal_obj: np.ndarray) -> int:
+    """Index of the best configuration on calibration (first on ties)."""
+    return int(np.argmax(np.asarray(cal_obj, dtype=float)))
+
+
+def run_rho_sweep(
+    point: OperatingPoint,
+    cfg: RunConfig,
+    rho_values_khz: Sequence[float] = RHO_SWEEP_VALUES_KHZ,
+    dt_us: float | None = None,
+    running_reward_per_ms: float = 0.0,
+    n_llr: int = RHO_N_LLR,
+    n_current: int = RHO_N_CURRENT,
+    llr_max: float = RHO_LLR_MAX,
+    stop_tolerance: float = RHO_STOP_TOLERANCE,
+    with_adaptive: bool = True,
+    with_cost_dp: bool = True,
+    refine_factor: int = 4,
+) -> dict:
+    """
+    The rho sweep at one operating point: every rule scored by the SAME
+    discounted objective J(rho) = E[e^{-rho tau} 1{correct}] (+ running
+    reward), on the same test shots.
+
+        rho-DP           v1.8's optimum for J at this rho (binned counts)
+        HMM              fixed-length posterior called at P = 1/2 (v1.8's
+                         "fixed-time exact event-time MMPP"), t_R on cal
+        threshold        fixed-time count threshold, t_R on cal
+        adaptive count   (n_up, deadline) on cal              -- added here
+        adaptive SPRT    exact event-time (L, offset, deadline) on cal
+                                                               -- added here
+        cost-DP          the Bayes-risk optimum at c = rho per ms, a/c =
+                         1000/rho us: the linearised match, a check and not
+                         a competitor -- it optimises a different objective
+        rho-DP, dt/r     the same DP on bins refine_factor times finer: a
+                         convergence check. The DP is optimal only among
+                         rules that see binned counts and act on its epochs;
+                         where E[tau] is a few bins, grid-free rules can beat
+                         it, and this row shows how much of that is the bin.
+
+    "On cal" means the configuration maximising J on calibration shots is
+    scored on test, so every rule is tuned by the criterion it is judged by
+    (v1.8's protocol for the fixed-time rules, extended to the rest). Every
+    baseline also gets v1.8's trivial option of guessing at t = 0 (J = 1/2).
+    The DP needs no data. Intervals are paired stratified bootstraps over
+    test shots; nothing is selected on test, so they carry no selection bias.
+    """
+    t0 = time.time()
+    params = point.params
+    detector, noise = cfg.detector, cfg.noise
+    filter_params = _filter_params_for(params, detector, noise)
+    seed = int(cfg.seed) + 70_001 + int(point.seed_offset)
+    horizon_us = (
+        float(point.horizon_us) if point.horizon_us is not None
+        else choose_horizon_us(params)
+    )
+    dt_us = float(dt_us) if dt_us is not None else rho_dt_us(filter_params, horizon_us)
+    n_steps = int(round(horizon_us / dt_us))
+    dt_us = horizon_us / n_steps
+    dt_ms, horizon_ms = dt_us / 1000.0, horizon_us / 1000.0
+    rho_values = np.unique(np.asarray(rho_values_khz, dtype=float))
+    if np.any(~np.isfinite(rho_values)) or np.any(rho_values < 0):
+        raise ValueError("All rho values must be finite and >= 0.")
+    c = float(running_reward_per_ms)
+
+    cal_shots, cal_labels = simulate_balanced_dataset(
+        cfg.n_cal, horizon_ms, params, seed, detector, noise
+    )
+    test_shots, test_labels = simulate_balanced_dataset(
+        cfg.n_test, horizon_ms, params, seed + 7717, detector, noise
+    )
+    spec = build_no_click_spectral(filter_params)
+    cal_packed = pack_records(build_records(cal_shots, horizon_us, filter_params, spec), spec)
+    test_packed = pack_records(build_records(test_shots, horizon_us, filter_params, spec), spec)
+
+    # ---- per-shot (tau, correct) of every configuration of every rule ------
+    # Each family is a list of configurations; for each one we keep its cal
+    # and test stop times (ms) and correctness, so J at any rho is a mean.
+    t_floor_us = time_grid_floor_us(params, horizon_us)
+    times_us = np.unique(np.concatenate([
+        np.geomspace(t_floor_us, horizon_us, cfg.n_readout_times), [horizon_us]
+    ]))
+    families: dict[str, dict] = {}
+
+    def _add(name, cal_tau_ms, cal_corr, test_tau_ms, test_corr, configs):
+        # Prepend the immediate guess (tau = 0, call NV-): J = 1/2 exactly on
+        # a balanced set, the option the DP has and v1.8 grants fixed time.
+        z_cal = np.zeros((len(cal_labels), 1))
+        z_test = np.zeros((len(test_labels), 1))
+        families[name] = {
+            "cal_tau": np.hstack([z_cal, cal_tau_ms]),
+            "cal_corr": np.hstack([(cal_labels == 0)[:, None], cal_corr]).astype(float),
+            "test_tau": np.hstack([z_test, test_tau_ms]),
+            "test_corr": np.hstack([(test_labels == 0)[:, None], test_corr]).astype(float),
+            "configs": ["guess at t = 0"] + list(configs),
+        }
+
+    # threshold: per t_R the count cutoff is fitted on calibration (as `run`)
+    cal_counts = total_counts_at_times(cal_shots, times_us / 1000.0)
+    test_counts = total_counts_at_times(test_shots, times_us / 1000.0)
+    thr_cal = np.empty((len(cal_shots), times_us.size), dtype=bool)
+    thr_test = np.empty((len(test_shots), times_us.size), dtype=bool)
+    for j in range(times_us.size):
+        n_th, _ = optimize_count_threshold(cal_counts[:, j], cal_labels)
+        thr_cal[:, j] = np.where(cal_counts[:, j] >= n_th, 0, 1) == cal_labels
+        thr_test[:, j] = np.where(test_counts[:, j] >= n_th, 0, 1) == test_labels
+    tt_cal = np.tile(times_us / 1000.0, (len(cal_shots), 1))
+    tt_test = np.tile(times_us / 1000.0, (len(test_shots), 1))
+    _add("threshold", tt_cal, thr_cal, tt_test, thr_test,
+         [f"t_R = {t:.4g} us" for t in times_us])
+    # HMM: the same _hmm_correct `run` scores (LLR >= 0, no fitted cutoff)
+    _add("hmm", tt_cal, _hmm_correct(cal_packed, times_us, cal_labels),
+         tt_test, _hmm_correct(test_packed, times_us, test_labels),
+         [f"t_R = {t:.4g} us" for t in times_us])
+
+    deadlines_us = np.geomspace(4.0 * t_floor_us, horizon_us, cfg.n_deadlines)
+    if with_adaptive:
+        cal_clicks, test_clicks = click_time_matrix(cal_packed), click_time_matrix(test_packed)
+        max_n_up = int(min(cfg.max_n_up, max(3, np.percentile(test_packed.n_clicks, 99) + 1)))
+        cfgs, ct, cc, st, sc = [], [], [], [], []
+        for dl in deadlines_us:
+            for n_up in range(1, max_n_up + 1):
+                tc, pc = run_adaptive_count(cal_clicks, n_up, dl)
+                tt, pt = run_adaptive_count(test_clicks, n_up, dl)
+                ct.append(tc / 1000.0); cc.append(pc == cal_labels)
+                st.append(tt / 1000.0); sc.append(pt == test_labels)
+                cfgs.append(f"n_up = {n_up}, deadline {dl:.4g} us")
+        _add("count", np.column_stack(ct), np.column_stack(cc),
+             np.column_stack(st), np.column_stack(sc), cfgs)
+        cfgs, ct, cc, st, sc = [], [], [], [], []
+        for dl in deadlines_us:
+            for b in np.asarray(cfg.offsets, dtype=float):
+                for L in np.asarray(cfg.boundary_widths, dtype=float):
+                    if abs(float(b)) >= float(L):
+                        continue
+                    tc, pc = run_sprt(cal_packed, float(L), float(b), float(dl))
+                    tt, pt = run_sprt(test_packed, float(L), float(b), float(dl))
+                    ct.append(tc / 1000.0); cc.append(pc == cal_labels)
+                    st.append(tt / 1000.0); sc.append(pt == test_labels)
+                    cfgs.append(f"L = {L:.3g}, offset {b:+.2g}, deadline {dl:.4g} us")
+        _add("sprt", np.column_stack(ct), np.column_stack(cc),
+             np.column_stack(st), np.column_stack(sc), cfgs)
+    if cfg.verbose:
+        print(f"  baselines on {len(cal_shots)} cal + {len(test_shots)} test shots "
+              f"[{time.time() - t0:.0f}s]")
+
+    # ---- the rho-DP, at v1.8's bin and refine_factor times finer -----------
+    dps_setup = {}
+    for key, fac in (("rho_dp", 1), ("rho_dp_fine", int(refine_factor))):
+        if key == "rho_dp_fine" and fac <= 1:
+            continue
+        ker = build_rho_kernel(filter_params, dt_ms / fac, llr_max, n_llr, n_current)
+        dps_setup[key] = (ker, rho_binned_counts(test_shots, dt_ms / fac, n_steps * fac))
+        if cfg.verbose:
+            print(f"  {key} kernel: grid {ker['grid_shape']}, dt = {dt_us / fac:.4g} us "
+                  f"({n_steps * fac} epochs), photons/bin <= {ker['n_max']} "
+                  f"(tail {ker['tail_mass']:.1e}) [{time.time() - t0:.0f}s]")
+    kernel = dps_setup["rho_dp"][0]
+
+    # ---- the cost-formulation optimum at c = rho (linearised check) ---------
+    cost_dp = {}
+    if with_cost_dp and np.any(rho_values > 0):
+        cdt = optimal_dp_step_us(filter_params, horizon_us)
+        if horizon_us / cdt <= 5000:
+            chunks = optimal_dp_paths(test_shots, test_labels, filter_params,
+                                      horizon_us, cdt, spec)
+            for rho in rho_values[rho_values > 0]:
+                econ = Economics(cost_per_us=float(rho) / 1000.0)
+                dp = solve_optimal_dp(filter_params, horizon_us, econ, dt_us=cdt)
+                st_o, pr_o, _ = evaluate_optimal_dp(dp, chunks)
+                cost_dp[float(rho)] = (st_o / 1000.0, (pr_o == test_labels), dp.risk)
+            del chunks
+
+    boots = stratified_bootstrap_indices(test_labels, cfg.n_boot, seed + 991)
+
+    def _boot(x):
+        x = np.asarray(x, dtype=float)
+        v = np.array([0.5 * (x[i0].mean() + x[i1].mean()) for i0, i1 in boots])
+        return float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))
+
+    prior = (np.array([0.0]), np.array([1.0]), np.array([0.0]))
+    rows = []
+    for rho in rho_values:
+        dp = None
+        for key, (ker, bins) in dps_setup.items():
+            sol = solve_rho_stopping(ker, horizon_ms, rho, c)
+            res_k = apply_rho_policy(ker, sol, bins, test_labels, stop_tolerance)
+            v0_k = float(_rho_interp_on_grid(ker, sol["value_at_grid"], *prior)[0])
+            del sol
+            if key == "rho_dp":
+                dp, v0 = res_k, v0_k
+            lo, hi = _boot(res_k["realized"])
+            glo, ghi = _boot(res_k["realized"] - dp["realized"])
+            rows.append({
+                "rho_khz": float(rho), "method": key,
+                "config": f"dt = {1000.0 * ker['dt_ms']:.4g} us",
+                "objective": res_k["objective"], "objective_ci_low": lo,
+                "objective_ci_high": hi,
+                "gap_vs_dp": float((res_k["realized"] - dp["realized"]).mean()),
+                "gap_ci_low": glo, "gap_ci_high": ghi,
+                "fidelity": res_k["fidelity"], "mean_tau_us": res_k["mean_tau_us"],
+                "median_tau_us": res_k["median_tau_us"],
+                "fraction_at_horizon": res_k["fraction_at_horizon"],
+                "dp_value_at_prior": v0_k,
+                "objective_posterior": res_k["objective_posterior"],
+            })
+        for name, fam in families.items():
+            j = _select_on_calibration(
+                _rho_discounted(fam["cal_tau"], fam["cal_corr"], rho, c).mean(axis=0)
+            )
+            r = _rho_discounted(fam["test_tau"][:, j], fam["test_corr"][:, j], rho, c)
+            lo, hi = _boot(r)
+            glo, ghi = _boot(r - dp["realized"])
+            tau_us = 1000.0 * fam["test_tau"][:, j]
+            rows.append({
+                "rho_khz": float(rho), "method": name, "config": fam["configs"][j],
+                "objective": float(r.mean()), "objective_ci_low": lo, "objective_ci_high": hi,
+                "gap_vs_dp": float((r - dp["realized"]).mean()),
+                "gap_ci_low": glo, "gap_ci_high": ghi,
+                "fidelity": balanced_fidelity(test_labels, np.where(
+                    fam["test_corr"][:, j] > 0.5, test_labels, 1 - test_labels)),
+                "mean_tau_us": float(tau_us.mean()),
+                "median_tau_us": float(np.median(tau_us)),
+                "fraction_at_horizon": float(np.mean(tau_us >= horizon_us - 1e-9)),
+            })
+        if float(rho) in cost_dp:
+            st_o, corr_o, risk = cost_dp[float(rho)]
+            r = _rho_discounted(st_o, corr_o, rho, c)
+            lo, hi = _boot(r)
+            glo, ghi = _boot(r - dp["realized"])
+            rows.append({
+                "rho_khz": float(rho), "method": "cost_dp",
+                "config": f"a/c = {1000.0 / rho:.4g} us (c = rho)",
+                "objective": float(r.mean()), "objective_ci_low": lo, "objective_ci_high": hi,
+                "gap_vs_dp": float((r - dp["realized"]).mean()),
+                "gap_ci_low": glo, "gap_ci_high": ghi,
+                "fidelity": balanced_fidelity(test_labels, np.where(
+                    corr_o, test_labels, 1 - test_labels)),
+                "mean_tau_us": float(1000.0 * st_o.mean()),
+                "median_tau_us": float(1000.0 * np.median(st_o)),
+                "fraction_at_horizon": float(np.mean(1000.0 * st_o >= horizon_us - 1e-9)),
+                "cost_dp_risk_star": float(risk),
+            })
+        if cfg.verbose:
+            by = {r["method"]: r for r in rows if r["rho_khz"] == float(rho)}
+            inv = "inf" if rho == 0 else f"{1000.0 / rho:.3g}"
+            print(
+                f"  rho = {rho:8.4g} kHz (1/rho = {inv:>6} us) | DP F = "
+                f"{by['rho_dp']['fidelity']:.4f}, <tau> = {by['rho_dp']['mean_tau_us']:7.2f} us, "
+                f"at T {100 * by['rho_dp']['fraction_at_horizon']:5.1f}%, J = "
+                f"{by['rho_dp']['objective']:.4f} (V0 {v0:.4f}, RB "
+                f"{by['rho_dp']['objective_posterior']:.4f}) | J: "
+                + ", ".join(f"{k} {by[k]['objective']:.4f}" for k in by if k != "rho_dp")
+            )
+
+    # Curves for the figure: test F(t) of the fixed-time rules, and the
+    # (mean tau, F) clouds of the adaptive families on test.
+    curves = {
+        "times_us": times_us,
+        "F_threshold": np.array([balanced_fidelity(test_labels, np.where(
+            thr_test[:, j], test_labels, 1 - test_labels)) for j in range(times_us.size)]),
+        "F_hmm": np.array([balanced_fidelity(test_labels, np.where(
+            families["hmm"]["test_corr"][:, 1 + j] > 0.5, test_labels, 1 - test_labels))
+            for j in range(times_us.size)]),
+    }
+    return {
+        "name": point.name,
+        "label": point.label,
+        "params": params,
+        "filter_params": filter_params,
+        "detector": detector,
+        "noise": noise,
+        "regime": regime_summary(params),
+        "power_uw": point.power_uw,
+        "detection_efficiency": point.detection_efficiency,
+        "horizon_us": horizon_us,
+        "dt_us": dt_us,
+        "n_steps": n_steps,
+        "running_reward_per_ms": c,
+        "stop_tolerance": float(stop_tolerance),
+        "grid_shape": tuple(int(x) for x in kernel["grid_shape"]),
+        "llr_max": float(llr_max),
+        "n_max": kernel["n_max"],
+        "tail_mass": kernel["tail_mass"],
+        "rho_khz": rho_values,
+        "refine_factor": int(refine_factor),
+        "rows": rows,
+        "curves": curves,
+        "seed": seed,
+        "n_cal_per_state": cfg.n_cal,
+        "n_test_per_state": cfg.n_test,
+        "n_boot": cfg.n_boot,
+        "module_version": MODULE_VERSION,
+        "physics_layer": PHYSICS_LAYER,
+        "runtime_s": time.time() - t0,
+    }
+
+
+_RHO_METHODS = (
+    # key, label, style, colour
+    ("rho_dp", r"$\rho$-optimal DP (L&S Eq. 1.5)", "-o", "k"),
+    ("rho_dp_fine", r"$\rho$-DP on 4x finer bins (convergence)", "--o", "0.55"),
+    ("hmm", "HMM, fixed length (P > 1/2)", "-s", "C0"),
+    ("threshold", "fixed-time count threshold", ":o", "0.45"),
+    ("count", "adaptive count SPRT", "--^", "C1"),
+    ("sprt", "adaptive MMPP SPRT (exact)", "-d", "C3"),
+    ("cost_dp", "cost-formulation L&S, c = $\\rho$ (check)", "none", "C5"),
+)
+
+
+def plot_rho_sweep(result: dict, save_path: str | None = None):
+    """
+    (a) fidelity vs mean readout time, with the rho-DP points over the
+    fixed-time curves; (b) J(rho) for every rule; (c) each rule's J minus the
+    rho-DP's, with paired 95% CIs; (d) mean stopping / chosen readout time;
+    (e) fidelity at the rho-chosen setting; (f) sanity checks.
+    """
+    plt = _pyplot()
+    rows = result["rows"]
+    rho = np.asarray(result["rho_khz"], dtype=float)
+    pos = rho > 0
+    by = {k: [next((r for r in rows if r["rho_khz"] == x and r["method"] == k), None)
+              for x in rho] for k, *_ in _RHO_METHODS}
+
+    def col(k, f):
+        return np.array([np.nan if r is None else r.get(f, np.nan) for r in by[k]], float)
+
+    fig, axes = plt.subplots(2, 3, figsize=(20.0, 11.5))
+    ax = axes[0, 0]
+    cv = result["curves"]
+    ax.plot(cv["times_us"], cv["F_threshold"], ":", color="0.45", lw=1.6,
+            label="fixed-time count threshold")
+    ax.plot(cv["times_us"], cv["F_hmm"], "-", color="C0", lw=1.6,
+            label="HMM, fixed length (P > 1/2)")
+    sc = ax.scatter(col("rho_dp", "mean_tau_us")[pos], col("rho_dp", "fidelity")[pos],
+                    c=np.log10(rho[pos]), cmap="viridis", s=46, zorder=4,
+                    label=r"$\rho$-optimal DP (mean $\tau$)")
+    if np.any(~pos):
+        ax.scatter(col("rho_dp", "mean_tau_us")[~pos], col("rho_dp", "fidelity")[~pos],
+                   marker="*", s=180, color="k", zorder=5, label=r"$\rho$ = 0")
+    for k, lab, st, colr in _RHO_METHODS[4:]:
+        x, y = col(k, "mean_tau_us"), col(k, "fidelity")
+        m = np.isfinite(x) & (x > 0)
+        if m.any():
+            ax.plot(x[m], y[m], "o" if k == "cost_dp" else st[-1], mfc="none",
+                    color=colr, ms=6, ls="none", label=lab + r", $\rho$-chosen")
+    fig.colorbar(sc, ax=ax).set_label(r"$\log_{10}\,\rho$ (kHz)")
+    ax.set_xscale("log")
+    ax.set_xlabel(r"readout time $t_R$, or mean stopping time (us)")
+    ax.set_ylabel("balanced initial-state fidelity")
+    ax.set_title("(a) fidelity vs readout time", fontsize=11)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(alpha=0.25)
+
+    for ax, field, title, ylog in (
+        (axes[0, 1], "objective", r"(b) objective $J(\rho) = E[e^{-\rho\tau}\,1\{\rm correct\}]$", False),
+        (axes[0, 2], "gap_vs_dp", r"(c) $J$ minus the $\rho$-DP's, paired 95% CI", False),
+        (axes[1, 0], "mean_tau_us", r"(d) mean stopping time / chosen $t_R$ (us)", True),
+        (axes[1, 1], "fidelity", r"(e) fidelity at the $\rho$-chosen setting", False),
+    ):
+        for k, lab, st, colr in _RHO_METHODS:
+            if field == "gap_vs_dp" and k == "rho_dp":
+                continue
+            y = col(k, field)
+            m = pos & np.isfinite(y)
+            if not m.any():
+                continue
+            ls = "--" if k == "cost_dp" else st[:-1] or "-"
+            mk = "o" if k == "cost_dp" else st[-1]
+            ax.plot(rho[m], y[m], ls=ls, marker=mk, color=colr, ms=5,
+                    mfc="none" if k in ("cost_dp", "rho_dp_fine") else colr,
+                    lw=1.6 if k != "rho_dp" else 2.2, label=lab)
+            if field in ("objective", "gap_vs_dp"):
+                lo_f, hi_f = ("objective_ci_low", "objective_ci_high") if field == "objective" \
+                    else ("gap_ci_low", "gap_ci_high")
+                lo, hi = col(k, lo_f), col(k, hi_f)
+                g = m & np.isfinite(lo) & np.isfinite(hi)
+                ax.fill_between(rho[g], lo[g], hi[g], color=colr, alpha=0.12, lw=0)
+        if field == "objective":
+            v0 = col("rho_dp", "dp_value_at_prior")
+            ax.plot(rho[pos], v0[pos], ":", color="k", lw=1.0, label=r"DP value $V_0$ (check)")
+        if field == "gap_vs_dp":
+            ax.axhline(0.0, color="k", lw=0.8)
+        if field == "mean_tau_us":
+            ax.plot(rho[pos], col("rho_dp", "median_tau_us")[pos], "o:", color="k",
+                    alpha=0.6, ms=4, label=r"$\rho$-DP median $\tau$")
+        ax.set_xscale("log")
+        if ylog:
+            ax.set_yscale("log")
+        ax.set_xlabel(r"discount rate $\rho$ (kHz)")
+        ax.set_title(title, fontsize=11)
+        ax.grid(alpha=0.25, which="both" if ylog else "major")
+        ax.legend(fontsize=7.5)
+
+    ax = axes[1, 2]
+    ax.axis("off")
+    d0 = by["rho_dp"][int(np.argmin(rho))]
+    lines = [
+        "settings",
+        f"  horizon T = {result['horizon_us']:.4g} us, bin dt = {result['dt_us']:.4g} us "
+        f"({result['n_steps']} epochs)",
+        f"  posterior grid (ell, a, b) = {result['grid_shape']}, |ell| <= {result['llr_max']:g}",
+        f"  photons per bin <= {result['n_max']} (tail {result['tail_mass']:.1e})",
+        f"  running reward c = {result['running_reward_per_ms']:g} per ms, "
+        f"stop tolerance {result['stop_tolerance']:g}",
+        f"  {result['n_cal_per_state']} cal + {result['n_test_per_state']} test shots "
+        f"per state, {result['n_boot']} paired bootstrap resamples",
+        "",
+        "checks",
+        f"  rho = {rho.min():g}: F = {d0['fidelity']:.4f} vs fixed-length HMM at T "
+        f"{result['curves']['F_hmm'][-1]:.4f},",
+        f"    mean tau {d0['mean_tau_us']:.1f} us: with eps = {result['stop_tolerance']:g} "
+        f"a shot stops once reading on",
+        f"    can gain < eps ({100 * d0['fraction_at_horizon']:.1f}% reach T; Remark 4.4's "
+        "run-to-T is eps = 0)",
+    ]
+    dv = [abs(r["dp_value_at_prior"] - r["objective_posterior"]) for r in by["rho_dp"] if r]
+    lines.append(f"  |V_0 - posterior-averaged J|: max {max(dv):.4f} over rho")
+    dv2 = [abs(r["dp_value_at_prior"] - r["objective"]) for r in by["rho_dp"] if r]
+    lines.append(f"  |V_0 - realised J|: max {max(dv2):.4f} (includes MC noise)")
+    worst = max((r["gap_vs_dp"], r["method"], r["rho_khz"]) for r in rows
+                if r["method"] not in ("rho_dp", "rho_dp_fine"))
+    lines.append(f"  largest J gain of any rule over the DP: {worst[0]:+.4f}")
+    lines.append(f"    ({worst[1]}, rho = {worst[2]:.3g} kHz)")
+    fine = [r for r in rows if r["method"] == "rho_dp_fine"]
+    if fine:
+        g = max(fine, key=lambda r: r["gap_vs_dp"])
+        lines.append(f"  4x finer bins raise J by up to {g['gap_vs_dp']:+.4f} "
+                     f"(rho = {g['rho_khz']:.3g} kHz)")
+    ax.text(0.0, 1.0, "\n".join(lines), va="top", ha="left", family="monospace",
+            fontsize=9, transform=ax.transAxes)
+
+    det = result["detector"]
+    fig.suptitle(
+        f"rho sweep (Ludkovski & Sezer Eq. 1.5): {result['label']}  --  "
+        f"{det.describe() if hasattr(det, 'describe') else det}", fontsize=12,
+    )
+    fig.tight_layout(rect=(0, 0.035, 1, 0.96))
+    fig.text(0.5, 0.008, _rates_and_power_text([result]), ha="center", va="bottom",
+             fontsize=11)
+    if save_path:
+        fig.savefig(save_path, dpi=140, bbox_inches="tight")
+    return fig
+
+
+_RHO_CSV_COLUMNS = [
+    "experiment", "detector", "physics_layer", "point_index", "point",
+    "power_uw", "detection_efficiency", "horizon_us", "dt_us",
+    "running_reward_per_ms", "n_test_per_state", "rho_khz", "inv_rho_us",
+    "method", "config", "objective", "objective_ci_low", "objective_ci_high",
+    "gap_vs_dp", "gap_ci_low", "gap_ci_high", "fidelity", "mean_tau_us",
+    "median_tau_us", "fraction_at_horizon", "dp_value_at_prior",
+    "objective_posterior", "cost_dp_risk_star",
+]
+
+
+def export_rho_csv(results: list[dict], spec: SweepSpec, directory: Path) -> list[Path]:
+    fp = directory / "rho_sweep.csv"
+    with open(fp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_RHO_CSV_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for res in results:
+            det = res["detector"]
+            for r in res["rows"]:
+                w.writerow({
+                    "experiment": spec.key,
+                    "detector": det.tag() if hasattr(det, "tag") else str(det),
+                    "physics_layer": res["physics_layer"],
+                    "point_index": res.get("point_index", ""),
+                    "point": res["name"],
+                    "power_uw": res["power_uw"],
+                    "detection_efficiency": res["detection_efficiency"],
+                    "horizon_us": res["horizon_us"],
+                    "dt_us": res["dt_us"],
+                    "running_reward_per_ms": res["running_reward_per_ms"],
+                    "n_test_per_state": res["n_test_per_state"],
+                    "inv_rho_us": (1000.0 / r["rho_khz"]) if r["rho_khz"] > 0 else np.inf,
+                    **r,
+                })
+    return [fp]
+
+
+def cmd_rho(args: argparse.Namespace) -> int:
+    spec = _resolve_spec(args.experiment)
+    cfg = config_from_args(args, spec)
+    points = spec.build_points(cfg)
+    wanted = _selected_indices(args.point, len(points))
+    directory = run_directory(
+        spec, Path(args.out), cfg.detector, cfg.noise, cfg.efficiency_model
+    ) / "rho"
+    directory.mkdir(parents=True, exist_ok=True)
+    rho_values = (
+        RHO_SWEEP_VALUES_KHZ if args.rho_values is None
+        else [float(x) for x in args.rho_values.split(",")]
+    )
+    results = []
+    if args.from_saved:
+        # Re-plot and re-export the selected points from their pickles --
+        # how points run as separate processes are gathered into one CSV.
+        for i in wanted:
+            fp = directory / f"rho_{i:02d}_{points[i].name}.pkl"
+            if not fp.exists():
+                print(f"  {points[i].name}: no saved rho sweep")
+                continue
+            with open(fp, "rb") as f:
+                res = _from_plain(pickle.load(f))
+            results.append(res)
+            if not args.no_plot:
+                fig = plot_rho_sweep(res, str(directory / f"rho_{i:02d}_{points[i].name}.png"))
+                del fig
+        for fp in export_rho_csv(results, spec, directory):
+            print(f"wrote {fp}")
+        return 0 if results else 1
+    for i in wanted:
+        if cfg.verbose:
+            print(f"\n{'=' * 78}\nrho sweep: {points[i].label}\n{'=' * 78}")
+        res = run_rho_sweep(
+            points[i], cfg, rho_values_khz=rho_values, dt_us=args.dt_us,
+            running_reward_per_ms=args.running_reward,
+            n_llr=args.n_llr, n_current=args.n_current, llr_max=args.llr_max,
+            stop_tolerance=args.stop_tolerance,
+            with_adaptive=not args.no_adaptive, with_cost_dp=not args.no_cost_dp,
+            refine_factor=args.refine_factor,
+        )
+        res["point_index"] = i
+        results.append(res)
+        with open(directory / f"rho_{i:02d}_{points[i].name}.pkl", "wb") as f:
+            pickle.dump(_to_plain(res), f)
+        if not args.no_plot:
+            fig = plot_rho_sweep(res, str(directory / f"rho_{i:02d}_{points[i].name}.png"))
+            del fig
+        if cfg.verbose:
+            print(f"  done in {res['runtime_s']:.0f} s")
+    for fp in export_rho_csv(results, spec, directory):
+        print(f"\nwrote {fp}")
+    return 0
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     return 1 if validate_all() else 0
 
@@ -12457,6 +13440,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--no-plot", action="store_true")
     sp.set_defaults(func=cmd_noiserisk)
+
+    sp = sub.add_parser(
+        "rho",
+        help="discounted optimal stopping (L&S Eq. 1.5): sweep rho, every rule "
+             "scored by E[exp(-rho tau) 1{correct}]",
+    )
+    add_common(sp)
+    sp.add_argument("--point", default="all")
+    sp.add_argument("--quick", action="store_true", help="small fast smoke run")
+    sp.add_argument("--seed", type=int, default=None)
+    sp.add_argument("--n-cal", type=int, default=None)
+    sp.add_argument("--n-test", type=int, default=None)
+    sp.add_argument("--n-boot", type=int, default=None)
+    sp.add_argument(
+        "--rho-values", default=None,
+        help="comma-separated discount rates in kHz (default: 0 and 13 "
+             "log-spaced values from 0.3 to 300)",
+    )
+    sp.add_argument(
+        "--dt-us", type=float, default=None,
+        help="decision bin (default: lambda_max dt = 0.228, v1.8's 1 us at "
+             "the moderate point)",
+    )
+    sp.add_argument(
+        "--running-reward", type=float, default=0.0,
+        help="c in L&S Eq. 1.5, per ms; keep it <= 0 (a cost of waiting)",
+    )
+    sp.add_argument("--n-llr", type=int, default=RHO_N_LLR)
+    sp.add_argument("--n-current", type=int, default=RHO_N_CURRENT)
+    sp.add_argument("--llr-max", type=float, default=RHO_LLR_MAX)
+    sp.add_argument("--stop-tolerance", type=float, default=RHO_STOP_TOLERANCE)
+    sp.add_argument("--no-adaptive", action="store_true",
+                    help="skip the adaptive count and SPRT baselines")
+    sp.add_argument("--no-cost-dp", action="store_true",
+                    help="skip the cost-formulation L&S check")
+    sp.add_argument("--from-saved", action="store_true",
+                    help="re-plot and re-export saved points instead of running")
+    sp.add_argument("--refine-factor", type=int, default=4,
+                    help="also solve the DP on bins this many times finer "
+                         "(1 to skip)")
+    sp.add_argument("--no-plot", action="store_true")
+    sp.set_defaults(func=cmd_rho)
 
     sp = sub.add_parser("validate", help="run the numerical validation suite")
     sp.set_defaults(func=cmd_validate)

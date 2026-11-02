@@ -18,3 +18,4 @@ results/**/point_*.png
 # CSVs and figures under results/ are derived from them.
 results/**/optimal/*.pkl
 results/**/discard/*.pkl
+results/**/rho/*.pkl
