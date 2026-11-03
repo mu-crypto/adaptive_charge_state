@@ -974,6 +974,95 @@ evidence per click. The excess variance is real: it is what costs every rule
 here. But it is not mistaken for certainty, so the HMM degrades along with
 the threshold rather than below it.
 
+## The rho sweep: discounted optimal stopping (L&S Eq. 1.5)
+
+`rho demo` runs study 11 of `nv_charge_readout_master_v1_8` (its
+"rho_sweep"), ported unchanged. It optimises
+
+```
+J(rho) = E[ exp(-rho tau) 1{correct} ]
+```
+
+by backward induction on the posterior (ℓ, a, b): the initial-state LLR, and
+the current-state probability under each hypothesis. The record enters as
+exact photon counts per decision bin, with v1.8's grid of 97 × 41 × 41 and
+triangle-split interpolation. Every rule is scored by the same J on 7200
+test shots per state, with its setting chosen on calibration for that ρ.
+Each also gets the trivial option of guessing at t = 0, which scores J = ½.
+Gaps are paired bootstrap 95% intervals. ρ runs over 0 and 13 log-spaced
+values from 0.3 to 300 kHz. The decision bin keeps v1.8's 0.23 photons per
+bin: 1 µs at the moderate point, 0.42 µs at high flux and 10 µs at the sparse
+point.
+
+**At ρ = c = 0 the rule stops once nothing it could still see would change
+the call.** Its fidelity is that of reading to T:
+
+| point | fidelity | HMM at T | mean τ / T |
+|---|---|---|---|
+| high flux | 0.8953 | 0.8953 | 12.4 / 100 µs |
+| moderate | 0.9499 | 0.9498 | 35.2 / 250 µs |
+| sparse | 0.7969 | 0.7972 | 119 / 800 µs |
+
+The rule stops once the margin falls to ε = 10⁻⁶, so 0% of shots reach T.
+v1.8's docstring expects "essentially all shots run to the horizon" (Remark
+4.4). That describes an indifferent exact rule. Numerically the margin is
+zero on most of the grid, including at ε = 0, where 5% reach T on a 60 µs
+check with identical calls.
+
+**Where the decision bins are fine compared with the stopping time, the
+ρ-DP is the best rule.** No rule beats it at ρ ≤ 30 kHz at high flux,
+ρ ≤ 9.5 kHz at moderate flux and ρ ≤ 1.7 kHz at the sparse point. That holds
+until its mean τ falls to roughly 5–8 bins. In those ranges each rule's best
+J falls short of the DP's by:
+
+| rule | high flux | moderate | sparse |
+|---|---|---|---|
+| fixed-length HMM (P > ½) | −0.004 to −0.025 | −0.007 to −0.032 | −0.008 to −0.019 |
+| fixed-time count threshold | −0.015 to −0.025 | −0.010 to −0.032 | −0.011 to −0.021 |
+| adaptive count SPRT | −0.014 to −0.021 | −0.008 to −0.023 | −0.000 to −0.004 |
+| adaptive MMPP SPRT (exact) | +0.000 to −0.008 | −0.002 to −0.009 | −0.000 to −0.012 |
+
+The fixed-length rules lose most as ρ grows, because they cannot stop early
+on easy shots. Above a few kHz the HMM and the threshold make identical
+calls: at their short chosen t_R the count is the sufficient statistic, as
+in the HMM section.
+
+**Where the stopping time is only a few bins, the grid-free rules beat the
+binned DP.** The exact SPRT and the count rule stop at the click; the DP
+stops only on a bin boundary and sees only bin counts. Their lead is
+resolved at ρ ≥ 53 kHz at high flux, ρ ≥ 17 kHz at moderate flux and
+ρ ≥ 3 kHz at the sparse point, up to +0.012 in J. That is the bin, not the
+optimum. The same DP on 4× finer bins gains up to +0.0084 and leaves at most
++0.0036 to the best grid-free rule (moderate flux at 95 kHz, high flux at
+300 kHz). Through the
+range where the 1 µs DP was already best, the refinement moves J by
+−0.001 to +0.002.
+
+**The cost-formulation optimum is a check that holds where it should.**
+At cost ρ − c per ms it is the same problem as the ρ-DP when ρ = 0. With
+c = 0 it matches to first order only near fidelity 1, since the exact
+first-order cost is the state-dependent ρ·max(p, 1−p).
+
+- At small ρ it tracks the ρ-DP to within ±0.001.
+- At larger ρ it drifts by up to +0.004 at high flux and moderate flux.
+- It fails where the linearisation should fail. At moderate flux at 95 kHz
+  (−0.052), at the sparse point at 9.5 kHz (−0.053) and at high flux at
+  300 kHz (−0.031), its a/c of 1000/ρ µs falls below the cost problem's
+  immediate-stop threshold (10.7, 111 and 4.6 µs). So it guesses at t = 0
+  while the discounted problem still waits.
+
+With `--running-reward −2` (c < 0), the ρ = 0 row is the identical problem.
+There the binned DP's V₀ = 0.9164 matches the event-time solver's
+1 − R* = 0.9159.
+
+**The DP's own value is consistent with its realised policy.** V₀ at the
+prior differs from the posterior-averaged J of the applied policy by at
+most 0.0024, and from the realised J by at most 0.0037. That is grid
+interpolation error plus Monte Carlo noise. At ρ = 0 with c < 0, V₀ reads
+0.7% high against the exact solver, which is the upward bias of linearly
+interpolating a convex value. So the tables report the policy's realised J,
+never V₀.
+
 ## Bootstrap intervals
 
 Three different intervals appear in these results, and they are not
@@ -1059,6 +1148,11 @@ results/demo/ideal/optimal/
 results/demo/ideal/discard/
     discard_*.png                       the four-panel three-action figure
     discard_sweep.csv                   risk, retention, accuracy and yield vs w
+results/demo/ideal/rho/
+    rho_*.png                           the rho sweep: frontier, J(rho), gaps
+                                        to the rho-DP with CIs, times,
+                                        fidelities, checks
+    rho_sweep.csv                       one row per (point, rho, rule)
 results/demo/ideal/noiserisk/
     noiserisk_*.png                     6 panels: risk and degradation under
                                         each action set, the gap between them,
@@ -1115,13 +1209,14 @@ custom classes, so a bare `pickle.load` with no imports works.
 ## Reproducing
 
 ```bash
-python adaptive_charge_state_master.py validate                  # 99 checks
+python adaptive_charge_state_master.py validate                  # 105 checks
 python adaptive_charge_state_master.py run  <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py plot <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py export <experiment> --out results [detector flags]
 python adaptive_charge_state_master.py optimal demo --out results
 python adaptive_charge_state_master.py discard demo --out results
 python adaptive_charge_state_master.py noiserisk demo --out results
+python adaptive_charge_state_master.py rho demo --out results --n-test 7200 --n-boot 400
 python results/analysis.py
 ```
 
@@ -1134,4 +1229,7 @@ policy adds a little.
 before that step existed; it re-simulates the test shots, checks that one
 stored optimum column is reproduced, and rebuilds only the optimum's
 columns. `optimal demo` takes about 70 minutes with the exact DP at every
-a/c (about 10 with `--no-dp`).
+a/c (about 10 with `--no-dp`). `rho demo` takes 5–15 minutes per point
+single-threaded (the cost-formulation check and the 4x-finer DP are most
+of it; `--no-cost-dp` and `--refine-factor 1` drop them). Run the points as
+separate processes and gather them with `rho demo --from-saved`.

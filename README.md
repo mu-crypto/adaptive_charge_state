@@ -111,6 +111,45 @@ than a ceiling.
 
 See `results/README.md` for how far each rule sits from the optimum.
 
+### The discounted version: the rho sweep
+
+`rho` runs study 11 of `nv_charge_readout_master_v1_8` (its "rho_sweep"),
+ported unchanged into section 10f. It solves the other L&S formulation, their
+Eq. 1.5, which discounts a reward instead of charging a cost:
+
+```
+maximise   J(rho) = E[ exp(-rho tau) 1{correct} ]   (+ optional running reward c)
+```
+
+Here ρ (kHz) sets how fast a late answer loses value. The DP is exact for
+photon counts binned at its decision step dt: v1.8's 1 µs at the moderate
+point, held at λ_max·dt = 0.23 elsewhere. Every rule is scored by the same J
+on the same test shots, with its setting chosen on calibration for that ρ:
+
+- the fixed-length HMM and the fixed-time threshold (v1.8's baselines),
+- the adaptive count SPRT and the exact adaptive MMPP SPRT,
+- the same DP on 4× finer bins, as a convergence check,
+- the cost-formulation optimum at cost ρ − c, as a cross-check. To first
+  order it is the same problem when the fidelity is near 1, and exactly the
+  same at ρ = 0.
+
+```bash
+python adaptive_charge_state_master.py rho demo                      # 14 rho values, 3 points
+python adaptive_charge_state_master.py rho demo --rho-values 0,3,30 --point 1
+python adaptive_charge_state_master.py rho demo --running-reward -2  # c < 0: a cost of waiting
+```
+
+v1.8 is otherwise identical to the physics layer in use: every function this
+file imports is AST-identical, as are the rate laws. So the port changes
+nothing else. `validate` pins the port in six checks:
+
+- the transition matrices against the Poisson limit and quadrature,
+- the interpolation's invariant a = b manifold,
+- convergence of the binned posterior to the event-time LLR,
+- agreement with the independent event-time DP at ρ = 0, c < 0, to 0.7%,
+- the ε-optimal rule at ρ = c = 0,
+- the strict fall of V₀ with ρ.
+
 ## A third action: abandoning the shot
 
 A finite `cost_discard` adds a third terminal action, so the decision becomes
@@ -177,6 +216,9 @@ the field: with post-selection the best-to-worst spread falls from 40% to
 | `paper_noise_tau` | the noise model of Spethmann et al. (2025) — additive, Gaussian spectrum, one trace per state — sweeping T_c at SNR 3 |
 | `paper_noise_snr` | the same noise sweeping its SNR = Δλ/σ at T_c = 10 µs |
 
+The `rho` command, like `optimal`, `discard` and `noiserisk`, takes any
+experiment but is run and documented at the `demo` points.
+
 `efficiency` and `snr` both move the readout's information content, but along
 different axes: η scales SNR² and sparsity together, while the SNR sweep holds
 sparsity fixed and moves the dark rate alone. The `snr` sweep is what settles
@@ -190,7 +232,7 @@ the LLR and is absorbed by the calibrated boundary.
 
 ```bash
 python adaptive_charge_state_master.py list              # experiments, points, presets
-python adaptive_charge_state_master.py validate          # 99 numerical checks
+python adaptive_charge_state_master.py validate          # 105 numerical checks
 python adaptive_charge_state_master.py run power         # simulate + analyze
 python adaptive_charge_state_master.py run ratio --point 0,2 --quick
 python adaptive_charge_state_master.py run power --no-optimal   # methods 1-5 only, fast
@@ -202,6 +244,7 @@ python adaptive_charge_state_master.py robustness demo --point 1
 python adaptive_charge_state_master.py optimal demo      # every rule vs the exact optimum
 python adaptive_charge_state_master.py discard demo      # add the abandon action
 python adaptive_charge_state_master.py noiserisk demo    # all six under rate noise
+python adaptive_charge_state_master.py rho demo          # discounted L&S (v1.8's rho sweep)
 python results/analysis.py                              # cross-experiment tables
 ```
 
@@ -266,6 +309,6 @@ the file falls back to a self-contained reference implementation pinned to the
 same 5.437 µW operating point (Γ_tot = 9.42 kHz, p_bright = 0.118) — a
 documented stand-in, not a re-measurement, and its emission rates and power
 dependence differ substantially. `list` and `validate` report which layer is
-active, every saved result records it, and `validate` passes 99/99 on both.
+active, every saved result records it, and `validate` passes 105/105 on both.
 
 Requires `numpy`, `scipy` and `matplotlib`.

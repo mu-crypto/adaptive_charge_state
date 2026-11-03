@@ -9636,12 +9636,32 @@ def validate_all(verbose: bool = True) -> int:
     p_rho = _base_params()
     M_r, tail_r = rho_photon_count_matrices(p_rho, 0.001, 12)
     Q_r, L_r = _rho_generators(p_rho)
+    # The photon blocks against two independent references: the Poisson law
+    # when nothing switches, and the one-photon term by quadrature,
+    # int_0^dt e^{A (dt - s)} Lambda e^{A s} ds with A = Q - Lambda.
+    from math import factorial
+    from scipy.integrate import quad_vec
+
+    p_frozen = _replace_params(p_rho, gamma_minus_to_zero_khz=0.0,
+                               gamma_zero_to_minus_khz=0.0)
+    dt_p = 0.004
+    M_p, _ = rho_photon_count_matrices(p_frozen, dt_p, 12)
+    lam_r = np.array([p_rho.lambda_minus_khz, p_rho.lambda_zero_khz])
+    pois = max(
+        float(np.abs(np.diag(M_p[n]) - np.exp(-lam_r * dt_p) * (lam_r * dt_p) ** n
+                     / factorial(n)).max())
+        for n in range(6)
+    )
+    A_r = Q_r - L_r
+    M1_q = quad_vec(lambda u: expm(A_r * (dt_p - u)) @ L_r @ expm(A_r * u), 0.0, dt_p,
+                    epsabs=1e-14)[0]
+    M_s, _ = rho_photon_count_matrices(p_rho, dt_p, 12)
+    one = float(np.abs(M_s[1] - M1_q).max())
     check(
         "rho sweep: binned-count transition matrices are exact",
-        np.abs(M_r.sum(axis=(0, 1)) - 1.0).max() < 1e-12
-        and np.abs(M_r[0] - expm((Q_r - L_r) * 0.001)).max() < 1e-12,
-        f"column sums 1 to {np.abs(M_r.sum(axis=(0, 1)) - 1.0).max():.1e}, "
-        f"zero-photon block = expm((Q - Lambda) dt), tail {tail_r:.1e}",
+        np.abs(M_r.sum(axis=(0, 1)) - 1.0).max() < 1e-12 and pois < 1e-12 and one < 1e-10,
+        f"column sums 1 to {np.abs(M_r.sum(axis=(0, 1)) - 1.0).max():.1e}; Poisson "
+        f"limit to {pois:.1e}; one-photon block vs quadrature {one:.1e}",
     )
     g_r = (np.linspace(-12, 12, 97), np.linspace(0, 1, 41), np.linspace(0, 1, 41))
     rgr = np.random.default_rng(21)
@@ -9682,12 +9702,17 @@ def validate_all(verbose: bool = True) -> int:
     sol_r = solve_rho_stopping(ker_r, 0.060, 0.0, -1000.0 / 500.0)
     v0_r = float(_rho_interp_on_grid(ker_r, sol_r["value_at_grid"], *prior_r)[0])
     r_star = solve_optimal_dp(p_rho, 60.0, Economics(cost_per_us=1.0 / 500.0)).risk
+    # Two independent solvers of the same problem. Exactly, binned counts and
+    # 1 us epochs can only do worse (1 - V_0 >= R*); on the default grid V_0
+    # reads slightly HIGH instead, because linear interpolation overestimates
+    # a convex value function. The band bounds that bias; the policy's
+    # realised objective, not V_0, is what the sweep reports.
     check(
         "rho sweep: at rho = 0 with c < 0 the DP is the Bayes-risk problem",
         abs((1.0 - v0_r) / r_star - 1.0) < 0.02,
         f"1 - V_0 = {1.0 - v0_r:.5f} vs the event-time DP's R* = {r_star:.5f} at "
-        f"a/c = 500 us, T = 60 us ({100 * ((1.0 - v0_r) / r_star - 1.0):+.2f}%) -- two "
-        "independent solvers",
+        f"a/c = 500 us, T = 60 us ({100 * ((1.0 - v0_r) / r_star - 1.0):+.2f}%; below "
+        "R* means V_0 carries the grid's upward interpolation bias)",
     )
     sh_r, lab_r = simulate_balanced_dataset(400, 0.06, p_rho, 11, DETECTOR_OFF, NOISE_OFF)
     cnt_r = rho_binned_counts(sh_r, 0.001, 60)
@@ -9704,17 +9729,18 @@ def validate_all(verbose: bool = True) -> int:
         f"{100 * flip:.2f}% of calls differ from the binned posterior at T; "
         f"mean tau {d0r['mean_tau_us']:.1f} of 60 us (eps = {RHO_STOP_TOLERANCE:g})",
     )
-    v_prev = np.inf
-    mono = True
+    # V_0 >= 1/2 holds by construction (V = max(H, C), H >= 1/2), so the
+    # content is the STRICT fall with rho -- a sign error in the discount
+    # would reverse it -- and that waiting is still worth something at
+    # 100 kHz (1/rho = 10 us against a 4.4 us photon spacing).
+    v_seq = []
     for rr in (0.0, 1.0, 10.0, 100.0):
         sr = solve_rho_stopping(ker_r, 0.060, rr, 0.0)
-        vv = float(_rho_interp_on_grid(ker_r, sr["value_at_grid"], *prior_r)[0])
-        mono &= vv <= v_prev + 1e-12 and vv >= 0.5 - 1e-9
-        v_prev = vv
+        v_seq.append(float(_rho_interp_on_grid(ker_r, sr["value_at_grid"], *prior_r)[0]))
     check(
-        "rho sweep: V_0 falls with rho and never below the immediate guess",
-        mono,
-        f"V_0 at rho = 100 kHz is {v_prev:.4f} (>= 1/2)",
+        "rho sweep: V_0 falls strictly with rho, and waiting still pays at 100 kHz",
+        all(b < a - 1e-6 for a, b in zip(v_seq, v_seq[1:])) and v_seq[-1] > 0.5 + 1e-3,
+        "V_0 at rho = 0, 1, 10, 100 kHz: " + ", ".join(f"{v:.4f}" for v in v_seq),
     )
 
     n_fail = sum(1 for _, ok in results if not ok)
@@ -12342,8 +12368,12 @@ def cmd_noiserisk(args: argparse.Namespace) -> int:
 # so rho (kHz = 1/ms) alone sets how fast a late answer loses value; 1/rho is
 # that time scale. This is the DISCOUNTED-reward counterpart of the
 # Bayes-risk problem `solve_optimal_dp` solves (a running cost c per us and a
-# terminal cost per error). For rho tau << 1, e^{-rho tau} ~ 1 - rho tau and
-# the two coincide at c = rho; `run_rho_sweep` checks exactly that.
+# terminal cost per error). For rho tau << 1, e^{-rho tau} ~ 1 - rho tau: the
+# stopped payoff becomes max(p, 1-p) - rho max(p, 1-p) tau, so the two agree
+# to first order at a STATE-DEPENDENT cost rho max(p, 1-p), between rho/2 and
+# rho. `run_rho_sweep` solves the cost problem at its upper end, c = rho
+# (minus any running reward), as an approximate check that is tight only when
+# the fidelity is near 1 -- and exact at rho = 0, where it is the same problem.
 #
 # State: ell = initial-state LLR, a = P(j = NV- | i = NV-, data),
 # b = P(j = NV- | i = NV0, data). Decisions at epochs k dt; the record enters
@@ -12366,6 +12396,8 @@ RHO_N_LLR = 97
 RHO_N_CURRENT = 41
 RHO_LLR_MAX = 12.0
 RHO_STOP_TOLERANCE = 1.0e-6
+# Largest float32 margin array (epochs x grid nodes) a rho-DP may allocate.
+RHO_MARGIN_BUDGET_GB = 3.0
 
 
 def _rho_generators(params: MMPPParams) -> tuple[np.ndarray, np.ndarray]:
@@ -12707,9 +12739,13 @@ def run_rho_sweep(
         adaptive count   (n_up, deadline) on cal              -- added here
         adaptive SPRT    exact event-time (L, offset, deadline) on cal
                                                                -- added here
-        cost-DP          the Bayes-risk optimum at c = rho per ms, a/c =
-                         1000/rho us: the linearised match, a check and not
-                         a competitor -- it optimises a different objective
+        cost-DP          the Bayes-risk optimum at cost rho - c per ms (c the
+                         running reward), a/c = 1000/(rho - c) us: the
+                         first-order match when the fidelity is near 1 (the
+                         exact first-order cost is rho max(p, 1-p) - c), and
+                         the identical problem at rho = 0. A check, not a
+                         competitor -- elsewhere it optimises a different
+                         objective.
         rho-DP, dt/r     the same DP on bins refine_factor times finer: a
                          convergence check. The DP is optimal only among
                          rules that see binned counts and act on its epochs;
@@ -12721,11 +12757,21 @@ def run_rho_sweep(
     (v1.8's protocol for the fixed-time rules, extended to the rest). Every
     baseline also gets v1.8's trivial option of guessing at t = 0 (J = 1/2).
     The DP needs no data. Intervals are paired stratified bootstraps over
-    test shots; nothing is selected on test, so they carry no selection bias.
+    test shots; no configuration is chosen by test outcomes, so they carry no
+    selection bias. (The count rule's n_up range is sized from the test
+    click-count distribution, as in `run` -- a grid extent, using no labels.)
+
+    The fine DP stores refine_factor x n_steps float32 margins over the grid;
+    it is skipped, with a note, when that would exceed RHO_MARGIN_BUDGET_GB
+    (the low-power end of the `power` sweep would need ~10 GB).
     """
     t0 = time.time()
     params = point.params
-    detector, noise = cfg.detector, cfg.noise
+    detector = cfg.detector
+    # A point's own noise overrides cfg.noise, as in `run`: the noise sweeps
+    # set it only there.
+    noise = point.noise if point.noise is not None else cfg.noise
+    noise.validate()
     filter_params = _filter_params_for(params, detector, noise)
     seed = int(cfg.seed) + 70_001 + int(point.seed_offset)
     horizon_us = (
@@ -12824,8 +12870,20 @@ def run_rho_sweep(
 
     # ---- the rho-DP, at v1.8's bin and refine_factor times finer -----------
     dps_setup = {}
+    n_nodes = int(n_llr) * int(n_current) ** 2
     for key, fac in (("rho_dp", 1), ("rho_dp_fine", int(refine_factor))):
         if key == "rho_dp_fine" and fac <= 1:
+            continue
+        gb = 4.0 * n_steps * fac * n_nodes / 1e9
+        if gb > RHO_MARGIN_BUDGET_GB:
+            if key == "rho_dp":
+                raise MemoryError(
+                    f"the rho-DP would store {gb:.1f} GB of margins ({n_steps} epochs x "
+                    f"{n_nodes} nodes); pass a coarser --dt-us or a smaller grid"
+                )
+            if cfg.verbose:
+                print(f"  {key} skipped: {gb:.1f} GB of margins > "
+                      f"{RHO_MARGIN_BUDGET_GB:g} GB budget")
             continue
         ker = build_rho_kernel(filter_params, dt_ms / fac, llr_max, n_llr, n_current)
         dps_setup[key] = (ker, rho_binned_counts(test_shots, dt_ms / fac, n_steps * fac))
@@ -12837,13 +12895,16 @@ def run_rho_sweep(
 
     # ---- the cost-formulation optimum at c = rho (linearised check) ---------
     cost_dp = {}
-    if with_cost_dp and np.any(rho_values > 0):
+    # Effective cost per ms of the matching Bayes-risk problem: rho - c, which
+    # must be positive (rho = 0 qualifies only with a running cost c < 0).
+    cost_rhos = [float(r) for r in rho_values if float(r) - c > 0.0]
+    if with_cost_dp and cost_rhos:
         cdt = optimal_dp_step_us(filter_params, horizon_us)
         if horizon_us / cdt <= 5000:
             chunks = optimal_dp_paths(test_shots, test_labels, filter_params,
                                       horizon_us, cdt, spec)
-            for rho in rho_values[rho_values > 0]:
-                econ = Economics(cost_per_us=float(rho) / 1000.0)
+            for rho in cost_rhos:
+                econ = Economics(cost_per_us=(float(rho) - c) / 1000.0)
                 dp = solve_optimal_dp(filter_params, horizon_us, econ, dt_us=cdt)
                 st_o, pr_o, _ = evaluate_optimal_dp(dp, chunks)
                 cost_dp[float(rho)] = (st_o / 1000.0, (pr_o == test_labels), dp.risk)
@@ -12908,7 +12969,8 @@ def run_rho_sweep(
             glo, ghi = _boot(r - dp["realized"])
             rows.append({
                 "rho_khz": float(rho), "method": "cost_dp",
-                "config": f"a/c = {1000.0 / rho:.4g} us (c = rho)",
+                "config": (f"a/c = {1000.0 / (rho - c):.4g} us (cost rho - c = "
+                           f"{rho - c:.4g} per ms)"),
                 "objective": float(r.mean()), "objective_ci_low": lo, "objective_ci_high": hi,
                 "gap_vs_dp": float((r - dp["realized"]).mean()),
                 "gap_ci_low": glo, "gap_ci_high": ghi,
@@ -12931,8 +12993,8 @@ def run_rho_sweep(
                 + ", ".join(f"{k} {by[k]['objective']:.4f}" for k in by if k != "rho_dp")
             )
 
-    # Curves for the figure: test F(t) of the fixed-time rules, and the
-    # (mean tau, F) clouds of the adaptive families on test.
+    # Curves for the figure: test F(t) of the two fixed-time rules. (The
+    # adaptive rules appear in it only at their rho-chosen settings.)
     curves = {
         "times_us": times_us,
         "F_threshold": np.array([balanced_fidelity(test_labels, np.where(
@@ -12977,7 +13039,7 @@ def run_rho_sweep(
 _RHO_METHODS = (
     # key, label, style, colour
     ("rho_dp", r"$\rho$-optimal DP (L&S Eq. 1.5)", "-o", "k"),
-    ("rho_dp_fine", r"$\rho$-DP on 4x finer bins (convergence)", "--o", "0.55"),
+    ("rho_dp_fine", r"$\rho$-DP on {r}x finer bins (convergence)", "--o", "0.55"),
     ("hmm", "HMM, fixed length (P > 1/2)", "-s", "C0"),
     ("threshold", "fixed-time count threshold", ":o", "0.45"),
     ("count", "adaptive count SPRT", "--^", "C1"),
@@ -12997,8 +13059,11 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
     rows = result["rows"]
     rho = np.asarray(result["rho_khz"], dtype=float)
     pos = rho > 0
+    rf = int(result.get("refine_factor", 4))
+    c_run = float(result.get("running_reward_per_ms", 0.0))
+    methods = [(k, lab.replace("{r}", str(rf)), st, colr) for k, lab, st, colr in _RHO_METHODS]
     by = {k: [next((r for r in rows if r["rho_khz"] == x and r["method"] == k), None)
-              for x in rho] for k, *_ in _RHO_METHODS}
+              for x in rho] for k, *_ in methods}
 
     def col(k, f):
         return np.array([np.nan if r is None else r.get(f, np.nan) for r in by[k]], float)
@@ -13016,7 +13081,7 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
     if np.any(~pos):
         ax.scatter(col("rho_dp", "mean_tau_us")[~pos], col("rho_dp", "fidelity")[~pos],
                    marker="*", s=180, color="k", zorder=5, label=r"$\rho$ = 0")
-    for k, lab, st, colr in _RHO_METHODS[4:]:
+    for k, lab, st, colr in methods[4:]:
         x, y = col(k, "mean_tau_us"), col(k, "fidelity")
         m = np.isfinite(x) & (x > 0)
         if m.any():
@@ -13031,12 +13096,14 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
     ax.grid(alpha=0.25)
 
     for ax, field, title, ylog in (
-        (axes[0, 1], "objective", r"(b) objective $J(\rho) = E[e^{-\rho\tau}\,1\{\rm correct\}]$", False),
+        (axes[0, 1], "objective",
+         r"(b) objective $J(\rho) = E[e^{-\rho\tau}\,1\{\rm correct\}]$"
+         + (rf" + running, $c$ = {c_run:g}/ms" if c_run != 0 else ""), False),
         (axes[0, 2], "gap_vs_dp", r"(c) $J$ minus the $\rho$-DP's, paired 95% CI", False),
         (axes[1, 0], "mean_tau_us", r"(d) mean stopping time / chosen $t_R$ (us)", True),
         (axes[1, 1], "fidelity", r"(e) fidelity at the $\rho$-chosen setting", False),
     ):
-        for k, lab, st, colr in _RHO_METHODS:
+        for k, lab, st, colr in methods:
             if field == "gap_vs_dp" and k == "rho_dp":
                 continue
             y = col(k, field)
@@ -13072,7 +13139,8 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
 
     ax = axes[1, 2]
     ax.axis("off")
-    d0 = by["rho_dp"][int(np.argmin(rho))]
+    i0 = int(np.argmin(rho))
+    d0 = by["rho_dp"][i0]
     lines = [
         "settings",
         f"  horizon T = {result['horizon_us']:.4g} us, bin dt = {result['dt_us']:.4g} us "
@@ -13085,13 +13153,19 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
         f"per state, {result['n_boot']} paired bootstrap resamples",
         "",
         "checks",
-        f"  rho = {rho.min():g}: F = {d0['fidelity']:.4f} vs fixed-length HMM at T "
-        f"{result['curves']['F_hmm'][-1]:.4f},",
-        f"    mean tau {d0['mean_tau_us']:.1f} us: with eps = {result['stop_tolerance']:g} "
-        f"a shot stops once reading on",
-        f"    can gain < eps ({100 * d0['fraction_at_horizon']:.1f}% reach T; Remark 4.4's "
-        "run-to-T is eps = 0)",
     ]
+    if rho[i0] == 0 and c_run == 0:
+        # At rho = c = 0 stopping is never strictly better, so the rule may
+        # stop once no reachable data can change the call (margin <= eps):
+        # the fidelity of reading to T, in a fraction of the time.
+        lines += [
+            f"  rho = c = 0: F = {d0['fidelity']:.4f} vs fixed-length HMM at T "
+            f"{result['curves']['F_hmm'][-1]:.4f}, mean tau",
+            f"    {d0['mean_tau_us']:.1f} of {result['horizon_us']:.4g} us: it stops once "
+            f"no reachable data",
+            f"    can change the call (margin <= eps = {result['stop_tolerance']:g}); "
+            f"{100 * d0['fraction_at_horizon']:.1f}% reach T",
+        ]
     dv = [abs(r["dp_value_at_prior"] - r["objective_posterior"]) for r in by["rho_dp"] if r]
     lines.append(f"  |V_0 - posterior-averaged J|: max {max(dv):.4f} over rho")
     dv2 = [abs(r["dp_value_at_prior"] - r["objective"]) for r in by["rho_dp"] if r]
@@ -13103,7 +13177,7 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
     fine = [r for r in rows if r["method"] == "rho_dp_fine"]
     if fine:
         g = max(fine, key=lambda r: r["gap_vs_dp"])
-        lines.append(f"  4x finer bins raise J by up to {g['gap_vs_dp']:+.4f} "
+        lines.append(f"  {rf}x finer bins raise J by up to {g['gap_vs_dp']:+.4f} "
                      f"(rho = {g['rho_khz']:.3g} kHz)")
     ax.text(0.0, 1.0, "\n".join(lines), va="top", ha="left", family="monospace",
             fontsize=9, transform=ax.transAxes)
@@ -13124,7 +13198,7 @@ def plot_rho_sweep(result: dict, save_path: str | None = None):
 _RHO_CSV_COLUMNS = [
     "experiment", "detector", "physics_layer", "point_index", "point",
     "power_uw", "detection_efficiency", "horizon_us", "dt_us",
-    "running_reward_per_ms", "n_test_per_state", "rho_khz", "inv_rho_us",
+    "running_reward_per_ms", "noise", "n_test_per_state", "rho_khz", "inv_rho_us",
     "method", "config", "objective", "objective_ci_low", "objective_ci_high",
     "gap_vs_dp", "gap_ci_low", "gap_ci_high", "fidelity", "mean_tau_us",
     "median_tau_us", "fraction_at_horizon", "dp_value_at_prior",
@@ -13151,6 +13225,8 @@ def export_rho_csv(results: list[dict], spec: SweepSpec, directory: Path) -> lis
                     "horizon_us": res["horizon_us"],
                     "dt_us": res["dt_us"],
                     "running_reward_per_ms": res["running_reward_per_ms"],
+                    "noise": (res["noise"].describe() if hasattr(res.get("noise"), "describe")
+                              else "no rate noise"),
                     "n_test_per_state": res["n_test_per_state"],
                     "inv_rho_us": (1000.0 / r["rho_khz"]) if r["rho_khz"] > 0 else np.inf,
                     **r,
@@ -13479,7 +13555,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="re-plot and re-export saved points instead of running")
     sp.add_argument("--refine-factor", type=int, default=4,
                     help="also solve the DP on bins this many times finer "
-                         "(1 to skip)")
+                         "(1 to skip; skipped automatically when its margins "
+                         "would exceed RHO_MARGIN_BUDGET_GB)")
     sp.add_argument("--no-plot", action="store_true")
     sp.set_defaults(func=cmd_rho)
 
